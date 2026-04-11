@@ -314,7 +314,7 @@ public class ExecutorEngine implements AutoCloseable {
 
         // ----- sentinel for blocking queue wakeup ----------------------------
         private static final LogEntry POISON_PILL =
-                new LogEntry(Long.MAX_VALUE, -1, java.util.Set.of(LogTag.of("__poison__")),
+                new LogEntry(Long.MAX_VALUE, 0, java.util.Set.of(LogTag.of("__poison__")),
                         new byte[0], Instant.EPOCH);
     }
 

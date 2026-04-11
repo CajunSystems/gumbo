@@ -316,27 +316,30 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         return buf.array();
     }
 
+    /**
+     * Fixed-size prefix before the variable-length tag section:
+     * magic(4) + seqnum(8) + timestamp(8) + localId(8) + numTags(4) = 32 bytes.
+     * Note: FIXED_OVERHEAD (40) = PREFIX_SIZE(32) + dataLen(4) + checksum(4),
+     * used for total entry size calculation but NOT as the cursor start.
+     */
+    private static final int PREFIX_SIZE = 32;
+
     private LogEntry decodeAt(FileChannel channel, long offset) throws IOException {
-        // Read fixed header first
-        ByteBuffer header = ByteBuffer.allocate(FIXED_OVERHEAD);
+        // Read only the fixed prefix (32 bytes) before the variable tag section
+        ByteBuffer header = ByteBuffer.allocate(PREFIX_SIZE);
         readFully(channel, header, offset);
         header.flip();
 
         int magic = header.getInt();
         if (magic != MAGIC) throw new IOException("Bad magic at offset " + offset);
 
-        long seqnum    = header.getLong();
-        long tsMillis  = header.getLong();
-        long localId   = header.getLong();
-        int numTags    = header.getInt();
-        // skip dataLen and crc placeholders; read them after variable-length parts
-        // (dataLen is at position 36, after we read tags)
+        long seqnum   = header.getLong();
+        long tsMillis = header.getLong();
+        long localId  = header.getLong();
+        int numTags   = header.getInt();
 
-        // We need to read the variable-length tag section.
-        // We re-read from the channel starting after the fixed header.
-        // Strategy: read in chunks or re-read the full entry.
-        // For simplicity, read rest of the entry by scanning forward.
-        long cursor = offset + FIXED_OVERHEAD;
+        // Variable-length tag section starts immediately after the 32-byte prefix
+        long cursor = offset + PREFIX_SIZE;
 
         // Read tags
         Set<LogTag> tags = new java.util.HashSet<>(numTags);
