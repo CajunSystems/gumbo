@@ -51,8 +51,8 @@ class FoundationDBPersistenceAdapterTest {
             probe.open();
             probe.close();
             fdbAvailable = true;
-        } catch (Exception e) {
-            // FDB not available; all tests will be skipped
+        } catch (Throwable e) {
+            // FDB not available (missing libfdb_c.so, no cluster file, etc.); all tests will be skipped
             fdbAvailable = false;
         }
     }
