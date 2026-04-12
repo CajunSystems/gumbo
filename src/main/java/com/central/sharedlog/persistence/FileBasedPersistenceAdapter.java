@@ -161,19 +161,38 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public void append(LogEntry entry) throws IOException {
+        writeNoSync(entry);
+        syncChannels();
+    }
+
+    /**
+     * Writes all entries to the log and index files then calls {@code fdatasync}
+     * <em>once</em> for both — the group-commit path.  N entries cost 2
+     * {@code fdatasync} calls instead of {@code 2N}.
+     */
+    @Override
+    public void appendBatch(List<LogEntry> entries) throws IOException {
+        for (LogEntry entry : entries) {
+            writeNoSync(entry);
+        }
+        syncChannels();
+    }
+
+    // Writes bytes to both channels and updates in-memory indices without
+    // calling force() — the caller is responsible for the fdatasync.
+    private void writeNoSync(LogEntry entry) throws IOException {
         ensureOpen();
         byte[] encoded = encode(entry);
 
-        // Current position = end of log file
+        // Current position = end of log file (channel opened in APPEND mode)
         long offset = logChannel.size();
 
         ByteBuffer buf = ByteBuffer.wrap(encoded);
         while (buf.hasRemaining()) {
             logChannel.write(buf);
         }
-        logChannel.force(false); // fdatasync (metadata not required)
 
-        // Append to index
+        // Append seqnum→offset record to index
         ByteBuffer idxBuf = ByteBuffer.allocate(16);
         idxBuf.putLong(entry.seqnum());
         idxBuf.putLong(offset);
@@ -181,9 +200,8 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         while (idxBuf.hasRemaining()) {
             indexChannel.write(idxBuf);
         }
-        indexChannel.force(false);
 
-        // Update in-memory indices
+        // Update in-memory indices immediately so concurrent reads see the entry
         globalIndex.put(entry.seqnum(), offset);
         for (LogTag tag : entry.tags()) {
             tagSeqnums
@@ -193,6 +211,12 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
                     .updateAndGet(c -> Math.max(c, entry.localId() + 1));
         }
+    }
+
+    // fdatasync on both WAL files; metadata update not required.
+    private void syncChannels() throws IOException {
+        logChannel.force(false);
+        indexChannel.force(false);
     }
 
     // -------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import com.central.sharedlog.core.LogTag;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Collections;
 
 /**
  * Pluggable storage back-end for the shared log.
@@ -62,6 +63,24 @@ public interface PersistenceAdapter extends AutoCloseable {
      * @throws IOException if the write fails
      */
     void append(LogEntry entry) throws IOException;
+
+    /**
+     * Persists multiple entries as a single batch with <em>one</em> durability
+     * flush at the end, rather than one flush per entry.
+     *
+     * <p>The default implementation calls {@link #append} for each entry
+     * (same semantics, no batching benefit).  Storage back-ends that support
+     * group-commit should override this to write all entries and call
+     * {@code fdatasync} / {@code msync} exactly once.
+     *
+     * @param entries entries to store, in seqnum order; must not be empty
+     * @throws IOException if the write fails
+     */
+    default void appendBatch(List<LogEntry> entries) throws IOException {
+        for (LogEntry entry : entries) {
+            append(entry);
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Read

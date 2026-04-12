@@ -15,11 +15,12 @@ every component crash-safe and independently restartable with no coordination.
 4. [Module map](#module-map)
 5. [Data model](#data-model)
 6. [Persistence adapters](#persistence-adapters)
-7. [Executor model](#executor-model)
-8. [Virtual threads](#virtual-threads)
-9. [Quick start](#quick-start)
-10. [Examples](#examples)
-11. [Building](#building)
+7. [Typed log views (Kryo)](#typed-log-views-kryo)
+8. [Executor model](#executor-model)
+9. [Virtual threads](#virtual-threads)
+10. [Quick start](#quick-start)
+11. [Examples](#examples)
+12. [Building](#building)
 
 ---
 
@@ -207,23 +208,30 @@ src/main/java/com/central/sharedlog/
 │
 ├── api/                        Interfaces — depend only on core/
 │   ├── SharedLog.java          Main log interface (append/read/subscribe/trim)
-│   ├── LogView.java            Tag-scoped read/append window
+│   ├── LogView.java            Tag-scoped read/append window (byte[])
+│   ├── TypedLogView.java       Type-safe wrapper over LogView (uses LogSerializer)
 │   ├── Executor.java           Stateless executor interface (fold + execute)
 │   └── ExecutorContext.java    Runtime context injected into execute()
 │
+├── serialization/              Pluggable object ↔ byte[] conversion
+│   ├── LogSerializer.java      Interface — serialize(T) / deserialize(byte[])
+│   └── KryoLogSerializer.java  Kryo 5 implementation with internal Pool<Kryo>
+│
 ├── persistence/                Storage back-ends
-│   ├── PersistenceAdapter.java Interface — open/close/append/read/trim
+│   ├── PersistenceAdapter.java Interface — open/close/append/appendBatch/read/trim
 │   ├── InMemoryPersistenceAdapter.java
-│   └── FileBasedPersistenceAdapter.java
+│   ├── FileBasedPersistenceAdapter.java  WAL + index + trim files; group-commit via appendBatch
+│   └── BatchingPersistenceAdapter.java   Batches writes → one fdatasync per N entries
 │
 ├── sequencer/                  Sequence-number generation
 │   ├── Sequencer.java          Interface — next() / current()
-│   └── LocalSequencer.java     AtomicLong implementation
+│   └── LocalSequencer.java     AtomicLong; advanceTo() for post-crash reseeding
 │
 └── service/                    Wiring
     ├── SharedLogConfig.java    Builder-pattern configuration
-    ├── SharedLogService.java   Main implementation
+    ├── SharedLogService.java   Main implementation; getTypedView() factory
     ├── DefaultLogView.java     LogView backed by SharedLogService
+    ├── DefaultTypedLogView.java TypedLogView backed by LogView + LogSerializer
     └── ExecutorEngine.java     Runs Executor<S> instances on virtual threads
 ```
 
@@ -278,6 +286,37 @@ Append-only binary WAL (`log.dat`) with:
   multiple of 16 bytes, falls back to scanning `log.dat` and rebuilding from scratch.
   Per-tag in-memory indices are always rebuilt from the verified log entries.
 
+### BatchingPersistenceAdapter
+
+Wraps any `PersistenceAdapter` and accumulates writes in memory, flushing to
+the delegate as a single `appendBatch()` call.  With `FileBasedPersistenceAdapter`
+as the delegate, **N entries cost 2 `fdatasync` calls instead of 2N**:
+
+```java
+PersistenceAdapter base     = new FileBasedPersistenceAdapter("/var/data");
+PersistenceAdapter batching = BatchingPersistenceAdapter.of(base); // 64 entries / 10 ms defaults
+
+// or with explicit tuning:
+PersistenceAdapter batching = new BatchingPersistenceAdapter(base, 128, 5 /* ms */);
+
+SharedLogConfig config = SharedLogConfig.builder()
+    .persistenceAdapter(batching)
+    .build();
+```
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `maxBatchSize` | 64 | Flush immediately when pending entries reach this count |
+| `maxDelayMs` | 10 ms | Background virtual-thread fires and flushes after this interval |
+
+**Durability tradeoff**: entries appended but not yet flushed are in memory only.
+A JVM crash within the delay window loses those entries.  For strict durability
+keep the default `FileBasedPersistenceAdapter` (1 `fdatasync` per entry) or use
+`BatchingPersistenceAdapter` with `maxDelayMs=0` / `maxBatchSize=1`.
+
+See [docs/PERSISTENCE_EVOLUTION.md](docs/PERSISTENCE_EVOLUTION.md) for a full
+analysis of the persistence roadmap including memory-mapped files and io_uring.
+
 ### Implementing your own adapter
 
 ```java
@@ -297,6 +336,62 @@ SharedLogConfig config = SharedLogConfig.builder()
     .persistenceAdapter(new RocksDbPersistenceAdapter(path))
     .build();
 ```
+
+---
+
+## Typed log views (Kryo)
+
+Every method in `SharedLog` and `LogView` works with raw `byte[]`.  A
+`TypedLogView<T>` wraps a `LogView` and uses a `LogSerializer<T>` to
+transparently handle serialization so call sites never touch `byte[]`:
+
+```java
+// 1. Pick a serializer
+LogSerializer<OrderEvent> s = new KryoLogSerializer<>(OrderEvent.class);
+
+// 2. Get a typed view
+TypedLogView<OrderEvent> view = service.getTypedView(LogTag.of("orders"), s);
+
+// 3. Append domain objects directly — no .getBytes()
+view.append(new OrderEvent("ord-42", "placed")).join();
+
+// 4. Read back typed objects — no new String(e.data())
+List<OrderEvent> events = view.readAll().join();
+```
+
+Subscriptions are also typed:
+
+```java
+SharedLog.Subscription sub = view.subscribeTail(event ->
+        System.out.println("received: " + event.orderId()));
+```
+
+### LogSerializer
+
+`LogSerializer<T>` is a single-responsibility interface with two methods:
+
+```java
+public interface LogSerializer<T> {
+    byte[] serialize(T value);
+    T      deserialize(byte[] data);
+}
+```
+
+Plug in any format — JSON, Protobuf, Avro — by implementing this interface.
+`KryoLogSerializer<T>` ships out of the box:
+
+```java
+// Default (no registration required — works for most types and records)
+new KryoLogSerializer<>(MyClass.class)
+
+// Pre-registered (smaller wire format, faster)
+new KryoLogSerializer<>(MyClass.class, kryo -> {
+    kryo.register(MyClass.class, 10);
+    kryo.register(MyEnum.class,  11);
+})
+```
+
+Kryo instances are pooled internally so the serializer is fully thread-safe.
 
 ---
 
