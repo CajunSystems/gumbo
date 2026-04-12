@@ -86,15 +86,12 @@ public class SharedLogService implements SharedLog {
 
     private void init() throws IOException {
         adapter.open();
-        // Seed sequencer so it continues from the last persisted seqnum
+        // Seed sequencer so it continues from the last persisted seqnum on restart.
         long latest = adapter.getLatestSeqnum();
         if (latest >= 0 && sequencer instanceof com.central.sharedlog.sequencer.LocalSequencer ls) {
-            // Re-create sequencer starting after the latest known seqnum
-            // (LocalSequencer is seeded via constructor; we rely on SharedLogConfig to
-            // pass in a sequencer already seeded, OR we handle it here via reflection).
-            // Practical approach: just assert the sequencer is ahead or reseed via cast.
+            ls.advanceTo(latest + 1);
         }
-        logger.info("SharedLogService started: latestSeqnum={}", adapter.getLatestSeqnum());
+        logger.info("SharedLogService started: latestSeqnum={}", latest);
     }
 
     // -------------------------------------------------------------------------

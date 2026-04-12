@@ -18,7 +18,8 @@ every component crash-safe and independently restartable with no coordination.
 7. [Executor model](#executor-model)
 8. [Virtual threads](#virtual-threads)
 9. [Quick start](#quick-start)
-10. [Building](#building)
+10. [Examples](#examples)
+11. [Building](#building)
 
 ---
 
@@ -454,6 +455,29 @@ Switch to file-backed storage:
 SharedLogConfig config = SharedLogConfig.builder()
     .persistenceAdapter(new FileBasedPersistenceAdapter("/var/data/myapp"))
     .build();
+```
+
+---
+
+## Examples
+
+Runnable end-to-end examples live in
+[`src/test/java/com/central/sharedlog/examples/`](src/test/java/com/central/sharedlog/examples/).
+They are compiled and executed as part of `mvn verify`, so they always stay in
+sync with the library.
+
+| Example | What it demonstrates |
+|---|---|
+| [`QuickStartExample.java`](src/test/java/com/central/sharedlog/examples/QuickStartExample.java) | Append, read, `readFromPosition`, subscribe, multi-tag entries, `LogView` |
+| [`OrderFulfilmentExample.java`](src/test/java/com/central/sharedlog/examples/OrderFulfilmentExample.java) | Stateless executor: backlog replay on startup, then incremental processing |
+| [`FilePersistedExample.java`](src/test/java/com/central/sharedlog/examples/FilePersistedExample.java) | File-backed WAL: durability, crash recovery, and sequencer reseeding across restarts |
+
+Run a single example directly:
+
+```bash
+mvn test -Dtest=QuickStartExample
+mvn test -Dtest=OrderFulfilmentExample
+mvn test -Dtest=FilePersistedExample
 ```
 
 ---
