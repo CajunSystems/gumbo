@@ -63,7 +63,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
      * {@code ("gumbo_seq", "seq")}.
      */
     public FoundationDBSequencer() {
-        this(null, "gumbo_seq");
+        this((String) null, "gumbo_seq");
     }
 
     /**

@@ -136,7 +136,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      * Uses the default FDB cluster file with {@code "gumbo"} as the root subspace.
      */
     public FoundationDBPersistenceAdapter() {
-        this(null, "gumbo");
+        this((String) null, "gumbo");
     }
 
     /**
@@ -415,8 +415,8 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             final long newTrim = upToSeqnum;
             db.run(tr -> {
                 // Clear log entries below the trim boundary
-                tr.clearRange(logSubspace.range().begin,
-                              logSubspace.pack(Tuple.from(newTrim)));
+                tr.clear(logSubspace.range().begin,
+                         logSubspace.pack(Tuple.from(newTrim)));
                 // Persist trim point
                 tr.set(metaSubspace.pack(Tuple.from(TRIM_KEY)), longBytes(newTrim));
                 return null;
