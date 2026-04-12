@@ -1,4 +1,4 @@
-# Shared Log
+# Gumbo
 
 A Boki-inspired shared log library for Java 21. A single append-only, totally-ordered
 log acts as the source of truth for an entire system. Stateless **executors** derive
