@@ -212,7 +212,7 @@ serve tag-scoped reads without touching the write lock.
 ## Module map
 
 ```
-src/main/java/com/central/sharedlog/
+src/main/java/com/cajunsystems/gumbo/
 │
 ├── core/                       Pure value types — no dependencies
 │   ├── LogTag.java             Logical stream identifier (namespace + key)
@@ -622,6 +622,100 @@ engine.register(new FulfilmentExecutor());
 engine.start();
 ```
 
+### Example: workflow executor
+
+A workflow executor chains two executors together so that the output of the first
+becomes the input of the second, advancing items through a multi-stage pipeline.
+
+**Stage 1** reads `workflow.commands` (entries like `"submit:<id>"`) and emits
+`"processing:<id>"` entries to `workflow.events`:
+
+```java
+static class WorkflowSubmitExecutor implements Executor<List<String>> {
+
+    private final Set<String> emitted = ConcurrentHashMap.newKeySet();
+
+    @Override public LogTag getInputTag() { return LogTag.of("workflow.commands"); }
+    @Override public String getName()     { return "WorkflowSubmit"; }
+
+    @Override public List<String> initialState() { return List.of(); }
+
+    @Override
+    public List<String> apply(List<String> pending, LogEntry entry) {
+        String msg = new String(entry.data());
+        if (msg.startsWith("submit:")) {
+            String id = msg.substring("submit:".length());
+            List<String> next = new ArrayList<>(pending);
+            next.add(id);
+            return next;
+        }
+        return pending;
+    }
+
+    @Override
+    public List<AppendRequest> execute(List<String> pending, ExecutorContext ctx) {
+        return pending.stream()
+            .filter(emitted::add)           // idempotency: only emit each id once
+            .map(id -> AppendRequest.to(
+                LogTag.of("workflow.events"),
+                ("processing:" + id).getBytes()))
+            .toList();
+    }
+}
+```
+
+**Stage 2** reads `workflow.events`, picks up items in `processing` state, and
+emits `"complete:<id>"` back to the same tag:
+
+```java
+static class WorkflowProcessExecutor implements Executor<List<String>> {
+
+    private final Set<String> emitted = ConcurrentHashMap.newKeySet();
+
+    @Override public LogTag getInputTag() { return LogTag.of("workflow.events"); }
+    @Override public String getName()     { return "WorkflowProcess"; }
+
+    @Override public List<String> initialState() { return List.of(); }
+
+    @Override
+    public List<String> apply(List<String> processing, LogEntry entry) {
+        String msg = new String(entry.data());
+        if (msg.startsWith("processing:")) {
+            String id = msg.substring("processing:".length());
+            List<String> next = new ArrayList<>(processing);
+            next.add(id);
+            return next;
+        }
+        return processing;
+    }
+
+    @Override
+    public List<AppendRequest> execute(List<String> processing, ExecutorContext ctx) {
+        return processing.stream()
+            .filter(emitted::add)
+            .map(id -> AppendRequest.to(
+                LogTag.of("workflow.events"),
+                ("complete:" + id).getBytes()))
+            .toList();
+    }
+}
+```
+
+Register both executors with a single engine — they run concurrently on separate
+virtual threads:
+
+```java
+ExecutorEngine engine = new ExecutorEngine(service);
+engine.register(new WorkflowSubmitExecutor());
+engine.register(new WorkflowProcessExecutor());
+engine.start();
+
+// Trigger the pipeline
+service.append(AppendRequest.to(LogTag.of("workflow.commands"), "submit:order-99".getBytes())).join();
+// → WorkflowSubmitExecutor emits "processing:order-99" to workflow.events
+// → WorkflowProcessExecutor picks it up and emits "complete:order-99"
+```
+
 ### Cross-tag fan-out
 
 Executors can read and write other tags via `ExecutorContext.openView(tag)`:
@@ -710,15 +804,16 @@ SharedLogConfig config = SharedLogConfig.builder()
 ## Examples
 
 Runnable end-to-end examples live in
-[`src/test/java/com/central/sharedlog/examples/`](src/test/java/com/central/sharedlog/examples/).
+[`src/test/java/com/cajunsystems/gumbo/examples/`](src/test/java/com/cajunsystems/gumbo/examples/).
 They are compiled and executed as part of `mvn verify`, so they always stay in
 sync with the library.
 
 | Example | What it demonstrates |
 |---|---|
-| [`QuickStartExample.java`](src/test/java/com/central/sharedlog/examples/QuickStartExample.java) | Append, read, `readFromPosition`, subscribe, multi-tag entries, `LogView` |
-| [`OrderFulfilmentExample.java`](src/test/java/com/central/sharedlog/examples/OrderFulfilmentExample.java) | Stateless executor: backlog replay on startup, then incremental processing |
-| [`FilePersistedExample.java`](src/test/java/com/central/sharedlog/examples/FilePersistedExample.java) | File-backed WAL: durability, crash recovery, and sequencer reseeding across restarts |
+| [`QuickStartExample.java`](src/test/java/com/cajunsystems/gumbo/examples/QuickStartExample.java) | Append, read, `readFromPosition`, subscribe, multi-tag entries, `LogView` |
+| [`OrderFulfilmentExample.java`](src/test/java/com/cajunsystems/gumbo/examples/OrderFulfilmentExample.java) | Stateless executor: backlog replay on startup, then incremental processing |
+| [`FilePersistedExample.java`](src/test/java/com/cajunsystems/gumbo/examples/FilePersistedExample.java) | File-backed WAL: durability, crash recovery, and sequencer reseeding across restarts |
+| [`WorkflowExecutorExample.java`](src/test/java/com/cajunsystems/gumbo/examples/WorkflowExecutorExample.java) | Multi-stage workflow: chained executors advance items through SUBMITTED → PROCESSING → COMPLETE states |
 
 Run a single example directly:
 
@@ -726,6 +821,7 @@ Run a single example directly:
 mvn test -Dtest=QuickStartExample
 mvn test -Dtest=OrderFulfilmentExample
 mvn test -Dtest=FilePersistedExample
+mvn test -Dtest=WorkflowExecutorExample
 ```
 
 ---
