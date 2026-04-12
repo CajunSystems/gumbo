@@ -60,18 +60,26 @@ a single physical log therefore serves many logical streams simultaneously.
 | Pluggable back-ends | `PersistenceAdapter` interface |
 | FDB metalog consensus | `FoundationDBSequencer` — read-modify-write transaction over a single FDB counter key; OCC handles multi-node contention |
 
-### What this library simplifies
+### What this library takes from Boki (and where it differs)
 
 Boki is a distributed system with engine nodes, storage nodes, sequencer nodes,
 ZooKeeper-backed view management, and io_uring async I/O throughout. This library
-targets **single-node** deployments by default (the `LocalSequencer` is an `AtomicLong`
-and `FileBasedPersistenceAdapter` writes to local disk).
+takes the core insight — stateless executors + shared log — and delivers it in two
+deployment tiers:
 
-**For multi-node / production-scale deployments**, plug in
-`FoundationDBPersistenceAdapter` + `FoundationDBSequencer`. FoundationDB handles
-replication, crash recovery, and distributed sequence assignment — the same role
-FDB plays in Boki's metalog. The `Sequencer` and `PersistenceAdapter` interfaces
-are the seams; switching is a configuration change.
+**Single-node / local** (default): `LocalSequencer` (AtomicLong) +
+`FileBasedPersistenceAdapter` (local WAL). Zero external dependencies, sub-millisecond
+append latency on NVMe.
+
+**Multi-node / production** (recommended): `FoundationDBSequencer` +
+`FoundationDBPersistenceAdapter`. FoundationDB handles replication, crash recovery,
+and distributed sequence assignment — the same role FDB plays in Boki's metalog.
+`SharedLog.appendBatch(requests)` claims all seqnums in a single FDB transaction
+(Boki's batch-reservation optimisation), reducing sequencer round-trips from N to 1
+per N-entry batch.
+
+The `Sequencer` and `PersistenceAdapter` interfaces are the seams; switching tiers
+is a one-line configuration change.
 
 ---
 
@@ -475,10 +483,12 @@ long highWatermark = seq.currentGlobal();
 - You are already using `FoundationDBPersistenceAdapter` and want the entire
   write path to be distributed.
 
-**Latency note**: each `next()` call is a FDB round-trip. For high-throughput
-workloads, consider claiming seqnums in batches (reserve a range at once and
-hand them out locally) — this is the same optimisation Boki uses in its sequencer
-metalog to avoid making the sequencer a bottleneck.
+**Batch seqnum reservation**: `FoundationDBSequencer` implements
+`Sequencer.nextBatch(int count)`, which claims `count` seqnums in a **single**
+FDB transaction. `SharedLog.appendBatch(List<AppendRequest>)` uses this
+automatically — an N-entry write costs 2 FDB round-trips total (1 seqnum claim
++ 1 data commit) instead of N + 1. This is the same optimisation Boki uses in
+its metalog to prevent the sequencer from becoming a throughput bottleneck.
 
 ---
 

@@ -42,6 +42,19 @@ public class LocalSequencer implements Sequencer {
     }
 
     /**
+     * Claims {@code count} consecutive seqnums in O(1) via a single
+     * {@link AtomicLong#getAndAdd} — no loop required.
+     */
+    @Override
+    public long[] nextBatch(int count) {
+        if (count <= 0) throw new IllegalArgumentException("count must be > 0");
+        long base = counter.getAndAdd(count);
+        long[] seqnums = new long[count];
+        for (int i = 0; i < count; i++) seqnums[i] = base + i;
+        return seqnums;
+    }
+
+    /**
      * Advances the counter so that the next {@link #next()} call returns at least
      * {@code minNext}. Has no effect if the counter is already at or beyond
      * {@code minNext}. Used by {@code SharedLogService} to reseed from a persisted
