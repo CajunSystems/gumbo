@@ -108,6 +108,130 @@ new BatchingPersistenceAdapter(new FileBasedPersistenceAdapter(path), 1, 0)
 
 ---
 
+## Stage 3.5 — `FoundationDBPersistenceAdapter` (available, distributed path)
+
+**Location**: `persistence/FoundationDBPersistenceAdapter.java`
+
+This stage is **orthogonal** to the local-file progression (Stages 2–5).  Rather
+than optimising how bytes hit a local disk, it replaces the storage medium entirely
+with a distributed, replicated key-value store.
+
+```
+append(entry)
+  → FDB transaction:
+      logSubspace.set(seqnum, encodeEntry(entry))   // O(log n), distributed write
+      tagSubspace.set((ns, key, seqnum), localId)   // tag index entry
+      metaSubspace.set("latest", seqnum)            // cached high-water mark
+  → db.run() → commit()                             // 3-way replicated, crash-safe
+```
+
+### FDB subspace layout
+
+```
+{root} / "log"  / seqnum (long)                  → entry value bytes
+{root} / "tag"  / namespace / key / seqnum        → localId (8 bytes)
+{root} / "meta" / "latest"                        → latestSeqnum
+{root} / "meta" / "trim"                          → trimSeqnum
+{root} / "meta" / "tagcount" / namespace / key    → localIdCount
+```
+
+FDB's tuple-layer encoding preserves the natural ordering of `seqnum` keys, so
+`readFrom(n)` is a single range scan with no separate index file.  `readByTag`
+uses two FDB round-trips: one range scan of the tag index, then parallel point
+reads on the log subspace within the same snapshot transaction.
+
+### No MAGIC / CRC
+
+`FileBasedPersistenceAdapter` embeds a 4-byte MAGIC sentinel and a 4-byte CRC32
+per entry to detect partial writes and corruption on local disk.  FDB omits
+these: every committed transaction is verified end-to-end by the FDB storage
+layer before the commit future resolves.  The value format is therefore 8 bytes
+shorter per entry.
+
+### Durability model
+
+| Adapter | Durability unit | Failure domain |
+|---|---|---|
+| `FileBasedPersistenceAdapter` | `fdatasync` on local disk | Single machine |
+| `BatchingPersistenceAdapter` | `fdatasync` once per N entries | Single machine |
+| `FoundationDBPersistenceAdapter` | FDB commit (3-way replication) | Cluster-wide |
+
+A committed FDB transaction is durable across the replication group before
+`db.run()` returns.  No `fdatasync` logic is needed in the adapter.
+
+### Throughput
+
+```
+appendBatch(N entries)
+  → 1 FDB transaction (up to 8 MB of encoded data)
+  → ~1–5 ms round-trip latency per transaction
+```
+
+| Operation | Throughput |
+|---|---|
+| Single `append()` per transaction | ~200–1 000 writes/s |
+| `appendBatch(64)` — one transaction per 64 entries | ~12 000–64 000 writes/s |
+| `BatchingPersistenceAdapter` wrapping FDB adapter | Same as appendBatch above |
+
+The 10 MB per-transaction write limit is enforced by `appendBatch`: batches that
+would exceed 8 MB are automatically split into multiple consecutive transactions,
+each individually durable.
+
+### Comparison: when to use FDB vs local file adapters
+
+| Requirement | Local file adapter | FDB adapter |
+|---|---|---|
+| Single writer process | ✓ Simpler, lower latency | ✓ Works but adds RTT overhead |
+| Multiple concurrent writers | ✗ Unsafe — duplicate seqnums | ✓ Only safe option |
+| Data survives single-node failure | ✗ | ✓ 3-way replication |
+| Sub-millisecond P99 write latency | ✓ (NVMe, ~50–200 µs fdatasync) | ✗ Network RTT adds 1–5 ms |
+| Cross-datacenter DR | ✗ Manual rsync / replication | ✓ FDB built-in DR config |
+| No external cluster to operate | ✓ | ✗ Requires FDB cluster |
+| FaaS / stateless compute (any node writes) | ✗ | ✓ Designed for this model |
+
+### Pairing with FoundationDBSequencer
+
+For a fully distributed write path, use `FoundationDBSequencer` alongside the
+adapter. Both components can share a single `Database` connection:
+
+```java
+FDB      fdb     = FDB.selectAPIVersion(730);
+Database db      = fdb.open("/etc/foundationdb/fdb.cluster");
+
+FoundationDBSequencer         seq   = new FoundationDBSequencer(db, "myapp");
+FoundationDBPersistenceAdapter store = new FoundationDBPersistenceAdapter(db, "myapp");
+seq.open();
+store.open();
+
+SharedLogConfig config = SharedLogConfig.builder()
+    .sequencer(seq)
+    .persistenceAdapter(store)
+    .build();
+```
+
+`FoundationDBSequencer.next()` is a read-modify-write FDB transaction on a
+single counter key. FDB's OCC serialises concurrent callers across nodes —
+this is the same mechanism Boki uses for its metalog sequencer.
+
+### Installation
+
+```bash
+# Debian / Ubuntu
+apt install foundationdb-clients   # installs libfdb_c.so
+```
+
+```xml
+<!-- pom.xml — already present as optional -->
+<dependency>
+    <groupId>org.foundationdb</groupId>
+    <artifactId>fdb-java</artifactId>
+    <version>7.3.43</version>
+    <optional>true</optional>
+</dependency>
+```
+
+---
+
 ## Stage 4 — `MmapPersistenceAdapter` (planned)
 
 **Key idea**: map `log.dat` into the process address space via
@@ -226,15 +350,23 @@ This is the current architecture and already benefits from virtual-thread parkin
 ### Roadmap summary
 
 ```
-Stage 1  InMemoryPersistenceAdapter          ← tests, dev
-Stage 2  FileBasedPersistenceAdapter         ← production (2 fdatasyncs / entry)
-Stage 3  BatchingPersistenceAdapter          ← CURRENT: 2 fdatasyncs / N entries
-Stage 4  MmapPersistenceAdapter              ← PLANNED: msync / N entries, zero pwrite64s
-Stage 5  IoUringPersistenceAdapter           ← FUTURE: 1 io_uring_submit / batch
+Local-disk path (single-node)
+──────────────────────────────────────────────────────────────────
+Stage 1   InMemoryPersistenceAdapter     tests, dev (no durability)
+Stage 2   FileBasedPersistenceAdapter    production (2 fdatasyncs / entry)
+Stage 3   BatchingPersistenceAdapter     CURRENT: 2 fdatasyncs / N entries
+Stage 4   MmapPersistenceAdapter         PLANNED: msync / N entries, zero pwrite64s
+Stage 5   IoUringPersistenceAdapter      FUTURE: 1 io_uring_submit / batch
+
+Distributed path (multi-node)
+──────────────────────────────────────────────────────────────────
+Stage 3.5 FoundationDBPersistenceAdapter AVAILABLE: 3-way replicated, 1 FDB txn / batch
+          + FoundationDBSequencer        AVAILABLE: distributed seqnum via FDB OCC
 ```
 
 All stages share the same `PersistenceAdapter` interface.  Switching is a
-one-line config change.
+one-line config change.  The distributed and local-disk paths are fully
+independent — choose based on your deployment requirements.
 
 ---
 

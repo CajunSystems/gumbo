@@ -15,12 +15,13 @@ every component crash-safe and independently restartable with no coordination.
 4. [Module map](#module-map)
 5. [Data model](#data-model)
 6. [Persistence adapters](#persistence-adapters)
-7. [Typed log views (Kryo)](#typed-log-views-kryo)
-8. [Executor model](#executor-model)
-9. [Virtual threads](#virtual-threads)
-10. [Quick start](#quick-start)
-11. [Examples](#examples)
-12. [Building](#building)
+7. [Sequencers](#sequencers)
+8. [Typed log views (Kryo)](#typed-log-views-kryo)
+9. [Executor model](#executor-model)
+10. [Virtual threads](#virtual-threads)
+11. [Quick start](#quick-start)
+12. [Examples](#examples)
+13. [Building](#building)
 
 ---
 
@@ -54,17 +55,23 @@ a single physical log therefore serves many logical streams simultaneously.
 | `SharedLogReadPrev(tag, maxSeqnum)` | `DefaultLogView.readPrevBefore(maxSeqnum)` |
 | `SharedLogCheckTail(tag)` | `DefaultLogView.checkTail()` |
 | Stateless function → rebuild state from log | `Executor<S>` functional fold |
-| Sequencer metalog (drives ordering) | `LocalSequencer` (single-node AtomicLong) |
-| Storage node (durable WAL) | `FileBasedPersistenceAdapter` |
+| Sequencer metalog (drives ordering) | `LocalSequencer` (single-node AtomicLong) or `FoundationDBSequencer` (distributed) |
+| Storage node (durable WAL) | `FileBasedPersistenceAdapter` (local) or `FoundationDBPersistenceAdapter` (distributed) |
 | Pluggable back-ends | `PersistenceAdapter` interface |
+| FDB metalog consensus | `FoundationDBSequencer` — read-modify-write transaction over a single FDB counter key; OCC handles multi-node contention |
 
 ### What this library simplifies
 
 Boki is a distributed system with engine nodes, storage nodes, sequencer nodes,
 ZooKeeper-backed view management, and io_uring async I/O throughout. This library
-targets **single-node** deployments (the `LocalSequencer` is an `AtomicLong`).
-Plugging in a distributed sequencer and a distributed storage adapter is the natural
-extension path; the `Sequencer` and `PersistenceAdapter` interfaces are the seams.
+targets **single-node** deployments by default (the `LocalSequencer` is an `AtomicLong`
+and `FileBasedPersistenceAdapter` writes to local disk).
+
+**For multi-node / production-scale deployments**, plug in
+`FoundationDBPersistenceAdapter` + `FoundationDBSequencer`. FoundationDB handles
+replication, crash recovery, and distributed sequence assignment — the same role
+FDB plays in Boki's metalog. The `Sequencer` and `PersistenceAdapter` interfaces
+are the seams; switching is a configuration change.
 
 ---
 
@@ -220,12 +227,14 @@ src/main/java/com/central/sharedlog/
 ├── persistence/                Storage back-ends
 │   ├── PersistenceAdapter.java Interface — open/close/append/appendBatch/read/trim
 │   ├── InMemoryPersistenceAdapter.java
-│   ├── FileBasedPersistenceAdapter.java  WAL + index + trim files; group-commit via appendBatch
-│   └── BatchingPersistenceAdapter.java   Batches writes → one fdatasync per N entries
+│   ├── FileBasedPersistenceAdapter.java        WAL + index + trim files; group-commit via appendBatch
+│   ├── BatchingPersistenceAdapter.java         Batches writes → one fdatasync per N entries
+│   └── FoundationDBPersistenceAdapter.java     FDB-backed; distributed durability, optional dep
 │
 ├── sequencer/                  Sequence-number generation
 │   ├── Sequencer.java          Interface — next() / current()
-│   └── LocalSequencer.java     AtomicLong; advanceTo() for post-crash reseeding
+│   ├── LocalSequencer.java     AtomicLong; advanceTo() for post-crash reseeding
+│   └── FoundationDBSequencer.java  Distributed; FDB read-modify-write transaction per seqnum
 │
 └── service/                    Wiring
     ├── SharedLogConfig.java    Builder-pattern configuration
@@ -317,6 +326,92 @@ keep the default `FileBasedPersistenceAdapter` (1 `fdatasync` per entry) or use
 See [docs/PERSISTENCE_EVOLUTION.md](docs/PERSISTENCE_EVOLUTION.md) for a full
 analysis of the persistence roadmap including memory-mapped files and io_uring.
 
+### FoundationDBPersistenceAdapter
+
+Backed by [FoundationDB](https://www.foundationdb.org/), this adapter replaces the
+local WAL with a distributed, replicated key-value store.  It is the recommended
+persistence back-end for **multi-node or production-scale deployments**.
+
+#### Subspace layout
+
+```
+{root} / "log"  / seqnum                         → entry bytes
+{root} / "tag"  / namespace / key / seqnum        → localId (8 bytes)
+{root} / "meta" / "latest"                        → latestSeqnum (8 bytes)
+{root} / "meta" / "trim"                          → trimSeqnum (8 bytes)
+{root} / "meta" / "tagcount" / namespace / key    → localIdCount (8 bytes)
+```
+
+FDB's tuple-layer key encoding preserves ordering, so range reads over the log
+subspace naturally return entries in `seqnum` order without a separate index file.
+
+#### Quick start
+
+```java
+// Minimal — uses the default fdb.cluster file
+PersistenceAdapter fdb = new FoundationDBPersistenceAdapter();
+
+SharedLogConfig config = SharedLogConfig.builder()
+    .persistenceAdapter(fdb)
+    .build();
+```
+
+#### Production setup — shared connection with FoundationDBSequencer
+
+For true multi-node operation, use `FoundationDBSequencer` alongside the adapter.
+Sharing a single `Database` instance avoids opening two connections:
+
+```java
+FDB      fdb = FDB.selectAPIVersion(730);
+Database db  = fdb.open("/etc/foundationdb/fdb.cluster");
+
+// Both components share the same connection
+FoundationDBSequencer        seq     = new FoundationDBSequencer(db, "myapp");
+FoundationDBPersistenceAdapter store = new FoundationDBPersistenceAdapter(db, "myapp");
+seq.open();
+store.open();
+
+SharedLogConfig config = SharedLogConfig.builder()
+    .sequencer(store)        // seqnums assigned by FDB — safe across nodes
+    .persistenceAdapter(store)
+    .build();
+```
+
+> **`fdb-java` is an optional Maven dependency.** It pulls in a platform-specific
+> native library (`libfdb_c.so` on Linux).  Projects that do not use the FDB
+> adapter are not affected.
+
+#### When to use FoundationDB in production
+
+| Scenario | Recommendation |
+|---|---|
+| Single-node service, moderate write rate | `BatchingPersistenceAdapter` wrapping `FileBasedPersistenceAdapter` — simpler, lower latency |
+| Multiple writer processes / nodes sharing one log | **`FoundationDBPersistenceAdapter` + `FoundationDBSequencer`** — only option that is safe |
+| Need cross-datacenter replication | **FDB** — configure FDB's built-in DR replication |
+| Write latency is the primary concern (< 1 ms P99) | Local file adapter — FDB adds a network round-trip (~1–5 ms) per commit |
+| Log data must outlive the JVM process and survive node failure | **FDB** — 3-way replication by default |
+| Operational simplicity (no cluster to manage) | Local file adapter |
+| FaaS / serverless: any node can be the writer | **FDB** — distributed seqnum assignment is mandatory |
+
+#### Throughput characteristics
+
+| Configuration | Approximate writes/s |
+|---|---|
+| Single `append()` (one FDB transaction each) | ~200–1 000 |
+| `appendBatch(64 entries)` (one FDB transaction) | ~12 000–64 000 |
+| `BatchingPersistenceAdapter` wrapping FDB adapter | Same as appendBatch above |
+
+FDB transactions have a **10 MB write limit**; `appendBatch` automatically chunks
+batches that would exceed 8 MB.
+
+#### Operational requirements
+
+- FoundationDB cluster running and reachable (default: `/etc/foundationdb/fdb.cluster`)
+- `libfdb_c.so` 7.x installed on every JVM host (`apt install foundationdb-clients` on Debian/Ubuntu)
+- Java binding: `org.foundationdb:fdb-java:7.3.43` (already in `pom.xml` as optional)
+
+---
+
 ### Implementing your own adapter
 
 ```java
@@ -336,6 +431,54 @@ SharedLogConfig config = SharedLogConfig.builder()
     .persistenceAdapter(new RocksDbPersistenceAdapter(path))
     .build();
 ```
+
+---
+
+## Sequencers
+
+The `Sequencer` interface has two implementations:
+
+### LocalSequencer
+
+`AtomicLong`-backed. Suitable for any **single-process** deployment. Starts at
+`0` by default; call `advanceTo(latestSeqnum + 1)` after a restart to avoid
+reusing seqnums.
+
+```java
+// SharedLogService does this automatically on startup
+sequencer.advanceTo(persistenceAdapter.getLatestSeqnum() + 1);
+```
+
+### FoundationDBSequencer
+
+Uses a **read-modify-write FDB transaction** to atomically claim the next seqnum.
+FDB's optimistic concurrency control serialises concurrent callers across all nodes
+transparently — conflicting transactions are retried by the FDB client.
+
+```java
+FoundationDBSequencer seq = new FoundationDBSequencer("/etc/foundationdb/fdb.cluster", "myapp");
+seq.open();
+
+// next() — claims one seqnum, blocks for one FDB round-trip (~1–5 ms)
+long seqnum = seq.next();
+
+// currentGlobal() — reads the authoritative global counter without claiming
+long highWatermark = seq.currentGlobal();
+```
+
+**When to use `FoundationDBSequencer`**:
+
+- Multiple writer processes share the same log — `LocalSequencer` would produce
+  duplicate seqnums across processes.
+- You want the sequencer's counter to survive JVM restarts without manual
+  `advanceTo` reseeding (it is stored durably in FDB).
+- You are already using `FoundationDBPersistenceAdapter` and want the entire
+  write path to be distributed.
+
+**Latency note**: each `next()` call is a FDB round-trip. For high-throughput
+workloads, consider claiming seqnums in batches (reserve a range at once and
+hand them out locally) — this is the same optimisation Boki uses in its sequencer
+metalog to avoid making the sequencer a bottleneck.
 
 ---
 
