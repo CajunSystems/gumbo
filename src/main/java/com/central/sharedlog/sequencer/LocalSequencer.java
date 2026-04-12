@@ -40,4 +40,16 @@ public class LocalSequencer implements Sequencer {
         long v = counter.get() - 1;
         return v < 0 ? -1L : v;
     }
+
+    /**
+     * Advances the counter so that the next {@link #next()} call returns at least
+     * {@code minNext}. Has no effect if the counter is already at or beyond
+     * {@code minNext}. Used by {@code SharedLogService} to reseed from a persisted
+     * latest seqnum after a restart.
+     *
+     * @param minNext the minimum value the next {@link #next()} should return
+     */
+    public void advanceTo(long minNext) {
+        counter.updateAndGet(current -> Math.max(current, minNext));
+    }
 }

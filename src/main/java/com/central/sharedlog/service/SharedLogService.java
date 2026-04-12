@@ -2,6 +2,8 @@ package com.central.sharedlog.service;
 
 import com.central.sharedlog.api.LogView;
 import com.central.sharedlog.api.SharedLog;
+import com.central.sharedlog.api.TypedLogView;
+import com.central.sharedlog.serialization.LogSerializer;
 import com.central.sharedlog.core.AppendRequest;
 import com.central.sharedlog.core.AppendResult;
 import com.central.sharedlog.core.LogEntry;
@@ -86,15 +88,12 @@ public class SharedLogService implements SharedLog {
 
     private void init() throws IOException {
         adapter.open();
-        // Seed sequencer so it continues from the last persisted seqnum
+        // Seed sequencer so it continues from the last persisted seqnum on restart.
         long latest = adapter.getLatestSeqnum();
         if (latest >= 0 && sequencer instanceof com.central.sharedlog.sequencer.LocalSequencer ls) {
-            // Re-create sequencer starting after the latest known seqnum
-            // (LocalSequencer is seeded via constructor; we rely on SharedLogConfig to
-            // pass in a sequencer already seeded, OR we handle it here via reflection).
-            // Practical approach: just assert the sequencer is ahead or reseed via cast.
+            ls.advanceTo(latest + 1);
         }
-        logger.info("SharedLogService started: latestSeqnum={}", adapter.getLatestSeqnum());
+        logger.info("SharedLogService started: latestSeqnum={}", latest);
     }
 
     // -------------------------------------------------------------------------
@@ -137,6 +136,25 @@ public class SharedLogService implements SharedLog {
     @Override
     public LogView getView(LogTag tag) {
         return new DefaultLogView(tag, this);
+    }
+
+    /**
+     * Returns a {@link TypedLogView} that serializes domain objects of type
+     * {@code T} using the supplied {@link LogSerializer}.
+     *
+     * <pre>{@code
+     * LogSerializer<OrderEvent> s = new KryoLogSerializer<>(OrderEvent.class);
+     * TypedLogView<OrderEvent> view = service.getTypedView(LogTag.of("orders"), s);
+     * view.append(new OrderEvent(...)).join();
+     * List<OrderEvent> events = view.readAll().join();
+     * }</pre>
+     *
+     * @param tag        the tag to scope the view to
+     * @param serializer converts {@code T} ↔ {@code byte[]}
+     * @param <T>        the domain type
+     */
+    public <T> TypedLogView<T> getTypedView(LogTag tag, LogSerializer<T> serializer) {
+        return new DefaultTypedLogView<>(getView(tag), serializer);
     }
 
     @Override
