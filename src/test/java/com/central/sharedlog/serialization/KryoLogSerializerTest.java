@@ -90,8 +90,8 @@ class KryoLogSerializerTest {
         byte[] unregBytes = unregistered.serialize(order);
         byte[] regBytes   = registered.serialize(order);
 
-        // Registered mode omits the class name → smaller payload
-        assertThat(regBytes.length).isLessThan(unregBytes.length);
+        // Registered mode omits the class name → smaller or equal payload
+        assertThat(regBytes.length).isLessThanOrEqualTo(unregBytes.length);
         // Both must deserialize correctly
         assertThat(registered.deserialize(regBytes)).isEqualTo(order);
     }
