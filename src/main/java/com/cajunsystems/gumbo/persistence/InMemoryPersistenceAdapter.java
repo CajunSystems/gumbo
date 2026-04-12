@@ -65,9 +65,12 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         ensureOpen();
         log.put(entry.seqnum(), entry);
         for (LogTag tag : entry.tags()) {
+            // Use seqnum as the tagIndex key — it is globally unique across all tags,
+            // avoiding collisions when entries have different primary tags but share a
+            // secondary tag (which would cause localId-keyed entries to overwrite each other).
             tagIndex
                     .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
-                    .put(entry.localId(), entry.seqnum());
+                    .put(entry.seqnum(), entry.seqnum());
             tagLocalIdCount
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
                     .updateAndGet(current -> Math.max(current, entry.localId() + 1));
@@ -119,7 +122,7 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
             LogEntry entry = e.getValue();
             for (LogTag tag : entry.tags()) {
                 ConcurrentSkipListMap<Long, Long> idx = tagIndex.get(tag);
-                if (idx != null) idx.remove(entry.localId());
+                if (idx != null) idx.remove(entry.seqnum());
             }
         }
         toRemove.clear();

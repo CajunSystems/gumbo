@@ -105,6 +105,57 @@ public class SharedLogService implements SharedLog {
         return CompletableFuture.supplyAsync(() -> doAppend(request), asyncPool);
     }
 
+    /**
+     * Appends multiple entries in a single lock acquisition, claiming all seqnums
+     * in one {@link com.cajunsystems.gumbo.sequencer.Sequencer#nextBatch} call.
+     *
+     * <p>With {@link com.cajunsystems.gumbo.sequencer.FoundationDBSequencer} this
+     * reduces sequencer round-trips from N to 1 for an N-entry batch.  Combined
+     * with {@link com.cajunsystems.gumbo.persistence.BatchingPersistenceAdapter}
+     * wrapping the FDB adapter, an N-entry batch costs exactly 2 FDB transactions
+     * (one seqnum claim + one data commit) instead of N + 1.
+     */
+    @Override
+    public CompletableFuture<List<AppendResult>> appendBatch(List<AppendRequest> requests) {
+        if (requests.isEmpty()) return CompletableFuture.completedFuture(List.of());
+        return CompletableFuture.supplyAsync(() -> doAppendBatch(requests), asyncPool);
+    }
+
+    private List<AppendResult> doAppendBatch(List<AppendRequest> requests) {
+        ensureNotClosed();
+        writeLock.lock();
+        try {
+            // Claim all seqnums in a single sequencer call (1 FDB RTT for FoundationDBSequencer)
+            long[] seqnums = sequencer.nextBatch(requests.size());
+
+            List<LogEntry>     entries = new ArrayList<>(requests.size());
+            List<AppendResult> results = new ArrayList<>(requests.size());
+            Instant            now     = Instant.now();
+
+            for (int i = 0; i < requests.size(); i++) {
+                AppendRequest req      = requests.get(i);
+                long          seqnum   = seqnums[i];
+                LogTag        primary  = req.tags().iterator().next();
+                long          localId  = localIdFor(primary);
+                LogEntry      entry    = new LogEntry(seqnum, localId, req.tags(), req.dataUnsafe(), now);
+                entries.add(entry);
+                results.add(new AppendResult(seqnum, localId, primary, now));
+            }
+
+            // Single persistence call — 1 FDB transaction for entire batch when using FDB adapter
+            adapter.appendBatch(entries);
+
+            // Notify subscribers for each entry
+            for (LogEntry entry : entries) notifySubscribers(entry);
+
+            return List.copyOf(results);
+        } catch (IOException e) {
+            throw new LogWriteException("Failed to persist batch of " + requests.size() + " entries", e);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     private AppendResult doAppend(AppendRequest request) {
         ensureNotClosed();
         writeLock.lock();

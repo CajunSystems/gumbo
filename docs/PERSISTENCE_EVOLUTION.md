@@ -108,13 +108,15 @@ new BatchingPersistenceAdapter(new FileBasedPersistenceAdapter(path), 1, 0)
 
 ---
 
-## Stage 3.5 — `FoundationDBPersistenceAdapter` (available, distributed path)
+## FoundationDB Path — Recommended for production
 
 **Location**: `persistence/FoundationDBPersistenceAdapter.java`
 
-This stage is **orthogonal** to the local-file progression (Stages 2–5).  Rather
-than optimising how bytes hit a local disk, it replaces the storage medium entirely
-with a distributed, replicated key-value store.
+This is the **recommended persistence backend for any multi-node or production
+deployment**.  Rather than optimising how bytes hit a local disk, it replaces
+the storage medium entirely with a distributed, replicated key-value store.
+The local-file stages (2–5) remain fully supported for single-node and
+low-latency use cases.
 
 ```
 append(entry)
@@ -188,6 +190,30 @@ each individually durable.
 | Cross-datacenter DR | ✗ Manual rsync / replication | ✓ FDB built-in DR config |
 | No external cluster to operate | ✓ | ✗ Requires FDB cluster |
 | FaaS / stateless compute (any node writes) | ✗ | ✓ Designed for this model |
+
+### Batch seqnum reservation (Boki metalog optimisation)
+
+`FoundationDBSequencer` now implements `Sequencer.nextBatch(int count)`, which
+claims `count` seqnums in a **single FDB read-modify-write transaction** instead
+of one transaction per seqnum.  `SharedLogService.appendBatch(List<AppendRequest>)`
+uses this automatically.
+
+```
+Without appendBatch (N = 64 entries):
+  64 × sequencer.next()         → 64 FDB transactions (sequencer)
+  +  appendBatch on adapter     → 1  FDB transaction  (data)
+  ─────────────────────────────────────────────────────
+  Total: 65 FDB transactions
+
+With appendBatch (N = 64 entries):
+  sequencer.nextBatch(64)       → 1  FDB transaction  (sequencer)
+  +  adapter.appendBatch(64)    → 1  FDB transaction  (data)
+  ─────────────────────────────────────────────────────
+  Total: 2 FDB transactions
+```
+
+This is the same technique the Boki metalog uses: the sequencer issues a single
+cut vector covering N records rather than touching FDB for each individual record.
 
 ### Pairing with FoundationDBSequencer
 
@@ -350,18 +376,19 @@ This is the current architecture and already benefits from virtual-thread parkin
 ### Roadmap summary
 
 ```
-Local-disk path (single-node)
+Distributed path (multi-node) — RECOMMENDED for production
+──────────────────────────────────────────────────────────────────
+FoundationDBPersistenceAdapter   3-way replicated, 1 FDB txn / batch
++ FoundationDBSequencer          distributed seqnum via FDB OCC
++ SharedLog.appendBatch(N)       1 seqnum txn + 1 data txn = 2 FDB RTTs per N entries
+
+Local-disk path (single-node / low-latency)
 ──────────────────────────────────────────────────────────────────
 Stage 1   InMemoryPersistenceAdapter     tests, dev (no durability)
-Stage 2   FileBasedPersistenceAdapter    production (2 fdatasyncs / entry)
+Stage 2   FileBasedPersistenceAdapter    durable WAL (2 fdatasyncs / entry)
 Stage 3   BatchingPersistenceAdapter     CURRENT: 2 fdatasyncs / N entries
 Stage 4   MmapPersistenceAdapter         PLANNED: msync / N entries, zero pwrite64s
 Stage 5   IoUringPersistenceAdapter      FUTURE: 1 io_uring_submit / batch
-
-Distributed path (multi-node)
-──────────────────────────────────────────────────────────────────
-Stage 3.5 FoundationDBPersistenceAdapter AVAILABLE: 3-way replicated, 1 FDB txn / batch
-          + FoundationDBSequencer        AVAILABLE: distributed seqnum via FDB OCC
 ```
 
 All stages share the same `PersistenceAdapter` interface.  Switching is a

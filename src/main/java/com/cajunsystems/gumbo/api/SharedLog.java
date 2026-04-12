@@ -6,6 +6,7 @@ import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
@@ -42,6 +43,34 @@ public interface SharedLog extends AutoCloseable {
      * @return a future that resolves to the assigned {@link AppendResult}
      */
     CompletableFuture<AppendResult> append(AppendRequest request);
+
+    /**
+     * Appends multiple entries to the log, claiming all seqnums in a single
+     * sequencer operation where supported.  Results are returned in the same
+     * order as the input list.
+     *
+     * <p>For distributed deployments backed by
+     * {@link com.cajunsystems.gumbo.sequencer.FoundationDBSequencer}, this
+     * reduces sequencer round-trips from N to 1 for an N-entry batch — the same
+     * optimisation Boki uses in its metalog to avoid the sequencer becoming a
+     * throughput bottleneck.
+     *
+     * <p>The default implementation chains N individual {@link #append} calls
+     * sequentially; production implementations should override for single-operation
+     * seqnum claiming.
+     *
+     * @param requests entries to append; must not be empty
+     * @return a future resolving to results in the same order as {@code requests}
+     */
+    default CompletableFuture<List<AppendResult>> appendBatch(List<AppendRequest> requests) {
+        if (requests.isEmpty()) return CompletableFuture.completedFuture(List.of());
+        List<AppendResult> results = new ArrayList<>(requests.size());
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
+        for (AppendRequest req : requests) {
+            chain = chain.thenCompose(ignored -> append(req).thenAccept(results::add));
+        }
+        return chain.thenApply(ignored -> List.copyOf(results));
+    }
 
     // -------------------------------------------------------------------------
     // Read

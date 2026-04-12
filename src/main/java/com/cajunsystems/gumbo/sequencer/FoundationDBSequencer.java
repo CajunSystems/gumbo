@@ -160,6 +160,35 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
     }
 
     /**
+     * Claims {@code count} consecutive sequence numbers in a <strong>single</strong>
+     * FDB read-modify-write transaction, rather than one transaction per seqnum.
+     *
+     * <p>This is the Boki metalog batch-reservation optimisation: for an N-entry
+     * write batch the sequencer cost drops from N FDB round-trips to 1, which is
+     * the dominant throughput gain when using
+     * {@link com.cajunsystems.gumbo.persistence.BatchingPersistenceAdapter} with
+     * the FDB persistence adapter.
+     *
+     * @param count number of consecutive seqnums to claim; must be &gt; 0
+     * @return array of length {@code count} with consecutive seqnums starting at {@code base}
+     */
+    @Override
+    public long[] nextBatch(int count) {
+        if (count <= 0) throw new IllegalArgumentException("count must be > 0");
+        long base = db.run(tr -> {
+            byte[] val     = tr.get(counterKey).join();
+            long   current = (val == null) ? 0L : ByteBuffer.wrap(val).getLong();
+            long   next    = current + count;
+            tr.set(counterKey, ByteBuffer.allocate(8).putLong(next).array());
+            return current;
+        });
+        lastIssued = base + count - 1;
+        long[] seqnums = new long[count];
+        for (int i = 0; i < count; i++) seqnums[i] = base + i;
+        return seqnums;
+    }
+
+    /**
      * Returns the last seqnum issued by this instance, or {@code -1} if none has
      * been issued in this session.
      *
