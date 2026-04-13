@@ -150,7 +150,7 @@ encode the node and term in the high bits.
 │  append(AppendRequest)                                              │
 │    │                                                                │
 │    ├── writeLock.lock()                                             │
-│    ├── sequencer.next()          ←── LocalSequencer (AtomicLong)   │
+│    ├── sequencer.next()          ←── LocalSequencer (AtomicLong)    │
 │    ├── localIdCounters[tag]++                                       │
 │    ├── new LogEntry(seqnum, localId, tags, data, now)               │
 │    ├── persistenceAdapter.append(entry)                             │
@@ -163,7 +163,7 @@ encode the node and term in the high bits.
 │  getView(tag) ──▶ DefaultLogView                                    │
 │    ├── readNextAfter(minSeqnum)   ← Boki SharedLogReadNext          │
 │    ├── readPrevBefore(maxSeqnum)  ← Boki SharedLogReadPrev          │
-│    └── checkTail()               ← Boki SharedLogCheckTail         │
+│    └── checkTail()               ← Boki SharedLogCheckTail          │
 └─────────────────────────────────────────────────────────────────────┘
            │                              │
            ▼                              ▼
@@ -173,22 +173,22 @@ encode the node and term in the high bits.
 │                      │      │  register(Executor<S>)               │
 │  ┌────────────────┐  │      │  start() → one virtual thread each   │
 │  │  InMemory      │  │      │                                      │
-│  │  (test/dev)    │  │      │  ┌──────────────────────────────┐   │
-│  └────────────────┘  │      │  │  ExecutorRunner<S>           │   │
-│                      │      │  │                              │   │
-│  ┌────────────────┐  │      │  │  1. buildFullState()         │   │
-│  │  FileBased     │  │      │  │     readAll(inputTag)        │   │
-│  │  (production)  │  │      │  │     fold: apply(state, e)*   │   │
-│  │                │  │      │  │                              │   │
-│  │  log.dat       │  │      │  │  2. subscribe(inputTag)      │   │
-│  │  index.dat     │  │      │  │     park on inbox.poll()     │   │
-│  │  trim.dat      │  │      │  │                              │   │
-│  └────────────────┘  │      │  │  3. on new entries:          │   │
-└──────────────────────┘      │  │     apply(state, entry)*     │   │
-                              │  │     execute(state, ctx)      │   │
-                              │  │     → List<AppendRequest>    │   │
-                              │  │     append each to log       │   │
-                              │  └──────────────────────────────┘   │
+│  │  (test/dev)    │  │      │  ┌──────────────────────────────┐    │
+│  └────────────────┘  │      │  │  ExecutorRunner<S>           │    │
+│                      │      │  │                              │    │
+│  ┌────────────────┐  │      │  │  1. buildFullState()         │    │
+│  │  FileBased     │  │      │  │     readAll(inputTag)        │    │
+│  │  (production)  │  │      │  │     fold: apply(state, e)*   │    │
+│  │                │  │      │  │                              │    │
+│  │  log.dat       │  │      │  │  2. subscribe(inputTag)      │    │
+│  │  index.dat     │  │      │  │     park on inbox.poll()     │    │
+│  │  trim.dat      │  │      │  │                              │    │
+│  └────────────────┘  │      │  │  3. on new entries:          │    │
+└──────────────────────┘      │  │     apply(state, entry)*     │    │
+                              │  │     execute(state, ctx)      │    │
+                              │  │     → List<AppendRequest>    │    │
+                              │  │     append each to log       │    │
+                              │  └──────────────────────────────┘    │
                               └──────────────────────────────────────┘
 ```
 
