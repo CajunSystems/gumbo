@@ -243,6 +243,21 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         return Math.max(delegateLatest, pendingLatest);
     }
 
+    @Override
+    public void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
+        delegate.setTagValue(tag, key, value);
+    }
+
+    @Override
+    public byte[] getTagValue(LogTag tag, String key) throws IOException {
+        return delegate.getTagValue(tag, key);
+    }
+
+    @Override
+    public void deleteTagValue(LogTag tag, String key) throws IOException {
+        delegate.deleteTagValue(tag, key);
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------

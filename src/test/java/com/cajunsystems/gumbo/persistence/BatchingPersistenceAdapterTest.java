@@ -273,4 +273,19 @@ class BatchingPersistenceAdapterTest {
         adapter.flushNow();  // flush to delegate
         assertThat(adapter.getLatestSeqnumForTag(TAG)).isEqualTo(0L);
     }
+
+    @Test
+    void setGetTagValue_writeThroughToDelegate() throws IOException {
+        adapter.append(entry(0, TAG));
+        // KV write goes straight to delegate without needing a flush
+        adapter.setTagValue(TAG, "ck", "val".getBytes());
+        assertThat(adapter.getTagValue(TAG, "ck")).isEqualTo("val".getBytes());
+    }
+
+    @Test
+    void deleteTagValue_writeThroughToDelegate() throws IOException {
+        adapter.setTagValue(TAG, "ck", "val".getBytes());
+        adapter.deleteTagValue(TAG, "ck");
+        assertThat(adapter.getTagValue(TAG, "ck")).isNull();
+    }
 }
