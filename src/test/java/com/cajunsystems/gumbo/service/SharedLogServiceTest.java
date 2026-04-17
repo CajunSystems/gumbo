@@ -21,7 +21,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 class SharedLogServiceTest {
@@ -229,19 +228,36 @@ class SharedLogServiceTest {
     }
 
     @Test
-    void kvApi_throwsUnsupportedBeforeImplementation() {
-        // Documents that KV methods exist on the API; will be replaced in Phase 5 with real assertions.
+    void kvApi_setAndGetValue() throws Exception {
         LogView view = service.getView(ORDERS);
 
-        assertThatThrownBy(() -> view.setValue("ck", "42".getBytes()).join())
-            .isInstanceOf(java.util.concurrent.CompletionException.class)
-            .cause().isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> view.getValue("ck").join())
-            .isInstanceOf(java.util.concurrent.CompletionException.class)
-            .cause().isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> view.deleteValue("ck").join())
-            .isInstanceOf(java.util.concurrent.CompletionException.class)
-            .cause().isInstanceOf(UnsupportedOperationException.class);
+        view.setValue("checkpoint", "100".getBytes()).join();
+        byte[] result = view.getValue("checkpoint").join();
+
+        assertThat(result).isEqualTo("100".getBytes());
+        assertThat(view.getValue("nonexistent").join()).isNull();
+    }
+
+    @Test
+    void kvApi_deleteValue() throws Exception {
+        LogView view = service.getView(ORDERS);
+
+        view.setValue("ck", "val".getBytes()).join();
+        view.deleteValue("ck").join();
+
+        assertThat(view.getValue("ck").join()).isNull();
+    }
+
+    @Test
+    void kvApi_isolatedPerTag() throws Exception {
+        LogView ordersView    = service.getView(ORDERS);
+        LogView inventoryView = service.getView(INVENTORY);
+
+        ordersView.setValue("ck", "orders-val".getBytes()).join();
+        inventoryView.setValue("ck", "inventory-val".getBytes()).join();
+
+        assertThat(ordersView.getValue("ck").join()).isEqualTo("orders-val".getBytes());
+        assertThat(inventoryView.getValue("ck").join()).isEqualTo("inventory-val".getBytes());
     }
 
     @Test

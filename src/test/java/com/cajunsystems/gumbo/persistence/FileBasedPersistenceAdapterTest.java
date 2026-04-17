@@ -179,6 +179,42 @@ class FileBasedPersistenceAdapterTest {
     }
 
     // -------------------------------------------------------------------------
+    // KV tests
+    // -------------------------------------------------------------------------
+
+    @Test
+    void setGetTagValue_roundtrip() throws IOException {
+        adapter.setTagValue(TAG_ORDERS, "ck", "42".getBytes());
+        assertThat(adapter.getTagValue(TAG_ORDERS, "ck")).isEqualTo("42".getBytes());
+    }
+
+    @Test
+    void getTagValue_returnsNullWhenAbsent() {
+        assertThat(adapter.getTagValue(TAG_ORDERS, "missing")).isNull();
+    }
+
+    @Test
+    void deleteTagValue_removesValue() throws IOException {
+        adapter.setTagValue(TAG_ORDERS, "ck", "42".getBytes());
+        adapter.deleteTagValue(TAG_ORDERS, "ck");
+        assertThat(adapter.getTagValue(TAG_ORDERS, "ck")).isNull();
+    }
+
+    @Test
+    void kvPersistsAcrossReopen() throws IOException {
+        adapter.setTagValue(TAG_ORDERS, "ck", "persisted".getBytes());
+        adapter.close();
+
+        FileBasedPersistenceAdapter adapter2 = new FileBasedPersistenceAdapter(tempDir);
+        adapter2.open();
+        try {
+            assertThat(adapter2.getTagValue(TAG_ORDERS, "ck")).isEqualTo("persisted".getBytes());
+        } finally {
+            adapter2.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
 
     private static LogEntry entry(long seqnum, long localId, LogTag tag, String data) {
         return entry(seqnum, localId, tag, data.getBytes());

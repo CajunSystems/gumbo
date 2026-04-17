@@ -79,6 +79,9 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     private FileChannel logChannel;
     /** Durable write channel for the index; opened in APPEND mode. */
     private FileChannel indexChannel;
+    /** Durable write channel for the KV store; opened in APPEND mode. */
+    private FileChannel kvChannel;
+    private final ConcurrentHashMap<LogTag, ConcurrentHashMap<String, byte[]>> kvStore = new ConcurrentHashMap<>();
 
     /** In-memory global index: seqnum → file offset in log.dat */
     private final ConcurrentSkipListMap<Long, Long> globalIndex = new ConcurrentSkipListMap<>();
@@ -141,6 +144,12 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         indexChannel = FileChannel.open(indexFile,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
 
+        Path kvFile = dataDir.resolve("kv.dat");
+        if (Files.exists(kvFile)) {
+            loadKvFile(kvFile);
+        }
+        kvChannel = FileChannel.open(kvFile, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+
         open = true;
         log.info("FileBasedPersistenceAdapter opened: dir={}, entries={}, latestSeqnum={}",
                 dataDir, globalIndex.size(), getLatestSeqnum());
@@ -152,6 +161,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         open = false;
         closeQuietly(logChannel);
         closeQuietly(indexChannel);
+        closeQuietly(kvChannel);
         log.info("FileBasedPersistenceAdapter closed");
     }
 
@@ -301,6 +311,79 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         ConcurrentSkipListMap<Long, Long> idx = tagSeqnums.get(tag);
         if (idx == null || idx.isEmpty()) return -1L;
         return idx.lastKey();
+    }
+
+    // -------------------------------------------------------------------------
+    // Key-Value
+    // -------------------------------------------------------------------------
+
+    @Override
+    public void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
+        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+        writeKvRecord(tag, key, value);
+    }
+
+    @Override
+    public byte[] getTagValue(LogTag tag, String key) {
+        ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
+        return tagKv == null ? null : tagKv.get(key);
+    }
+
+    @Override
+    public void deleteTagValue(LogTag tag, String key) throws IOException {
+        ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
+        if (tagKv != null) tagKv.remove(key);
+        writeKvRecord(tag, key, null);  // null → tombstone (valLen = -1)
+    }
+
+    private void loadKvFile(Path kvFile) throws IOException {
+        byte[] bytes = Files.readAllBytes(kvFile);
+        ByteBuffer buf = ByteBuffer.wrap(bytes);
+        while (buf.remaining() >= 2) {
+            if (buf.remaining() < 2) break;
+            String ns     = readShortString(buf);
+            if (buf.remaining() < 2) break;
+            String tagKey = readShortString(buf);
+            if (buf.remaining() < 2) break;
+            String kvKey  = readShortString(buf);
+            if (buf.remaining() < 4) break;
+            int valLen = buf.getInt();
+            LogTag tag = LogTag.of(ns, tagKey);
+            if (valLen < 0) {
+                // tombstone — delete
+                ConcurrentHashMap<String, byte[]> m = kvStore.get(tag);
+                if (m != null) m.remove(kvKey);
+            } else {
+                if (buf.remaining() < valLen) break;
+                byte[] value = new byte[valLen];
+                buf.get(value);
+                kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(kvKey, value);
+            }
+        }
+    }
+
+    private static String readShortString(ByteBuffer buf) {
+        int len = Short.toUnsignedInt(buf.getShort());
+        byte[] b = new byte[len];
+        buf.get(b);
+        return new String(b, StandardCharsets.UTF_8);
+    }
+
+    private void writeKvRecord(LogTag tag, String kvKey, byte[] value) throws IOException {
+        byte[] nsBytes  = tag.namespace().getBytes(StandardCharsets.UTF_8);
+        byte[] tagBytes = tag.key().getBytes(StandardCharsets.UTF_8);
+        byte[] keyBytes = kvKey.getBytes(StandardCharsets.UTF_8);
+        int valueLen = (value == null) ? -1 : value.length;
+        int capacity = 2 + nsBytes.length + 2 + tagBytes.length + 2 + keyBytes.length + 4
+                       + (valueLen > 0 ? valueLen : 0);
+        ByteBuffer buf = ByteBuffer.allocate(capacity);
+        buf.putShort((short) nsBytes.length);  buf.put(nsBytes);
+        buf.putShort((short) tagBytes.length); buf.put(tagBytes);
+        buf.putShort((short) keyBytes.length); buf.put(keyBytes);
+        buf.putInt(valueLen);
+        if (valueLen > 0) buf.put(value);
+        buf.flip();
+        while (buf.hasRemaining()) kvChannel.write(buf);
     }
 
     // -------------------------------------------------------------------------
