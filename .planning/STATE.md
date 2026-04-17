@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-04-17)
 
 **Core value:** Efficient positional reads and per-tag offset queries to unblock actor system replay from checkpoints
-**Current focus:** Phase 5 — Key-value implementation
+**Current focus:** Phase 7 — Version + distribution (complete)
 
 ## Current Position
 
-Phase: 6 of 6 (TypedLogView + integration)
+Phase: 7 of 7 (Version + distribution)
 Plan: Complete
-Status: All 6 phases complete
-Last activity: 2026-04-17 — 06-02 complete: ActorCheckpointExample + README actor checkpoints section
+Status: All 7 phases complete
+Last activity: 2026-04-17 — 07-01 complete: pom.xml 0.2.0, jitpack.yml, README Installation section, CHANGELOG.md
 
-Progress: ██████████ 100% (9/11 plans — Phase 1 plan 01-02 deferred; roadmap complete)
+Progress: ██████████ 100% (10/12 plans — Phase 1 plan 01-02 deferred; roadmap complete)
 
 ## Performance Metrics
 
@@ -50,8 +50,12 @@ None yet.
 
 None yet.
 
+## Roadmap Evolution
+
+- Phase 7 added 2026-04-17: Version + distribution — bump to 0.2.0, JitPack setup, CHANGELOG.md
+
 ## Session Continuity
 
 Last session: 2026-04-17
-Stopped at: 06-02 complete — ActorCheckpointExample + README. All 6 phases done. Project objective achieved.
+Stopped at: 07-01 complete — pom.xml 0.2.0, jitpack.yml, README Installation, CHANGELOG.md. All 7 phases done.
 Resume file: None

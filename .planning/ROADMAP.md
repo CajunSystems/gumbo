@@ -16,6 +16,7 @@ None
 - [ ] **Phase 4: Key-value API design** — Design `setValue`/`getValue` interface with persistence semantics
 - [ ] **Phase 5: Key-value implementation** — Implement key-value across all 4 adapters
 - [ ] **Phase 6: TypedLogView + integration** — Surface new APIs through `TypedLogView<T>`, update docs and examples
+- [ ] **Phase 7: Version + distribution** — Bump to 0.2.0, configure JitPack distribution, create CHANGELOG.md
 
 ## Phase Details
 
@@ -77,6 +78,15 @@ Plans:
 - [x] 06-01: Add 5 methods to TypedLogView; DefaultTypedLogView delegation; 5 new tests (43ee248, e449dbf)
 - [x] 06-02: ActorCheckpointExample + README "Actor checkpoints" section (93b0467, 0a5f3a2)
 
+### Phase 7: Version + distribution
+**Goal**: Bump `pom.xml` version to `0.2.0`, configure JitPack distribution (badge + install instructions in README), create `CHANGELOG.md` documenting all changes from Phases 1–6
+**Depends on**: Phase 6
+**Research**: Unlikely (JitPack works from GitHub tags; pom.xml bump + README additions)
+**Plans**: TBD
+
+Plans:
+- [x] 07-01: Bump version, add JitPack config + README badge/install, create CHANGELOG.md (931d8d5, f8d2b64, 89167d7)
+
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
@@ -87,3 +97,4 @@ Plans:
 | 4. Key-value API design | 1/1 | Complete | 2026-04-17 |
 | 5. Key-value implementation | 2/2 | Complete | 2026-04-17 |
 | 6. TypedLogView + integration | 2/2 | Complete | 2026-04-17 |
+| 7. Version + distribution | 1/1 | Complete | 2026-04-17 |
