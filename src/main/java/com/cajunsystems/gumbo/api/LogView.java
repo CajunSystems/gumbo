@@ -93,4 +93,22 @@ public interface LogView {
         long s = getLatestSeqnum();
         return subscribe(new LogPosition(Math.max(0, s + 1)), listener);
     }
+
+    // ── Key-Value ──
+
+    /**
+     * Durably stores {@code value} under {@code key} in this view's tag-scoped
+     * key-value store. Overwrites any existing value.
+     */
+    CompletableFuture<Void> setValue(String key, byte[] value);
+
+    /**
+     * Returns the stored value for {@code key}, or {@code null} if absent.
+     */
+    CompletableFuture<byte[]> getValue(String key);
+
+    /**
+     * Removes the stored value for {@code key}. No-op if absent.
+     */
+    CompletableFuture<Void> deleteValue(String key);
 }

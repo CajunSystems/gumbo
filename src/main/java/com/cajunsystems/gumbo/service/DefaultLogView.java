@@ -120,6 +120,39 @@ public class DefaultLogView implements LogView {
         return readPrevBefore(Long.MAX_VALUE);
     }
 
+    @Override
+    public CompletableFuture<Void> setValue(String key, byte[] value) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                service.adapter().setTagValue(tag, key, value);
+            } catch (IOException e) {
+                throw new SharedLogService.LogReadException("setValue failed for tag=" + tag + " key=" + key, e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<byte[]> getValue(String key) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return service.adapter().getTagValue(tag, key);
+            } catch (IOException e) {
+                throw new SharedLogService.LogReadException("getValue failed for tag=" + tag + " key=" + key, e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteValue(String key) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                service.adapter().deleteTagValue(tag, key);
+            } catch (IOException e) {
+                throw new SharedLogService.LogReadException("deleteValue failed for tag=" + tag + " key=" + key, e);
+            }
+        });
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

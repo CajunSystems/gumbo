@@ -152,4 +152,31 @@ public interface PersistenceAdapter extends AutoCloseable {
         List<LogEntry> entries = readByTag(tag, 0L);
         return entries.isEmpty() ? -1L : entries.get(entries.size() - 1).seqnum();
     }
+
+    // ── Key-Value ──
+
+    /**
+     * Durably stores {@code value} under {@code key} for {@code tag}.
+     * Overwrites any existing value. Value of {@code null} is not permitted; use
+     * {@link #deleteTagValue} to remove a key.
+     */
+    default void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
+        throw new UnsupportedOperationException("setTagValue not implemented by " + getClass().getSimpleName());
+    }
+
+    /**
+     * Returns the stored value for {@code key} under {@code tag}, or {@code null}
+     * if the key has never been set (or was deleted).
+     */
+    default byte[] getTagValue(LogTag tag, String key) throws IOException {
+        throw new UnsupportedOperationException("getTagValue not implemented by " + getClass().getSimpleName());
+    }
+
+    /**
+     * Removes the stored value for {@code key} under {@code tag}. No-op if the
+     * key does not exist.
+     */
+    default void deleteTagValue(LogTag tag, String key) throws IOException {
+        throw new UnsupportedOperationException("deleteTagValue not implemented by " + getClass().getSimpleName());
+    }
 }
