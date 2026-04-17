@@ -40,6 +40,10 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
     private final ConcurrentHashMap<LogTag, AtomicLong> tagLocalIdCount =
             new ConcurrentHashMap<>();
 
+    /** Per-tag key-value store for arbitrary metadata. */
+    private final ConcurrentHashMap<LogTag, ConcurrentHashMap<String, byte[]>> kvStore =
+            new ConcurrentHashMap<>();
+
     private volatile boolean open = false;
 
     // -------------------------------------------------------------------------
@@ -144,6 +148,23 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         ConcurrentSkipListMap<Long, Long> idx = tagIndex.get(tag);
         if (idx == null || idx.isEmpty()) return -1L;
         return idx.lastKey();
+    }
+
+    @Override
+    public void setTagValue(LogTag tag, String key, byte[] value) {
+        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+    }
+
+    @Override
+    public byte[] getTagValue(LogTag tag, String key) {
+        ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
+        return tagKv == null ? null : tagKv.get(key);
+    }
+
+    @Override
+    public void deleteTagValue(LogTag tag, String key) {
+        ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
+        if (tagKv != null) tagKv.remove(key);
     }
 
     // -------------------------------------------------------------------------

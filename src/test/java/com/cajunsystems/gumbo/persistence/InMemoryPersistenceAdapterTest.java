@@ -173,6 +173,38 @@ class InMemoryPersistenceAdapterTest {
     }
 
     // -------------------------------------------------------------------------
+    // KV store
+    // -------------------------------------------------------------------------
+
+    @Test
+    void setGetTagValue_roundtrip() {
+        adapter.setTagValue(TAG_A, "ck", "42".getBytes());
+        assertThat(adapter.getTagValue(TAG_A, "ck")).isEqualTo("42".getBytes());
+    }
+
+    @Test
+    void getTagValue_returnsNullWhenAbsent() {
+        assertThat(adapter.getTagValue(TAG_A, "missing")).isNull();
+    }
+
+    @Test
+    void deleteTagValue_removesValue() {
+        adapter.setTagValue(TAG_A, "ck", "42".getBytes());
+        adapter.deleteTagValue(TAG_A, "ck");
+        assertThat(adapter.getTagValue(TAG_A, "ck")).isNull();
+    }
+
+    @Test
+    void kvIsolatedBetweenTags() {
+        adapter.setTagValue(TAG_A, "ck", "a-val".getBytes());
+        adapter.setTagValue(TAG_B, "ck", "b-val".getBytes());
+
+        assertThat(adapter.getTagValue(TAG_A, "ck")).isEqualTo("a-val".getBytes());
+        assertThat(adapter.getTagValue(TAG_B, "ck")).isEqualTo("b-val".getBytes());
+        assertThat(adapter.getTagValue(TAG_A, "other")).isNull();
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
