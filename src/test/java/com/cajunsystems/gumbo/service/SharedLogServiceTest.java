@@ -21,6 +21,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
 class SharedLogServiceTest {
@@ -225,6 +226,22 @@ class SharedLogServiceTest {
         assertThat(ordersLatest).isGreaterThan(inventoryLatest);   // orders got a later seqnum
         assertThat(inventoryLatest).isGreaterThanOrEqualTo(0L);
         assertThat(ordersView.getLatestSeqnum()).isEqualTo(ordersLatest); // stable
+    }
+
+    @Test
+    void kvApi_throwsUnsupportedBeforeImplementation() {
+        // Documents that KV methods exist on the API; will be replaced in Phase 5 with real assertions.
+        LogView view = service.getView(ORDERS);
+
+        assertThatThrownBy(() -> view.setValue("ck", "42".getBytes()).join())
+            .isInstanceOf(java.util.concurrent.CompletionException.class)
+            .cause().isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> view.getValue("ck").join())
+            .isInstanceOf(java.util.concurrent.CompletionException.class)
+            .cause().isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> view.deleteValue("ck").join())
+            .isInstanceOf(java.util.concurrent.CompletionException.class)
+            .cause().isInstanceOf(UnsupportedOperationException.class);
     }
 
     @Test
