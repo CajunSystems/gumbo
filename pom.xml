@@ -6,7 +6,7 @@
 
     <groupId>com.cajunsystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <name>Shared Log</name>

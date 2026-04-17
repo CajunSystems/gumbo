@@ -881,7 +881,7 @@ Requires Java 21 and Maven 3.9+.
 
 ```bash
 mvn verify          # compile + test
-mvn package         # produce sharedlog-1.0.0-SNAPSHOT.jar
+mvn package         # produce gumbo-0.2.0.jar
 ```
 
 GitHub Actions runs `mvn verify` on every push using Java 21 (Temurin).
