@@ -139,4 +139,17 @@ public interface PersistenceAdapter extends AutoCloseable {
      * that tag).
      */
     long getLocalIdCountForTag(LogTag tag);
+
+    /**
+     * Returns the highest {@code seqnum} of any entry visible to {@code tag},
+     * or {@code -1} if the tag has no entries.
+     *
+     * <p>Implementations should satisfy this in O(1) or O(log n) using maintained
+     * metadata rather than a full log scan. The default implementation falls back
+     * to a full scan via {@link #readByTag} and should be overridden.
+     */
+    default long getLatestSeqnumForTag(LogTag tag) throws IOException {
+        List<LogEntry> entries = readByTag(tag, 0L);
+        return entries.isEmpty() ? -1L : entries.get(entries.size() - 1).seqnum();
+    }
 }

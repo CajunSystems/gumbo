@@ -139,6 +139,13 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         return counter == null ? 0L : counter.get();
     }
 
+    @Override
+    public long getLatestSeqnumForTag(LogTag tag) {
+        ConcurrentSkipListMap<Long, Long> idx = tagIndex.get(tag);
+        if (idx == null || idx.isEmpty()) return -1L;
+        return idx.lastKey();
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------

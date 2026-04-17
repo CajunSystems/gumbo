@@ -296,6 +296,13 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         return c == null ? 0L : c.get();
     }
 
+    @Override
+    public long getLatestSeqnumForTag(LogTag tag) {
+        ConcurrentSkipListMap<Long, Long> idx = tagSeqnums.get(tag);
+        if (idx == null || idx.isEmpty()) return -1L;
+        return idx.lastKey();
+    }
+
     // -------------------------------------------------------------------------
     // Encoding / decoding
     // -------------------------------------------------------------------------
