@@ -29,9 +29,9 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
     private final ConcurrentSkipListMap<Long, LogEntry> log = new ConcurrentSkipListMap<>();
 
     /**
-     * Per-tag index: tag → (localId → seqnum).
-     * Entries within a tag are ordered by localId which is also seqnum-ordered
-     * because we assign localIds at the same time we assign seqnums.
+     * Per-tag index: tag → (seqnum → seqnum).
+     * Keys and values are both the global seqnum; using seqnum as key enables
+     * O(log N) positional seeks via tailMap.
      */
     private final ConcurrentHashMap<LogTag, ConcurrentSkipListMap<Long, Long>> tagIndex =
             new ConcurrentHashMap<>();
@@ -96,18 +96,13 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         ConcurrentSkipListMap<Long, Long> idx = tagIndex.get(tag);
         if (idx == null || idx.isEmpty()) return Collections.emptyList();
 
-        // The tag index maps localId → seqnum; we need entries with seqnum >= fromSeqnum.
-        // Walk the tag index and skip entries below fromSeqnum.
-        List<LogEntry> result = new ArrayList<>();
-        for (long seqnum : idx.values()) {
-            if (seqnum >= fromSeqnum) {
-                LogEntry e = log.get(seqnum);
-                if (e != null) result.add(e);
-            }
+        NavigableMap<Long, Long> range = idx.tailMap(fromSeqnum, true);
+        List<LogEntry> result = new ArrayList<>(range.size());
+        for (long seqnum : range.keySet()) {
+            LogEntry e = log.get(seqnum);
+            if (e != null) result.add(e);
         }
-        // Result may be out of seqnum order if localIds were assigned non-monotonically
-        // (they shouldn't be, but sort for safety).
-        result.sort((a, b) -> Long.compare(a.seqnum(), b.seqnum()));
+        // No sort needed: ConcurrentSkipListMap.tailMap preserves ascending key order
         return Collections.unmodifiableList(result);
     }
 
