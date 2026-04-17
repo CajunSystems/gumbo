@@ -75,7 +75,7 @@ Plans:
 
 Plans:
 - [x] 06-01: Add 5 methods to TypedLogView; DefaultTypedLogView delegation; 5 new tests (43ee248, e449dbf)
-- [ ] 06-02: Update examples (OrderFulfilmentExample, WorkflowExecutorExample) to show actor replay pattern; update README
+- [x] 06-02: ActorCheckpointExample + README "Actor checkpoints" section (93b0467, 0a5f3a2)
 
 ## Progress
 
@@ -86,4 +86,4 @@ Plans:
 | 3. Push-tail subscribe | 1/1 | Complete | 2026-04-17 |
 | 4. Key-value API design | 1/1 | Complete | 2026-04-17 |
 | 5. Key-value implementation | 2/2 | Complete | 2026-04-17 |
-| 6. TypedLogView + integration | 1/2 | In progress | — |
+| 6. TypedLogView + integration | 2/2 | Complete | 2026-04-17 |
