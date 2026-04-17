@@ -548,6 +548,54 @@ Kryo instances are pooled internally so the serializer is fully thread-safe.
 
 ---
 
+## Actor checkpoints
+
+An actor built on gumbo maps to a `LogTag` inbox. After startup it must replay
+messages it missed (backlog), then switch seamlessly to live delivery.
+
+Three APIs make this efficient:
+
+| API | What it does | Complexity |
+|-----|-------------|------------|
+| `logView.getLatestSeqnum()` | Highest seqnum in the tag's log | O(1) |
+| `logView.readFrom(position, max)` | Read entries starting at a seqnum | O(K) |
+| `logView.subscribeTail(listener)` | Deliver only future entries, no backlog | O(1) |
+| `logView.setValue(key, value)` | Persist a durable KV checkpoint | O(1) |
+| `logView.getValue(key)` | Read a durable KV checkpoint | O(1) |
+
+### Checkpoint → replay → live
+
+```java
+LogView inbox = service.getView(LogTag.of("actor", "orders"));
+
+// 1. Read saved checkpoint (null on first start)
+byte[] saved = inbox.getValue("checkpoint").join();
+long resumeFrom = saved != null
+    ? ByteBuffer.wrap(saved).getLong() + 1  // resume after last processed seqnum
+    : 0L;
+
+// 2. Replay the backlog from checkpoint
+List<LogEntry> backlog = inbox.readFrom(new LogPosition(resumeFrom), 1000).join();
+for (LogEntry e : backlog) {
+    process(e);
+    inbox.setValue("checkpoint", ByteBuffer.allocate(8).putLong(e.seqnum()).array()).join();
+}
+
+// 3. Switch to live delivery (no backlog, no polling)
+SharedLog.Subscription sub = inbox.subscribeTail(e -> {
+    process(e);
+    inbox.setValue("checkpoint", ByteBuffer.allocate(8).putLong(e.seqnum()).array()).join();
+});
+```
+
+The checkpoint seqnum is stored in the tag's per-actor KV store — durable in
+`FileBasedPersistenceAdapter` and `FoundationDBPersistenceAdapter`, in-memory only in
+`InMemoryPersistenceAdapter`.
+
+See [`ActorCheckpointExample.java`](src/test/java/com/cajunsystems/gumbo/examples/ActorCheckpointExample.java) for a runnable version.
+
+---
+
 ## Executor model
 
 Executors are the **stateless workers** of the system. Each executor is associated
@@ -814,6 +862,7 @@ sync with the library.
 | [`OrderFulfilmentExample.java`](src/test/java/com/cajunsystems/gumbo/examples/OrderFulfilmentExample.java) | Stateless executor: backlog replay on startup, then incremental processing |
 | [`FilePersistedExample.java`](src/test/java/com/cajunsystems/gumbo/examples/FilePersistedExample.java) | File-backed WAL: durability, crash recovery, and sequencer reseeding across restarts |
 | [`WorkflowExecutorExample.java`](src/test/java/com/cajunsystems/gumbo/examples/WorkflowExecutorExample.java) | Multi-stage workflow: chained executors advance items through SUBMITTED → PROCESSING → COMPLETE states |
+| [`ActorCheckpointExample.java`](src/test/java/com/cajunsystems/gumbo/examples/ActorCheckpointExample.java) | Actor checkpoint pattern: resume from KV checkpoint, replay backlog, switch to live via `subscribeTail()` |
 
 Run a single example directly:
 
