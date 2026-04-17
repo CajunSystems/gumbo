@@ -65,7 +65,7 @@ Plans:
 
 Plans:
 - [x] 05-01: KV in InMemory (ConcurrentHashMap) + FileBased (kv.dat append-log); kvPersistsAcrossReopen test (929d0d6, d4fa4c4)
-- [ ] 05-02: Implement in Batching and FoundationDB adapters; durability and recovery tests
+- [x] 05-02: KV write-through in Batching; kvSubspace in FDB; full suite passes (a1ad368, 5e581c0)
 
 ### Phase 6: TypedLogView + integration
 **Goal**: Surface `readFrom`, `latestSeqnum`, push-tail subscribe, and key-value through `TypedLogView<T>`; update Javadoc, examples, and README
@@ -85,5 +85,5 @@ Plans:
 | 2. Per-tag latestSeqnum | 2/2 | Complete | 2026-04-17 |
 | 3. Push-tail subscribe | 1/1 | Complete | 2026-04-17 |
 | 4. Key-value API design | 1/1 | Complete | 2026-04-17 |
-| 5. Key-value implementation | 1/2 | In progress | — |
+| 5. Key-value implementation | 2/2 | Complete | 2026-04-17 |
 | 6. TypedLogView + integration | 0/2 | Not started | — |
