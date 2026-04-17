@@ -46,8 +46,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 03-01: Add tail-subscribe mode to `LogView` interface; implement in `SharedLogService` subscription infrastructure
-- [ ] 03-02: Validate across all adapters; test live+replay handoff, no spurious backlog delivery
+- [x] 03-01: Close-out — subscribeTail() was pre-existing and fully correct; zero implementation needed (cbd7d3a)
 
 ### Phase 4: Key-value API design
 **Goal**: Design the `setValue(key, value)` / `getValue(key)` interface — decide scope (global vs. per-tag), persistence semantics (in-log entry vs. sidecar structure), durability guarantees per adapter
@@ -84,7 +83,7 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Efficient readFrom | 1/2 | In progress | — |
 | 2. Per-tag latestSeqnum | 2/2 | Complete | 2026-04-17 |
-| 3. Push-tail subscribe | 0/2 | Not started | — |
+| 3. Push-tail subscribe | 1/1 | Complete | 2026-04-17 |
 | 4. Key-value API design | 0/1 | Not started | — |
 | 5. Key-value implementation | 0/2 | Not started | — |
 | 6. TypedLogView + integration | 0/2 | Not started | — |
