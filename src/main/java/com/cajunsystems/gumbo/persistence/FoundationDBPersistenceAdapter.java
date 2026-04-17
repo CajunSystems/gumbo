@@ -99,6 +99,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private static final String LATEST_KEY  = "latest";
     private static final String TAGCOUNT_NS  = "tagcount";
     private static final String TAGLATEST_NS = "taglatest";
+    private static final String KV_NS        = "kv";
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -114,6 +115,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private Subspace metaSubspace;
     private Subspace tagCountSubspace;
     private Subspace tagLatestSubspace;
+    private Subspace kvSubspace;
 
     // -------------------------------------------------------------------------
     // In-memory caches (populated on open, kept current on every write)
@@ -207,6 +209,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         metaSubspace     = root.subspace(Tuple.from(META_NS));
         tagCountSubspace  = metaSubspace.subspace(Tuple.from(TAGCOUNT_NS));
         tagLatestSubspace = metaSubspace.subspace(Tuple.from(TAGLATEST_NS));
+        kvSubspace        = root.subspace(Tuple.from(KV_NS));
     }
 
     private void loadMetadata() {
@@ -472,6 +475,29 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public long getLatestSeqnumForTag(LogTag tag) {
         AtomicLong c = tagLatestSeqnum.get(tag);
         return c == null ? -1L : c.get();
+    }
+
+    @Override
+    public void setTagValue(LogTag tag, String key, byte[] value) {
+        db.run(tr -> {
+            tr.set(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)), value);
+            return null;
+        });
+    }
+
+    @Override
+    public byte[] getTagValue(LogTag tag, String key) {
+        return db.run(tr ->
+            tr.get(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key))).join()
+        );
+    }
+
+    @Override
+    public void deleteTagValue(LogTag tag, String key) {
+        db.run(tr -> {
+            tr.clear(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
+            return null;
+        });
     }
 
     // =========================================================================
