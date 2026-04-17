@@ -187,4 +187,38 @@ class TypedLogViewTest {
         assertThat(view.readAll().join()).containsExactly(new OrderEvent("ord-1", "placed"));
         assertThat(metrics.readAll().join()).containsExactly(new Metric("latency_ms", 42.5));
     }
+
+    // ── getLatestSeqnum tests ──
+
+    @Test
+    void getLatestSeqnum_returnsNegativeOneWhenEmpty() {
+        assertThat(view.getLatestSeqnum()).isEqualTo(-1L);
+    }
+
+    @Test
+    void getLatestSeqnum_returnsSeqnumAfterAppend() throws Exception {
+        view.append(new OrderEvent("ord-1", "placed")).join();
+        assertThat(view.getLatestSeqnum()).isGreaterThanOrEqualTo(0L);
+    }
+
+    // ── KV tests ──
+
+    @Test
+    void setValue_andGetValue_roundtrip() throws Exception {
+        view.setValue("ck", "checkpoint-data".getBytes()).join();
+        byte[] result = view.getValue("ck").join();
+        assertThat(result).isEqualTo("checkpoint-data".getBytes());
+    }
+
+    @Test
+    void getValue_returnsNullWhenAbsent() throws Exception {
+        assertThat(view.getValue("nonexistent").join()).isNull();
+    }
+
+    @Test
+    void deleteValue_removesEntry() throws Exception {
+        view.setValue("ck", "val".getBytes()).join();
+        view.deleteValue("ck").join();
+        assertThat(view.getValue("ck").join()).isNull();
+    }
 }
