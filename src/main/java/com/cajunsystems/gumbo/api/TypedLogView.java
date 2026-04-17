@@ -105,6 +105,28 @@ public interface TypedLogView<T> {
     /** Subscribes from the current tail (future entries only). */
     SharedLog.Subscription subscribeTail(Consumer<T> listener);
 
+    // ── Metadata ──
+
+    /** Returns the highest seqnum of any entry for this view's tag, or -1 if empty. */
+    long getLatestSeqnum();
+
+    /** Returns a {@link LogPosition} positioned at the current latest entry. */
+    default LogPosition currentPosition() {
+        long s = getLatestSeqnum();
+        return s < 0 ? LogPosition.BEGINNING : new LogPosition(s);
+    }
+
+    // ── Key-Value ──
+
+    /** Durably stores {@code value} under {@code key} in this view's tag-scoped KV store. */
+    CompletableFuture<Void> setValue(String key, byte[] value);
+
+    /** Returns the stored value for {@code key}, or {@code null} if absent. */
+    CompletableFuture<byte[]> getValue(String key);
+
+    /** Removes the stored value for {@code key}. No-op if absent. */
+    CompletableFuture<Void> deleteValue(String key);
+
     // -------------------------------------------------------------------------
     // Interoperability
     // -------------------------------------------------------------------------

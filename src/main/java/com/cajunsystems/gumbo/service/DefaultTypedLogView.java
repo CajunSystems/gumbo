@@ -88,6 +88,30 @@ final class DefaultTypedLogView<T> implements TypedLogView<T> {
         });
     }
 
+    // ── Metadata ──
+
+    @Override
+    public long getLatestSeqnum() {
+        return delegate.getLatestSeqnum();
+    }
+
+    // ── Key-Value ──
+
+    @Override
+    public CompletableFuture<Void> setValue(String key, byte[] value) {
+        return delegate.setValue(key, value);
+    }
+
+    @Override
+    public CompletableFuture<byte[]> getValue(String key) {
+        return delegate.getValue(key);
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteValue(String key) {
+        return delegate.deleteValue(key);
+    }
+
     // -------------------------------------------------------------------------
     // Interoperability
     // -------------------------------------------------------------------------
