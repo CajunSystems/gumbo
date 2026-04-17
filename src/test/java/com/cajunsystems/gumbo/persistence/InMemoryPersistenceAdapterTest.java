@@ -114,6 +114,32 @@ class InMemoryPersistenceAdapterTest {
     }
 
     @Test
+    void getLatestSeqnumForTag_returnsNegativeOneWhenEmpty() {
+        assertThat(adapter.getLatestSeqnumForTag(TAG_A)).isEqualTo(-1L);
+    }
+
+    @Test
+    void getLatestSeqnumForTag_returnsHighestSeqnumForTag() throws IOException {
+        adapter.append(entry(0, 0, TAG_A, "e0"));
+        adapter.append(entry(5, 0, TAG_B, "f0"));   // different tag, higher seqnum
+        adapter.append(entry(10, 1, TAG_A, "e1"));
+
+        // TAG_A's latest is 10, not 5 (which belongs to TAG_B)
+        assertThat(adapter.getLatestSeqnumForTag(TAG_A)).isEqualTo(10L);
+        assertThat(adapter.getLatestSeqnumForTag(TAG_B)).isEqualTo(5L);
+    }
+
+    @Test
+    void getLatestSeqnumForTag_unaffectedByOtherTags() throws IOException {
+        adapter.append(entry(0, 0, TAG_A, "e0"));
+        adapter.append(entry(1, 0, TAG_B, "f0"));
+        adapter.append(entry(2, 0, LogTag.of("other"), "x0"));
+
+        assertThat(adapter.getLatestSeqnumForTag(TAG_A)).isEqualTo(0L);
+        assertThat(adapter.getLatestSeqnumForTag(TAG_B)).isEqualTo(1L);
+    }
+
+    @Test
     void localIdCountReflectsAppendedEntries() throws IOException {
         adapter.append(entry(0, 0, TAG_A, "e0"));
         adapter.append(entry(1, 1, TAG_A, "e1"));

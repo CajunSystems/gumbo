@@ -48,9 +48,7 @@ public class DefaultLogView implements LogView {
     @Override
     public long getLatestSeqnum() {
         try {
-            List<LogEntry> entries = service.adapter().readByTag(tag, 0L);
-            if (entries.isEmpty()) return -1L;
-            return entries.get(entries.size() - 1).seqnum();
+            return service.adapter().getLatestSeqnumForTag(tag);
         } catch (IOException e) {
             throw new SharedLogService.LogReadException("getLatestSeqnum failed for tag=" + tag, e);
         }

@@ -206,4 +206,23 @@ class SharedLogServiceTest {
         assertThat(s1).isGreaterThanOrEqualTo(0L);
         assertThat(s2).isGreaterThan(s1);
     }
+
+    @Test
+    void logViewGetLatestSeqnum_returnsCorrectTagSeqnum() {
+        LogView ordersView    = service.getView(ORDERS);
+        LogView inventoryView = service.getView(INVENTORY);
+
+        assertThat(ordersView.getLatestSeqnum()).isEqualTo(-1L);
+
+        service.append(AppendRequest.to(ORDERS,    "o1".getBytes())).join();
+        service.append(AppendRequest.to(INVENTORY, "i1".getBytes())).join();
+        service.append(AppendRequest.to(ORDERS,    "o2".getBytes())).join();
+
+        long ordersLatest    = ordersView.getLatestSeqnum();
+        long inventoryLatest = inventoryView.getLatestSeqnum();
+
+        assertThat(ordersLatest).isGreaterThan(inventoryLatest);   // orders got a later seqnum
+        assertThat(inventoryLatest).isGreaterThanOrEqualTo(0L);
+        assertThat(ordersView.getLatestSeqnum()).isEqualTo(ordersLatest); // stable
+    }
 }
