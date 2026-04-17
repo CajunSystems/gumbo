@@ -64,7 +64,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 05-01: Implement key-value in InMemory and FileBased adapters
+- [x] 05-01: KV in InMemory (ConcurrentHashMap) + FileBased (kv.dat append-log); kvPersistsAcrossReopen test (929d0d6, d4fa4c4)
 - [ ] 05-02: Implement in Batching and FoundationDB adapters; durability and recovery tests
 
 ### Phase 6: TypedLogView + integration
@@ -85,5 +85,5 @@ Plans:
 | 2. Per-tag latestSeqnum | 2/2 | Complete | 2026-04-17 |
 | 3. Push-tail subscribe | 1/1 | Complete | 2026-04-17 |
 | 4. Key-value API design | 1/1 | Complete | 2026-04-17 |
-| 5. Key-value implementation | 0/2 | Not started | — |
+| 5. Key-value implementation | 1/2 | In progress | — |
 | 6. TypedLogView + integration | 0/2 | Not started | — |

@@ -10,16 +10,16 @@ See: .planning/PROJECT.md (updated 2026-04-17)
 ## Current Position
 
 Phase: 5 of 6 (Key-value implementation)
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-04-17 — Phase 4 complete (04-01: KV API contract established)
+Plan: 05-02 (next)
+Status: In progress — 05-01 complete
+Last activity: 2026-04-17 — 05-01 complete: KV in InMemory + FileBased; real behavior tests in SharedLogServiceTest
 
-Progress: ██████░░░░ 45% (5/11 plans)
+Progress: ███████░░░ 54% (6/11 plans)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
+- Total plans completed: 6
 - Average duration: ~2.5 min
 - Total execution time: ~2.5 min
 
@@ -53,5 +53,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-04-17
-Stopped at: Phase 4 complete — KV API on PersistenceAdapter + LogView + DefaultLogView; UnsupportedOperation pending Phase 5
+Stopped at: 05-01 complete — KV in InMemory (ConcurrentHashMap) + FileBased (kv.dat); persistence test passes
 Resume file: None
