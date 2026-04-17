@@ -36,7 +36,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 02-01: Add `latestSeqnum()` to `LogView` interface; implement in InMemory and FileBased adapters
+- [x] 02-01: Add getLatestSeqnumForTag() to interface; implement in InMemory/FileBased; fix DefaultLogView (d913dbe, 574c9b1)
 - [ ] 02-02: Implement in Batching and FoundationDB adapters; test that no readAll() is triggered
 
 ### Phase 3: Push-tail subscribe
@@ -83,7 +83,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Efficient readFrom | 1/2 | In progress | — |
-| 2. Per-tag latestSeqnum | 0/2 | Not started | — |
+| 2. Per-tag latestSeqnum | 1/2 | In progress | — |
 | 3. Push-tail subscribe | 0/2 | Not started | — |
 | 4. Key-value API design | 0/1 | Not started | — |
 | 5. Key-value implementation | 0/2 | Not started | — |
