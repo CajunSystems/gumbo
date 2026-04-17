@@ -74,7 +74,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 06-01: Propagate new APIs through `TypedLogView<T>` interface and `DefaultTypedLogView`
+- [x] 06-01: Add 5 methods to TypedLogView; DefaultTypedLogView delegation; 5 new tests (43ee248, e449dbf)
 - [ ] 06-02: Update examples (OrderFulfilmentExample, WorkflowExecutorExample) to show actor replay pattern; update README
 
 ## Progress
@@ -86,4 +86,4 @@ Plans:
 | 3. Push-tail subscribe | 1/1 | Complete | 2026-04-17 |
 | 4. Key-value API design | 1/1 | Complete | 2026-04-17 |
 | 5. Key-value implementation | 2/2 | Complete | 2026-04-17 |
-| 6. TypedLogView + integration | 0/2 | Not started | — |
+| 6. TypedLogView + integration | 1/2 | In progress | — |
