@@ -198,6 +198,50 @@ class BatchingPersistenceAdapterTest {
     }
 
     @Test
+    void readByTag_fromSeqnum_skipsEntriesBelowBoundary() throws IOException {
+        // Use a large batch size so entries stay in the pending buffer (not flushed to delegate)
+        adapter.close();
+        adapter = new BatchingPersistenceAdapter(inner, 100, 10_000);
+        adapter.open();
+
+        // Non-contiguous seqnums — simulates actor replay from a mid-log checkpoint
+        adapter.append(entry(0, TAG));
+        adapter.append(entry(5, TAG));
+        adapter.append(entry(10, TAG));
+
+        // All entries are still pending (unflushed) — verify boundary filtering works
+        List<LogEntry> result = adapter.readByTag(TAG, 5);
+
+        assertThat(result).hasSize(2);
+        assertThat(result).extracting(LogEntry::seqnum).containsExactlyInAnyOrder(5L, 10L);
+        // Entry at seqnum 0 must NOT appear
+        assertThat(result).noneMatch(e -> e.seqnum() == 0L);
+    }
+
+    @Test
+    void readByTag_fromSeqnum_includesPendingEntriesAboveBoundary() throws IOException {
+        // Use a large batch size so some entries stay in the pending buffer
+        adapter.close();
+        adapter = new BatchingPersistenceAdapter(inner, 100, 10_000);
+        adapter.open();
+
+        // Append entries at seqnums 0 and 5, then flush them to the delegate
+        adapter.append(entry(0, TAG));
+        adapter.append(entry(5, TAG));
+        adapter.flushNow();
+
+        // Append seqnum 10 — stays pending (not yet flushed)
+        adapter.append(entry(10, TAG));
+
+        // readByTag from 5 should include seqnum 5 (from delegate) and 10 (pending)
+        List<LogEntry> result = adapter.readByTag(TAG, 5);
+
+        assertThat(result).hasSize(2);
+        assertThat(result).extracting(LogEntry::seqnum).containsExactlyInAnyOrder(5L, 10L);
+        assertThat(result).noneMatch(e -> e.seqnum() == 0L);
+    }
+
+    @Test
     void trimFlushesBeforeDelegating() throws IOException {
         adapter.append(entry(0));
         adapter.append(entry(1));

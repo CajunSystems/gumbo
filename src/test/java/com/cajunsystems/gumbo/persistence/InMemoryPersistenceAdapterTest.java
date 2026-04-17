@@ -124,6 +124,22 @@ class InMemoryPersistenceAdapterTest {
     }
 
     @Test
+    void readByTag_fromSeqnum_skipsEntriesBelowBoundary() throws IOException {
+        // Non-contiguous seqnums — simulates actor replay from a mid-log checkpoint
+        adapter.append(entry(0,  0, TAG_A, "e0"));
+        adapter.append(entry(5,  1, TAG_A, "e5"));
+        adapter.append(entry(10, 2, TAG_A, "e10"));
+
+        List<LogEntry> result = adapter.readByTag(TAG_A, 5);
+
+        assertThat(result).hasSize(2);
+        assertThat(result.get(0).seqnum()).isEqualTo(5L);
+        assertThat(result.get(1).seqnum()).isEqualTo(10L);
+        // Entry at seqnum 0 must NOT appear
+        assertThat(result).noneMatch(e -> e.seqnum() == 0L);
+    }
+
+    @Test
     void closedAdapterThrowsOnWrite() throws IOException {
         adapter.close();
         assertThatThrownBy(() -> adapter.append(entry(0, 0, TAG_A, "x")))
