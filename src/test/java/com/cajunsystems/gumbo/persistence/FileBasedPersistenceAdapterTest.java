@@ -163,6 +163,21 @@ class FileBasedPersistenceAdapterTest {
         }
     }
 
+    @Test
+    void getLatestSeqnumForTag_returnsNegativeOneWhenEmpty() {
+        assertThat(adapter.getLatestSeqnumForTag(TAG_ORDERS)).isEqualTo(-1L);
+    }
+
+    @Test
+    void getLatestSeqnumForTag_returnsHighestSeqnumForTag() throws IOException {
+        adapter.append(entry(0, 0, TAG_ORDERS,    "o0"));
+        adapter.append(entry(3, 0, TAG_INVENTORY, "i0"));
+        adapter.append(entry(7, 1, TAG_ORDERS,    "o1"));
+
+        assertThat(adapter.getLatestSeqnumForTag(TAG_ORDERS)).isEqualTo(7L);
+        assertThat(adapter.getLatestSeqnumForTag(TAG_INVENTORY)).isEqualTo(3L);
+    }
+
     // -------------------------------------------------------------------------
 
     private static LogEntry entry(long seqnum, long localId, LogTag tag, String data) {

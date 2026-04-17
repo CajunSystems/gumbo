@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -224,5 +225,33 @@ class SharedLogServiceTest {
         assertThat(ordersLatest).isGreaterThan(inventoryLatest);   // orders got a later seqnum
         assertThat(inventoryLatest).isGreaterThanOrEqualTo(0L);
         assertThat(ordersView.getLatestSeqnum()).isEqualTo(ordersLatest); // stable
+    }
+
+    @Test
+    void subscribeTail_receivesOnlyFutureEntries() throws Exception {
+        LogView view = service.getView(ORDERS);
+
+        // Pre-populate — subscribeTail should NOT deliver these
+        service.append(AppendRequest.to(ORDERS, "past-1".getBytes())).join();
+        service.append(AppendRequest.to(ORDERS, "past-2".getBytes())).join();
+
+        List<String> received = new CopyOnWriteArrayList<>();
+        SharedLog.Subscription sub = view.subscribeTail(
+                e -> received.add(new String(e.dataUnsafe()))
+        );
+
+        try {
+            // Append future entries after subscribeTail()
+            service.append(AppendRequest.to(ORDERS, "future-1".getBytes())).join();
+            service.append(AppendRequest.to(ORDERS, "future-2".getBytes())).join();
+
+            await().atMost(3, TimeUnit.SECONDS)
+                   .until(() -> received.size() == 2);
+
+            assertThat(received).containsExactly("future-1", "future-2");
+            assertThat(received).doesNotContain("past-1", "past-2");
+        } finally {
+            sub.close();
+        }
     }
 }

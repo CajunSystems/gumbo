@@ -252,4 +252,25 @@ class BatchingPersistenceAdapterTest {
         // All entries were flushed to delegate
         assertThat(inner.batchCalls.get()).isEqualTo(1);
     }
+
+    @Test
+    void getLatestSeqnumForTag_returnsNegativeOneWhenEmpty() throws IOException {
+        assertThat(adapter.getLatestSeqnumForTag(TAG)).isEqualTo(-1L);
+    }
+
+    @Test
+    void getLatestSeqnumForTag_includesPendingEntries() throws IOException {
+        // Append but do NOT flush — entries live in pending buffer only
+        adapter.append(entry(0, TAG));
+        adapter.append(entry(5, TAG));
+        // Should see pending latest, not delegate latest (-1)
+        assertThat(adapter.getLatestSeqnumForTag(TAG)).isEqualTo(5L);
+    }
+
+    @Test
+    void getLatestSeqnumForTag_afterFlush_returnsFromDelegate() throws IOException {
+        adapter.append(entry(0, TAG));
+        adapter.flushNow();  // flush to delegate
+        assertThat(adapter.getLatestSeqnumForTag(TAG)).isEqualTo(0L);
+    }
 }
