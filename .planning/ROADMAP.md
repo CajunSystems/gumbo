@@ -37,7 +37,7 @@ Plans:
 
 Plans:
 - [x] 02-01: Add getLatestSeqnumForTag() to interface; implement in InMemory/FileBased; fix DefaultLogView (d913dbe, 574c9b1)
-- [ ] 02-02: Implement in Batching and FoundationDB adapters; test that no readAll() is triggered
+- [x] 02-02: Implement in Batching/FDB adapters; subscribeTail e2e test confirming future-only delivery (275fe1b, bfc22bf)
 
 ### Phase 3: Push-tail subscribe
 **Goal**: `logView.subscribe(listener)` from `TAIL` delivers only live (future) entries with no backlog; enables catching-up → live handoff without polling
@@ -83,7 +83,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Efficient readFrom | 1/2 | In progress | — |
-| 2. Per-tag latestSeqnum | 1/2 | In progress | — |
+| 2. Per-tag latestSeqnum | 2/2 | Complete | 2026-04-17 |
 | 3. Push-tail subscribe | 0/2 | Not started | — |
 | 4. Key-value API design | 0/1 | Not started | — |
 | 5. Key-value implementation | 0/2 | Not started | — |

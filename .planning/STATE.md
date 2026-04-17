@@ -5,21 +5,21 @@
 See: .planning/PROJECT.md (updated 2026-04-17)
 
 **Core value:** Efficient positional reads and per-tag offset queries to unblock actor system replay from checkpoints
-**Current focus:** Phase 1 — Efficient readFrom
+**Current focus:** Phase 3 — Push-tail subscribe
 
 ## Current Position
 
-Phase: 2 of 6 (Per-tag latestSeqnum)
-Plan: 02-02 (next)
-Status: In progress — 02-01 complete
-Last activity: 2026-04-17 — 02-01 complete: getLatestSeqnumForTag interface + InMemory/FileBased + DefaultLogView fix
+Phase: 3 of 6 (Push-tail subscribe)
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-04-17 — Phase 2 complete (02-01 + 02-02 executed)
 
-Progress: ███░░░░░░░ 18% (2/11 plans)
+Progress: ████░░░░░░ 27% (3/11 plans)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
+- Total plans completed: 3
 - Average duration: ~2.5 min
 - Total execution time: ~2.5 min
 
@@ -53,5 +53,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-04-17
-Stopped at: Phase 2 Plan 02-01 complete — getLatestSeqnumForTag interface + InMemory/FileBased + DefaultLogView fix
+Stopped at: Phase 2 complete — all 4 adapters have O(1)/O(log N) getLatestSeqnumForTag(); subscribeTail e2e test passing
 Resume file: None
