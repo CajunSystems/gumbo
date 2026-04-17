@@ -21,7 +21,8 @@ every component crash-safe and independently restartable with no coordination.
 10. [Virtual threads](#virtual-threads)
 11. [Quick start](#quick-start)
 12. [Examples](#examples)
-13. [Building](#building)
+13. [Installation](#installation)
+14. [Building](#building)
 
 ---
 
@@ -872,6 +873,49 @@ mvn test -Dtest=OrderFulfilmentExample
 mvn test -Dtest=FilePersistedExample
 mvn test -Dtest=WorkflowExecutorExample
 ```
+
+---
+
+## Installation
+
+Gumbo is distributed via [JitPack](https://jitpack.io). No local build required.
+
+### Maven
+
+Add the JitPack repository to your `pom.xml`:
+
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+```
+
+Then add the dependency:
+
+```xml
+<dependency>
+    <groupId>com.github.CajunSystems</groupId>
+    <artifactId>gumbo</artifactId>
+    <version>0.2.0</version>
+</dependency>
+```
+
+### Gradle
+
+```groovy
+repositories {
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+    implementation 'com.github.CajunSystems:gumbo:0.2.0'
+}
+```
+
+> **Note**: Gumbo requires Java 21+.
 
 ---
 
