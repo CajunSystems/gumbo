@@ -55,7 +55,7 @@ Plans:
 **Research topics**: In-log KV (append sentinel entries) vs. sidecar (separate file/FDB subspace); per-tag vs. global scope; read-your-writes guarantee under batching; FDB key-value atomic ops
 
 Plans:
-- [ ] 04-01: Investigate persistence options; document trade-offs; propose and confirm interface design
+- [x] 04-01: KV API on PersistenceAdapter + LogView + DefaultLogView; UnsupportedOperation defaults (da654ef, c9bd6df)
 
 ### Phase 5: Key-value implementation
 **Goal**: Implement `setValue`/`getValue` across all 4 adapters with appropriate durability; match guarantees documented in Phase 4
@@ -84,6 +84,6 @@ Plans:
 | 1. Efficient readFrom | 1/2 | In progress | — |
 | 2. Per-tag latestSeqnum | 2/2 | Complete | 2026-04-17 |
 | 3. Push-tail subscribe | 1/1 | Complete | 2026-04-17 |
-| 4. Key-value API design | 0/1 | Not started | — |
+| 4. Key-value API design | 1/1 | Complete | 2026-04-17 |
 | 5. Key-value implementation | 0/2 | Not started | — |
 | 6. TypedLogView + integration | 0/2 | Not started | — |

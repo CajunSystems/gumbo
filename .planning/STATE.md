@@ -5,21 +5,21 @@
 See: .planning/PROJECT.md (updated 2026-04-17)
 
 **Core value:** Efficient positional reads and per-tag offset queries to unblock actor system replay from checkpoints
-**Current focus:** Phase 4 — Key-value API design
+**Current focus:** Phase 5 — Key-value implementation
 
 ## Current Position
 
-Phase: 4 of 6 (Key-value API design)
+Phase: 5 of 6 (Key-value implementation)
 Plan: Not started
-Status: Ready to research/plan
-Last activity: 2026-04-17 — Phase 3 complete (03-01 close-out: subscribeTail was pre-existing)
+Status: Ready to plan
+Last activity: 2026-04-17 — Phase 4 complete (04-01: KV API contract established)
 
-Progress: █████░░░░░ 36% (4/11 plans)
+Progress: ██████░░░░ 45% (5/11 plans)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
+- Total plans completed: 5
 - Average duration: ~2.5 min
 - Total execution time: ~2.5 min
 
@@ -53,5 +53,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-04-17
-Stopped at: Phase 3 complete — subscribeTail was pre-existing; zero implementation needed; full test suite passes
+Stopped at: Phase 4 complete — KV API on PersistenceAdapter + LogView + DefaultLogView; UnsupportedOperation pending Phase 5
 Resume file: None
