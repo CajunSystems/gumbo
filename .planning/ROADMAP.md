@@ -26,8 +26,8 @@ None
 **Plans**: TBD
 
 Plans:
-- [ ] 01-01: Audit current readByTag/readFrom implementation in all adapters; implement O(from-N) in InMemory and FileBased
-- [ ] 01-02: Implement O(from-N) in Batching and FoundationDB adapters; add correctness + performance tests
+- [x] 01-01: Fix InMemory readByTag linear scan → tailMap; add gap-seqnum regression tests (ae190ab, 3e939a9)
+- [ ] 01-02: Verify FileBased/FDB/Batching readByTag correctness end-to-end; close out Phase 1
 
 ### Phase 2: Per-tag latestSeqnum
 **Goal**: `logView.latestSeqnum()` returns the latest seqnum for a tag in O(1)/O(log n) without materializing entries; uses maintained metadata
@@ -82,7 +82,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Efficient readFrom | 0/2 | Not started | — |
+| 1. Efficient readFrom | 1/2 | In progress | — |
 | 2. Per-tag latestSeqnum | 0/2 | Not started | — |
 | 3. Push-tail subscribe | 0/2 | Not started | — |
 | 4. Key-value API design | 0/1 | Not started | — |
