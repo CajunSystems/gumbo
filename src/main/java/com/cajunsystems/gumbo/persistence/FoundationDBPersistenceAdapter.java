@@ -97,7 +97,8 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private static final String META_NS     = "meta";
     private static final String TRIM_KEY    = "trim";
     private static final String LATEST_KEY  = "latest";
-    private static final String TAGCOUNT_NS = "tagcount";
+    private static final String TAGCOUNT_NS  = "tagcount";
+    private static final String TAGLATEST_NS = "taglatest";
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -112,6 +113,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private Subspace tagSubspace;
     private Subspace metaSubspace;
     private Subspace tagCountSubspace;
+    private Subspace tagLatestSubspace;
 
     // -------------------------------------------------------------------------
     // In-memory caches (populated on open, kept current on every write)
@@ -125,6 +127,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
 
     /** Per-tag entry counts; mirrors what is persisted under the tagcount subspace. */
     private final ConcurrentHashMap<LogTag, AtomicLong> tagLocalIdCount = new ConcurrentHashMap<>();
+
+    /** Per-tag latest seqnum; mirrors what is persisted under the taglatest subspace. */
+    private final ConcurrentHashMap<LogTag, AtomicLong> tagLatestSeqnum = new ConcurrentHashMap<>();
 
     private volatile boolean opened = false;
 
@@ -200,7 +205,8 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         logSubspace      = root.subspace(Tuple.from(LOG_NS));
         tagSubspace      = root.subspace(Tuple.from(TAG_NS));
         metaSubspace     = root.subspace(Tuple.from(META_NS));
-        tagCountSubspace = metaSubspace.subspace(Tuple.from(TAGCOUNT_NS));
+        tagCountSubspace  = metaSubspace.subspace(Tuple.from(TAGCOUNT_NS));
+        tagLatestSubspace = metaSubspace.subspace(Tuple.from(TAGLATEST_NS));
     }
 
     private void loadMetadata() {
@@ -219,6 +225,16 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 String key = suffix.getString(1);
                 long count = ByteBuffer.wrap(kv.getValue()).getLong();
                 tagLocalIdCount.put(LogTag.of(ns, key), new AtomicLong(count));
+            }
+
+            // Rebuild per-tag latest seqnum from the taglatest subspace
+            Range tlRange = tagLatestSubspace.range();
+            for (KeyValue kv : tr.getRange(tlRange)) {
+                Tuple suffix = tagLatestSubspace.unpack(kv.getKey());
+                String ns  = suffix.getString(0);
+                String key = suffix.getString(1);
+                long latest = ByteBuffer.wrap(kv.getValue()).getLong();
+                tagLatestSeqnum.put(LogTag.of(ns, key), new AtomicLong(latest));
             }
             return null;
         });
@@ -298,6 +314,12 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                             tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
                             longBytes(newCount)
                         );
+                        // Track latest seqnum for this tag
+                        long newLatest = entry.seqnum();
+                        tr.set(
+                            tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
+                            longBytes(newLatest)
+                        );
                     }
 
                     if (entry.seqnum() > maxSeqnum) maxSeqnum = entry.seqnum();
@@ -314,6 +336,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                     tagLocalIdCount
                         .computeIfAbsent(tag, k -> new AtomicLong(0))
                         .updateAndGet(c -> Math.max(c, entry.localId() + 1));
+                    tagLatestSeqnum
+                        .computeIfAbsent(tag, k -> new AtomicLong(-1L))
+                        .updateAndGet(c -> Math.max(c, entry.seqnum()));
                 }
             }
         } catch (Exception e) {
@@ -441,6 +466,12 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public long getLocalIdCountForTag(LogTag tag) {
         AtomicLong c = tagLocalIdCount.get(tag);
         return c == null ? 0L : c.get();
+    }
+
+    @Override
+    public long getLatestSeqnumForTag(LogTag tag) {
+        AtomicLong c = tagLatestSeqnum.get(tag);
+        return c == null ? -1L : c.get();
     }
 
     // =========================================================================

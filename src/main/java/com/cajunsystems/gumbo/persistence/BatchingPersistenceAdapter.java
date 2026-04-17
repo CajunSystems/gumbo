@@ -229,6 +229,20 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         return delegate.getLocalIdCountForTag(tag);
     }
 
+    @Override
+    public long getLatestSeqnumForTag(LogTag tag) throws IOException {
+        long delegateLatest = delegate.getLatestSeqnumForTag(tag);
+        // Check pending buffer for any higher seqnum for this tag
+        List<LogEntry> snapshot = pendingSnapshot();
+        long pendingLatest = -1L;
+        for (LogEntry e : snapshot) {
+            if (e.tags().contains(tag) && e.seqnum() > pendingLatest) {
+                pendingLatest = e.seqnum();
+            }
+        }
+        return Math.max(delegateLatest, pendingLatest);
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
