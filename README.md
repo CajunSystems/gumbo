@@ -1,86 +1,128 @@
 # Gumbo
 
-A Boki-inspired shared log library for Java 21. A single append-only, totally-ordered
-log acts as the source of truth for an entire system. Stateless **executors** derive
+A shared log library for Java 21 that provides a single append-only, totally-ordered
+log as the source of truth for your entire system. Stateless **executors** derive
 all their state by replaying the log, process it, and write new entries back — making
 every component crash-safe and independently restartable with no coordination.
+
+**Inspired by [Boki](https://github.com/ut-osa/boki)** (SOSP 2021), Gumbo brings the shared log primitive to Java with a focus on simplicity, flexibility, and production readiness. See [Boki Comparison](docs/BOKI_COMPARISON.md) for details on how Gumbo relates to and differs from Boki.
+
+---
+
+## Features
+
+- **Single source of truth**: All state derived from an append-only log
+- **Crash-safe by design**: Replay the log to recover exact state after any failure
+- **Flexible deployment**: Single-node (zero dependencies) to multi-node (FoundationDB)
+- **Type-safe API**: `TypedLogView<T>` with pluggable serialization (Kryo included)
+- **Virtual threads**: Lightweight concurrency for executors and subscriptions
+- **Pluggable persistence**: In-memory, file-based, or FoundationDB backends
+- **Tag-based filtering**: Multiple logical streams in one physical log
+- **Stateless executors**: Functional fold pattern for deterministic state rebuilding
+
+---
+
+## Quick start
+
+```java
+// 1. Open the log with in-memory storage
+SharedLogConfig config = SharedLogConfig.builder()
+    .persistenceAdapter(new InMemoryPersistenceAdapter())
+    .build();
+
+try (SharedLogService log = SharedLogService.open(config)) {
+
+    LogTag orders = LogTag.of("orders");
+
+    // 2. Append
+    AppendResult r = log.append(AppendRequest.to(orders, "order-placed".getBytes())).join();
+    System.out.println("seqnum=" + r.seqnum() + " localId=" + r.localId());
+
+    // 3. Read
+    List<LogEntry> entries = log.readAll(orders).join();
+
+    // 4. Subscribe (runs listener on a virtual thread)
+    SharedLog.Subscription sub = log.subscribe(orders, LogPosition.BEGINNING, entry ->
+        System.out.println("received: " + new String(entry.data())));
+
+    // 5. Use a view
+    LogView view = log.getView(orders);
+    view.append("order-confirmed".getBytes()).join();
+
+    sub.close();
+}
+```
+
+Switch to file-backed storage:
+
+```java
+SharedLogConfig config = SharedLogConfig.builder()
+    .persistenceAdapter(new FileBasedPersistenceAdapter("/var/data/myapp"))
+    .build();
+```
 
 ---
 
 ## Table of contents
 
-1. [Inspiration: Boki](#inspiration-boki)
+1. [Installation](#installation)
 2. [Core concepts](#core-concepts)
-3. [Architecture](#architecture)
-4. [Module map](#module-map)
-5. [Data model](#data-model)
-6. [Persistence adapters](#persistence-adapters)
-7. [Sequencers](#sequencers)
-8. [Typed log views (Kryo)](#typed-log-views-kryo)
-9. [Executor model](#executor-model)
-10. [Virtual threads](#virtual-threads)
-11. [Quick start](#quick-start)
-12. [Examples](#examples)
-13. [Installation](#installation)
+3. [API overview](#api-overview)
+4. [Persistence adapters](#persistence-adapters)
+5. [Sequencers](#sequencers)
+6. [Typed log views](#typed-log-views-kryo)
+7. [Executor model](#executor-model)
+8. [Actor checkpoints](#actor-checkpoints)
+9. [Virtual threads](#virtual-threads)
+10. [Architecture](#architecture)
+11. [Module map](#module-map)
+12. [Data model](#data-model)
+13. [Examples](#examples)
 14. [Building](#building)
+15. [Further reading](#further-reading)
 
 ---
 
-## Inspiration: Boki
+## Installation
 
-[Boki](https://github.com/ut-osa/boki) (SOSP 2021, UT Austin) is a research FaaS
-runtime that exposes a **shared log** as a first-class primitive. The central insight
-is simple but powerful:
+Gumbo is distributed via [JitPack](https://jitpack.io). No local build required.
 
-> If every function reads its state from a log and writes new facts back to the same
-> log, then functions become truly stateless. Any invocation — on any node, after any
-> crash — can replay the log and recover exactly where it left off.
+### Maven
 
-Boki implements this as a distributed, sharded log with a lightweight **sequencer**
-that assigns global sequence numbers via *metalog* entries (tiny cut vectors) without
-touching data. Storage nodes receive raw bytes directly from engine nodes in parallel,
-so throughput scales without the sequencer becoming a bottleneck. Each log entry
-carries one or more **tags** (`uint64`) that act as virtual log-stream identifiers;
-a single physical log therefore serves many logical streams simultaneously.
+Add the JitPack repository to your `pom.xml`:
 
-### What this library takes from Boki
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+```
 
-| Boki concept | This library |
-|---|---|
-| Global `seqnum` (64-bit monotonic) | `LogEntry.seqnum()` — assigned by `Sequencer` |
-| Per-engine `localid` | `LogEntry.localId()` — per-tag counter assigned at append time |
-| `user_tags: repeated uint64` | `LogTag(namespace, key)` — typed tag objects instead of raw integers |
-| `user_logspace` (application namespace) | `LogTag.namespace` |
-| Per-object tag (e.g. `objectLogTag(hash)`) | `LogTag.of("orders", "order-42")` |
-| `SharedLogReadNext(tag, minSeqnum)` | `DefaultLogView.readNextAfter(minSeqnum)` |
-| `SharedLogReadPrev(tag, maxSeqnum)` | `DefaultLogView.readPrevBefore(maxSeqnum)` |
-| `SharedLogCheckTail(tag)` | `DefaultLogView.checkTail()` |
-| Stateless function → rebuild state from log | `Executor<S>` functional fold |
-| Sequencer metalog (drives ordering) | `LocalSequencer` (single-node AtomicLong) or `FoundationDBSequencer` (distributed) |
-| Storage node (durable WAL) | `FileBasedPersistenceAdapter` (local) or `FoundationDBPersistenceAdapter` (distributed) |
-| Pluggable back-ends | `PersistenceAdapter` interface |
-| FDB metalog consensus | `FoundationDBSequencer` — read-modify-write transaction over a single FDB counter key; OCC handles multi-node contention |
+Then add the dependency:
 
-### What this library takes from Boki (and where it differs)
+```xml
+<dependency>
+    <groupId>com.github.CajunSystems</groupId>
+    <artifactId>gumbo</artifactId>
+    <version>0.2.0</version>
+</dependency>
+```
 
-Boki is a distributed system with engine nodes, storage nodes, sequencer nodes,
-ZooKeeper-backed view management, and io_uring async I/O throughout. This library
-takes the core insight — stateless executors + shared log — and delivers it in two
-deployment tiers:
+### Gradle
 
-**Single-node / local** (default): `LocalSequencer` (AtomicLong) +
-`FileBasedPersistenceAdapter` (local WAL). Zero external dependencies, sub-millisecond
-append latency on NVMe.
+```groovy
+repositories {
+    maven { url 'https://jitpack.io' }
+}
 
-**Multi-node / production** (recommended): `FoundationDBSequencer` +
-`FoundationDBPersistenceAdapter`. FoundationDB handles replication, crash recovery,
-and distributed sequence assignment — the same role FDB plays in Boki's metalog.
-`SharedLog.appendBatch(requests)` claims all seqnums in a single FDB transaction
-(Boki's batch-reservation optimisation), reducing sequencer round-trips from N to 1
-per N-entry batch.
+dependencies {
+    implementation 'com.github.CajunSystems:gumbo:0.2.0'
+}
+```
 
-The `Sequencer` and `PersistenceAdapter` interfaces are the seams; switching tiers
-is a one-line configuration change.
+> **Note**: Gumbo requires Java 21+.
 
 ---
 
@@ -139,6 +181,115 @@ Every entry has two identifiers:
 In Boki, `seqnum = [logspace_id:32 | position:32]` encodes the physical log shard.
 Here it is a plain `long` from an `AtomicLong`; a distributed implementation would
 encode the node and term in the high bits.
+
+---
+
+## API overview
+
+Gumbo provides three levels of API abstraction:
+
+### 1. SharedLog — Core log operations
+
+The main interface for interacting with the shared log:
+
+```java
+SharedLogService log = SharedLogService.open(config);
+
+// Append entries
+AppendResult result = log.append(AppendRequest.to(tag, data)).join();
+
+// Read entries
+List<LogEntry> all = log.readAll(tag).join();
+List<LogEntry> from = log.readFrom(tag, position, maxEntries).join();
+
+// Subscribe to new entries
+Subscription sub = log.subscribe(tag, position, entry -> {
+    // Process entry on virtual thread
+});
+
+// Batch operations
+List<AppendResult> results = log.appendBatch(requests).join();
+
+// Trim old entries
+log.trim(upToSeqnum).join();
+```
+
+### 2. LogView — Tag-scoped window
+
+A lightweight view over a specific tag:
+
+```java
+LogView view = log.getView(LogTag.of("orders"));
+
+// Append (automatically includes the view's tag)
+view.append(data).join();
+
+// Read operations
+List<LogEntry> entries = view.readAll().join();
+LogEntry next = view.readNextAfter(seqnum).join();
+LogEntry prev = view.readPrevBefore(seqnum).join();
+long tail = view.checkTail().join();
+
+// Subscribe to new entries only (no backlog)
+Subscription sub = view.subscribeTail(entry -> process(entry));
+
+// Durable KV storage (for checkpoints)
+view.setValue("checkpoint", bytes).join();
+byte[] saved = view.getValue("checkpoint").join();
+```
+
+### 3. TypedLogView — Type-safe operations
+
+Eliminates byte[] handling with automatic serialization:
+
+```java
+LogSerializer<OrderEvent> serializer = new KryoLogSerializer<>(OrderEvent.class);
+TypedLogView<OrderEvent> view = log.getTypedView(tag, serializer);
+
+// Append domain objects directly
+view.append(new OrderEvent("order-42", "placed")).join();
+
+// Read typed objects
+List<OrderEvent> events = view.readAll().join();
+
+// Typed subscriptions
+Subscription sub = view.subscribeTail(event -> 
+    System.out.println("Order: " + event.orderId()));
+```
+
+### Core data types
+
+```java
+// Tag: identifies a logical stream
+LogTag tag = LogTag.of("orders");              // namespace-wide
+LogTag tag = LogTag.of("orders", "order-42");  // instance-scoped
+
+// Entry: immutable log record
+record LogEntry(
+    long seqnum,        // global sequence number
+    long localId,       // per-tag sequence number
+    Set<LogTag> tags,   // tags this entry belongs to
+    byte[] data,        // payload
+    long timestamp      // append timestamp
+)
+
+// Position: read cursor
+LogPosition pos = new LogPosition(seqnum);
+LogPosition.BEGINNING  // start from seqnum 0
+LogPosition.END        // start from latest
+
+// Append request
+AppendRequest req = AppendRequest.to(tag, data);
+AppendRequest req = AppendRequest.to(Set.of(tag1, tag2), data);  // multi-tag
+
+// Append result
+record AppendResult(
+    long seqnum,
+    long localId,
+    LogTag primaryTag,
+    long timestamp
+)
+```
 
 ---
 
@@ -809,47 +960,6 @@ does not risk deadlock or thread starvation.
 
 ---
 
-## Quick start
-
-```java
-// 1. Open the log with in-memory storage
-SharedLogConfig config = SharedLogConfig.builder()
-    .persistenceAdapter(new InMemoryPersistenceAdapter())
-    .build();
-
-try (SharedLogService log = SharedLogService.open(config)) {
-
-    LogTag orders = LogTag.of("orders");
-
-    // 2. Append
-    AppendResult r = log.append(AppendRequest.to(orders, "order-placed".getBytes())).join();
-    System.out.println("seqnum=" + r.seqnum() + " localId=" + r.localId());
-
-    // 3. Read
-    List<LogEntry> entries = log.readAll(orders).join();
-
-    // 4. Subscribe (runs listener on a virtual thread)
-    SharedLog.Subscription sub = log.subscribe(orders, LogPosition.BEGINNING, entry ->
-        System.out.println("received: " + new String(entry.data())));
-
-    // 5. Use a view
-    LogView view = log.getView(orders);
-    view.append("order-confirmed".getBytes()).join();
-
-    sub.close();
-}
-```
-
-Switch to file-backed storage:
-
-```java
-SharedLogConfig config = SharedLogConfig.builder()
-    .persistenceAdapter(new FileBasedPersistenceAdapter("/var/data/myapp"))
-    .build();
-```
-
----
-
 ## Examples
 
 Runnable end-to-end examples live in
@@ -876,49 +986,6 @@ mvn test -Dtest=WorkflowExecutorExample
 
 ---
 
-## Installation
-
-Gumbo is distributed via [JitPack](https://jitpack.io). No local build required.
-
-### Maven
-
-Add the JitPack repository to your `pom.xml`:
-
-```xml
-<repositories>
-    <repository>
-        <id>jitpack.io</id>
-        <url>https://jitpack.io</url>
-    </repository>
-</repositories>
-```
-
-Then add the dependency:
-
-```xml
-<dependency>
-    <groupId>com.github.CajunSystems</groupId>
-    <artifactId>gumbo</artifactId>
-    <version>0.2.0</version>
-</dependency>
-```
-
-### Gradle
-
-```groovy
-repositories {
-    maven { url 'https://jitpack.io' }
-}
-
-dependencies {
-    implementation 'com.github.CajunSystems:gumbo:0.2.0'
-}
-```
-
-> **Note**: Gumbo requires Java 21+.
-
----
-
 ## Building
 
 Requires Java 21 and Maven 3.9+.
@@ -935,6 +1002,8 @@ Test reports are uploaded as workflow artifacts.
 
 ## Further reading
 
+- **[Boki Comparison](docs/BOKI_COMPARISON.md)** — How Gumbo relates to and differs from Boki
 - [Boki paper — SOSP 2021](https://www.cs.utexas.edu/~witchel/pubs/jia21sosp-boki.pdf)
 - [Boki source code](https://github.com/ut-osa/boki)
 - [Halfmoon — SOSP 2023, extends Boki with cross-log transactions](https://xinjin.github.io/files/SOSP23_Halfmoon.pdf)
+- [Persistence Evolution](docs/PERSISTENCE_EVOLUTION.md) — Roadmap for persistence optimizations
