@@ -148,7 +148,7 @@ class BatchingPersistenceAdapterTest {
     @Test
     void readByTagIncludesPendingEntries() throws IOException {
         // Use a large batch size so entries stay in the pending buffer (not flushed to delegate),
-        // avoiding the localId→seqnum collision in InMemoryPersistenceAdapter's tag index.
+        // avoiding the version→seqnum collision in InMemoryPersistenceAdapter's tag index.
         adapter.close();
         adapter = new BatchingPersistenceAdapter(inner, 100, 10_000);
         adapter.open();

@@ -97,7 +97,7 @@ class FoundationDBPersistenceAdapterTest {
         assertThat(entries).hasSize(1);
         LogEntry read = entries.get(0);
         assertThat(read.seqnum()).isEqualTo(0L);
-        assertThat(read.localId()).isEqualTo(0L);
+        assertThat(read.streamVersion()).isEqualTo(0L);
         assertThat(read.tags()).containsExactly(TAG_ORDERS);
         assertThat(read.data()).isEqualTo(payload);
         assertThat(read.timestamp().toEpochMilli()).isEqualTo(ts.toEpochMilli());
@@ -190,18 +190,18 @@ class FoundationDBPersistenceAdapterTest {
     }
 
     // =========================================================================
-    // localIdCount
+    // next stream version
     // =========================================================================
 
     @Test
-    void localIdCountReflectsHighestLocalIdPlusOne() throws IOException {
-        assertThat(adapter.getLocalIdCountForTag(TAG_ORDERS)).isEqualTo(0L);
+    void nextStreamVersionIsHighestVersionPlusOne() throws IOException {
+        assertThat(adapter.getNextStreamVersion(TAG_ORDERS)).isEqualTo(0L);
 
         adapter.append(entry(0, 0, TAG_ORDERS, "e0"));
-        assertThat(adapter.getLocalIdCountForTag(TAG_ORDERS)).isEqualTo(1L);
+        assertThat(adapter.getNextStreamVersion(TAG_ORDERS)).isEqualTo(1L);
 
         adapter.append(entry(1, 1, TAG_ORDERS, "e1"));
-        assertThat(adapter.getLocalIdCountForTag(TAG_ORDERS)).isEqualTo(2L);
+        assertThat(adapter.getNextStreamVersion(TAG_ORDERS)).isEqualTo(2L);
     }
 
     // =========================================================================
@@ -282,8 +282,8 @@ class FoundationDBPersistenceAdapterTest {
         try {
             second.open();
             assertThat(second.getLatestSeqnum()).isEqualTo(2L);
-            assertThat(second.getLocalIdCountForTag(TAG_ORDERS)).isEqualTo(2L);
-            assertThat(second.getLocalIdCountForTag(TAG_INVENTORY)).isEqualTo(1L);
+            assertThat(second.getNextStreamVersion(TAG_ORDERS)).isEqualTo(2L);
+            assertThat(second.getNextStreamVersion(TAG_INVENTORY)).isEqualTo(1L);
             // trim=1 means seqnum 0 was removed, 1 and 2 remain
             assertThat(second.readAll()).hasSize(2);
             assertThat(second.readAll().get(0).seqnum()).isEqualTo(1);
@@ -308,7 +308,7 @@ class FoundationDBPersistenceAdapterTest {
         LogEntry decoded = FoundationDBPersistenceAdapter.decodeEntry(encoded);
 
         assertThat(decoded.seqnum()).isEqualTo(42L);
-        assertThat(decoded.localId()).isEqualTo(7L);
+        assertThat(decoded.streamVersion()).isEqualTo(7L);
         assertThat(decoded.tags()).isEqualTo(original.tags());
         assertThat(decoded.data()).isEqualTo("payload".getBytes());
         assertThat(decoded.timestamp().toEpochMilli()).isEqualTo(999_000L);
@@ -326,8 +326,8 @@ class FoundationDBPersistenceAdapterTest {
     // Helpers
     // =========================================================================
 
-    private static LogEntry entry(long seqnum, long localId, LogTag tag, String data) {
-        return new LogEntry(seqnum, localId, Set.of(tag), data.getBytes(), Instant.now());
+    private static LogEntry entry(long seqnum, long streamVersion, LogTag tag, String data) {
+        return new LogEntry(seqnum, streamVersion, Set.of(tag), data.getBytes(), Instant.now());
     }
 
     /** Returns the cluster file path from the env variable, or null for the FDB default. */

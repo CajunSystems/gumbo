@@ -30,10 +30,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * <h2>Subspace layout</h2>
  * <pre>
  * {root} / "log"  / seqnum (long)                          → entry bytes
- * {root} / "tag"  / namespace / key / seqnum (long)        → localId  (8 bytes, big-endian)
+ * {root} / "tag"  / namespace / key / seqnum (long)        → version  (8 bytes, big-endian)
  * {root} / "meta" / "trim"                                 → trimSeqnum (8 bytes, big-endian)
  * {root} / "meta" / "latest"                               → latestSeqnum (8 bytes, big-endian)
- * {root} / "meta" / "tagcount" / namespace / key           → localIdCount (8 bytes, big-endian)
+ * {root} / "meta" / "tagcount" / namespace / key           → versionCount (8 bytes, big-endian)
  * </pre>
  *
  * <h2>Entry value format</h2>
@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <pre>
  * seqnum    8 bytes  big-endian long
  * timestamp 8 bytes  epoch-millis, big-endian long
- * localId   8 bytes  big-endian long
+ * version   8 bytes  big-endian long
  * numTags   4 bytes  big-endian int
  *   per tag:
  *     nsLen   2 bytes  unsigned big-endian short
@@ -128,7 +128,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private volatile long trimSeqnum = 0L;
 
     /** Per-tag entry counts; mirrors what is persisted under the tagcount subspace. */
-    private final ConcurrentHashMap<LogTag, AtomicLong> tagLocalIdCount = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<LogTag, AtomicLong> tagVersionCount = new ConcurrentHashMap<>();
 
     /** Per-tag latest seqnum; mirrors what is persisted under the taglatest subspace. */
     private final ConcurrentHashMap<LogTag, AtomicLong> tagLatestSeqnum = new ConcurrentHashMap<>();
@@ -227,7 +227,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 String ns  = suffix.getString(0);
                 String key = suffix.getString(1);
                 long count = ByteBuffer.wrap(kv.getValue()).getLong();
-                tagLocalIdCount.put(LogTag.of(ns, key), new AtomicLong(count));
+                tagVersionCount.put(LogTag.of(ns, key), new AtomicLong(count));
             }
 
             // Rebuild per-tag latest seqnum from the taglatest subspace
@@ -306,13 +306,13 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                     tr.set(logSubspace.pack(Tuple.from(entry.seqnum())), encodeEntry(entry));
 
                     for (LogTag tag : entry.tags()) {
-                        // Tag index: (namespace, key, seqnum) → localId
+                        // Tag index: (namespace, key, seqnum) → streamVersion
                         tr.set(
                             tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
-                            longBytes(entry.localId())
+                            longBytes(entry.streamVersion())
                         );
-                        // Compact per-tag count (last localId + 1)
-                        long newCount = entry.localId() + 1;
+                        // Compact per-tag count (last streamVersion + 1)
+                        long newCount = entry.streamVersion() + 1;
                         tr.set(
                             tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
                             longBytes(newCount)
@@ -336,9 +336,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             for (LogEntry entry : entries) {
                 if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
                 for (LogTag tag : entry.tags()) {
-                    tagLocalIdCount
+                    tagVersionCount
                         .computeIfAbsent(tag, k -> new AtomicLong(0))
-                        .updateAndGet(c -> Math.max(c, entry.localId() + 1));
+                        .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
                     tagLatestSeqnum
                         .computeIfAbsent(tag, k -> new AtomicLong(-1L))
                         .updateAndGet(c -> Math.max(c, entry.seqnum()));
@@ -424,11 +424,11 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     /**
      * Same two round-trips as {@link #readByTag}, filtered on the tag's own version.
      *
-     * <p>The tag index is keyed {@code (namespace, key, seqnum) → localId}, so the
+     * <p>The tag index is keyed {@code (namespace, key, seqnum) → streamVersion}, so the
      * version is the value rather than part of the key and the scan cannot start at it
      * directly. The scan therefore covers the tag's key range but reads only 8-byte
      * values; the expensive part — the point reads into the log subspace — is still
-     * proportional to the result. A {@code (namespace, key, localId)} index would make
+     * proportional to the result. A {@code (namespace, key, streamVersion)} index would make
      * the scan seekable too, at the cost of a second index and a migration for logs
      * already written.
      */
@@ -510,8 +510,8 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     }
 
     @Override
-    public long getLocalIdCountForTag(LogTag tag) {
-        AtomicLong c = tagLocalIdCount.get(tag);
+    public long getNextStreamVersion(LogTag tag) {
+        AtomicLong c = tagVersionCount.get(tag);
         return c == null ? 0L : c.get();
     }
 
@@ -571,7 +571,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         ByteBuffer buf = ByteBuffer.allocate(totalLen);
         buf.putLong(entry.seqnum());
         buf.putLong(entry.timestamp().toEpochMilli());
-        buf.putLong(entry.localId());
+        buf.putLong(entry.streamVersion());
         buf.putInt(entry.tags().size());
 
         for (int i = 0; i < nsBufs.size(); i++) {
@@ -590,7 +590,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         ByteBuffer buf    = ByteBuffer.wrap(bytes);
         long       seqnum = buf.getLong();
         long       tsMs   = buf.getLong();
-        long       localId= buf.getLong();
+        long       version= buf.getLong();
         int        nTags  = buf.getInt();
 
         Set<LogTag> tags = new HashSet<>(nTags);
@@ -609,7 +609,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         byte[] data    = new byte[dataLen];
         if (dataLen > 0) buf.get(data);
 
-        return new LogEntry(seqnum, localId, tags, data, Instant.ofEpochMilli(tsMs));
+        return new LogEntry(seqnum, version, tags, data, Instant.ofEpochMilli(tsMs));
     }
 
     /** Estimates encoded byte size for chunking decisions. */

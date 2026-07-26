@@ -13,7 +13,7 @@ throughput on the JVM.
 ```
 append(entry)
   → ConcurrentSkipListMap.put(seqnum, entry)    // O(log n), no syscall
-  → tagIndex[tag].put(seqnum, localId)
+  → tagIndex[tag].put(seqnum, streamVersion)
 ```
 
 Pure in-memory using `ConcurrentSkipListMap` for a lock-free read path and
@@ -35,7 +35,7 @@ append(entry)
   → indexChannel.write(idxBuf)   // pwrite64() — write [seqnum:8][offset:8] to index.dat
   → indexChannel.force(false)    // fdatasync() ← BOTTLENECK
   → globalIndex.put(seqnum, offset)
-  → tagSeqnums[tag].put(seqnum, localId)
+  → tagSeqnums[tag].put(seqnum, streamVersion)
 ```
 
 **Two `fdatasync` calls per entry** is the dominant cost.  On NVMe this is
@@ -46,7 +46,7 @@ latency, the sync path alone consumes 400 ms/s of I/O time.
 
 ```
 ┌──────────┬──────────┬──────────────┬──────────┬────────────────┬──────────┬───────────┬──────────┐
-│ MAGIC    │ seqnum   │ timestamp    │ localId  │ tags (var)     │ dataLen  │ data      │ CRC32    │
+│ MAGIC    │ seqnum   │ timestamp    │ version  │ tags (var)     │ dataLen  │ data      │ CRC32    │
 │ 4 bytes  │ 8 bytes  │ 8 bytes      │ 8 bytes  │ nsLen+ns+…     │ 4 bytes  │ N bytes   │ 4 bytes  │
 └──────────┴──────────┴──────────────┴──────────┴────────────────┴──────────┴───────────┴──────────┘
 ```
@@ -122,7 +122,7 @@ low-latency use cases.
 append(entry)
   → FDB transaction:
       logSubspace.set(seqnum, encodeEntry(entry))   // O(log n), distributed write
-      tagSubspace.set((ns, key, seqnum), localId)   // tag index entry
+      tagSubspace.set((ns, key, seqnum), streamVersion)   // tag index entry
       metaSubspace.set("latest", seqnum)            // cached high-water mark
   → db.run() → commit()                             // 3-way replicated, crash-safe
 ```
@@ -131,10 +131,10 @@ append(entry)
 
 ```
 {root} / "log"  / seqnum (long)                  → entry value bytes
-{root} / "tag"  / namespace / key / seqnum        → localId (8 bytes)
+{root} / "tag"  / namespace / key / seqnum        → streamVersion (8 bytes)
 {root} / "meta" / "latest"                        → latestSeqnum
 {root} / "meta" / "trim"                          → trimSeqnum
-{root} / "meta" / "tagcount" / namespace / key    → localIdCount
+{root} / "meta" / "tagcount" / namespace / key    → versionCount
 ```
 
 FDB's tuple-layer encoding preserves the natural ordering of `seqnum` keys, so

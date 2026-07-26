@@ -200,7 +200,7 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         List<LogEntry> snapshot = pendingSnapshot();
         List<LogEntry> fromDelegate = delegate.readFromVersion(tag, fromVersion);
         return merge(fromDelegate, snapshot,
-                e -> e.tags().contains(tag) && e.localId() >= fromVersion);
+                e -> e.tags().contains(tag) && e.streamVersion() >= fromVersion);
     }
 
     // -------------------------------------------------------------------------
@@ -228,14 +228,14 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     }
 
     @Override
-    public long getLocalIdCountForTag(LogTag tag) {
+    public long getNextStreamVersion(LogTag tag) {
         // The pending buffer has to be counted too. SharedLogService only asks on first
         // use of a tag, when nothing is pending — but a caller reading a tag's version
         // tip (LogView.getLatestVersion) asks at any time, and would otherwise see a
         // count that stops at the last flush.
-        long count = delegate.getLocalIdCountForTag(tag);
+        long count = delegate.getNextStreamVersion(tag);
         for (LogEntry e : pendingSnapshot()) {
-            if (e.tags().contains(tag)) count = Math.max(count, e.localId() + 1);
+            if (e.tags().contains(tag)) count = Math.max(count, e.streamVersion() + 1);
         }
         return count;
     }

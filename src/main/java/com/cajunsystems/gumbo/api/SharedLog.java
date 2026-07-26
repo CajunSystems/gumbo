@@ -98,7 +98,7 @@ public interface SharedLog extends AutoCloseable {
 
     /**
      * Reads entries with the given tag from {@code fromVersion} (inclusive) in that
-     * tag's <em>own</em> numbering — its {@code localId} — rather than the global
+     * tag's <em>own</em> numbering — its {@code streamVersion} — rather than the global
      * seqnum {@link #read} takes.
      *
      * <p>Use this whenever the position came from a previous entry of this tag:
