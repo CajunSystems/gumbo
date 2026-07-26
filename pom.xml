@@ -6,7 +6,7 @@
 
     <groupId>com.cajunsystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
     <packaging>jar</packaging>
 
     <name>Shared Log</name>
@@ -128,15 +128,18 @@
                         Ratchet, not a target: set to the measured score, so a decline
                         fails the build rather than being absorbed by slack.
 
-                        Baseline at introduction: 364/486 killed, test strength 81%.
-                        PIT rounds, so the real headroom is about two mutants — 363 still
-                        reports 75 and passes, 362 reports 74 and fails. Observed
-                        run-to-run variance is one mutant (363-364), from timing-sensitive
-                        tests in the service package; a slower machine tends to kill more,
-                        not fewer, since a timed-out mutant counts as killed. Raise this
-                        when the score rises.
+                        Measured on main at 0.3.0: 421-422 of 553 killed (the count varies
+                        by one between runs, from timing-sensitive tests in the service
+                        package), test strength 82%.
+
+                        PIT compares a rounded integer, so the floor is 418: that reports
+                        76 and passes, while 417 reports 75 and fails. Roughly three or
+                        four mutants of headroom, not the round number it looks like.
+                        A slower machine tends to kill more, not fewer, since a timed-out
+                        mutant counts as killed. Raise this when the score rises — and
+                        recompute the floor with it, since it moves with the denominator.
                     -->
-                    <mutationThreshold>75</mutationThreshold>
+                    <mutationThreshold>76</mutationThreshold>
                 </configuration>
             </plugin>
             <plugin>
