@@ -1,5 +1,6 @@
 package com.cajunsystems.gumbo.persistence;
 
+import com.cajunsystems.gumbo.core.CounterValues;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -316,5 +317,112 @@ public interface PersistenceAdapter extends AutoCloseable {
      */
     default void deleteTagValue(LogTag tag, String key) throws IOException {
         throw new UnsupportedOperationException("deleteTagValue not implemented by " + getClass().getSimpleName());
+    }
+
+    // ── Key-Value: conditional mutation ──
+
+    /**
+     * Sets {@code key} to {@code value} only if it currently holds {@code expected},
+     * comparing by content. Returns whether the swap happened.
+     *
+     * <p>This is the KV's counterpart to conditional append, and it exists for the same
+     * reason: it lets a claim be decided <em>by storage</em>, so correctness stops depending
+     * on any coordination layer being right. A lock service can tell a node it holds a lock
+     * but never that it <em>still</em> holds it at the instant it writes — a GC pause
+     * between those two moments is enough for two nodes to both believe they own a stream.
+     * With the comparison where the write lands, the loser is rejected instead.
+     *
+     * <p>It also makes lease expiry an efficiency problem rather than a correctness one.
+     * A claimant compares an {@code expiresAt} it stored in the value, and clock skew can
+     * let two nodes both decide a lease is free — but only one of them wins the swap, and
+     * (with a conditional append behind it) only one of them can write.
+     *
+     * <h2>Absence and removal</h2>
+     * <ul>
+     *   <li>{@code expected == null} means <em>the key must be absent</em>. A stored value
+     *       is never {@code null} — {@link #setTagValue} forbids it — so absence has an
+     *       unambiguous representation and "claim if unclaimed" needs no separate
+     *       protocol.</li>
+     *   <li>{@code value == null} <em>removes</em> the key, making a conditional release
+     *       the same operation as a conditional claim.</li>
+     * </ul>
+     *
+     * <h2>Atomicity</h2>
+     * <p>The comparison and the write must be one atomic operation in the same store.
+     * A client-side read-then-write races the other writers it is trying to exclude, which
+     * is the whole failure this method exists to remove.
+     *
+     * <p>There is deliberately <strong>no</strong> working default. An implementation that
+     * compared non-atomically would make a log look like it was arbitrating claims while
+     * arbitrating nothing, surfacing as two owners rather than as an error — the same
+     * reasoning as {@link #append(PendingAppend, long)}. Adapters that can do this override
+     * it; the three other conditional methods below are defined in terms of it, so
+     * overriding this one supplies all four.
+     *
+     * @param tag      the tag whose KV namespace holds {@code key}
+     * @param key      the key to swap
+     * @param expected the value {@code key} must currently hold, or {@code null} to require
+     *                 that it is absent
+     * @param value    the value to store, or {@code null} to remove the key
+     * @return {@code true} if {@code key} held {@code expected} and was written
+     * @throws UnsupportedOperationException if this adapter cannot compare and write atomically
+     * @throws IOException if the write fails
+     */
+    default boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value)
+            throws IOException {
+        throw new UnsupportedOperationException(
+                getClass().getSimpleName() + " does not support compareAndSetTagValue;"
+                + " it cannot compare and write atomically");
+    }
+
+    /**
+     * Sets {@code key} to {@code value} only if it is currently absent — the claim
+     * operation: exactly one of N contending callers gets {@code true}.
+     *
+     * @return {@code true} if the key was absent and is now {@code value}
+     * @throws IOException if the write fails
+     */
+    default boolean setTagValueIfAbsent(LogTag tag, String key, byte[] value) throws IOException {
+        return compareAndSetTagValue(tag, key, null, value);
+    }
+
+    /**
+     * Removes {@code key} only if it currently holds {@code expected} — the release
+     * operation, which a holder uses to avoid releasing a claim that has since been taken
+     * over by someone else.
+     *
+     * @return {@code true} if the key held {@code expected} and was removed
+     * @throws IOException if the write fails
+     */
+    default boolean deleteTagValueIf(LogTag tag, String key, byte[] expected) throws IOException {
+        return compareAndSetTagValue(tag, key, expected, null);
+    }
+
+    /**
+     * Adds {@code delta} to the counter at {@code key} and returns the new value. An absent
+     * key counts as {@code 0}, so a counter needs no initialisation.
+     *
+     * <p>The value is eight bytes, big-endian — see {@link CounterValues}, which a client
+     * uses to decode the same key through {@link #getTagValue}.
+     *
+     * <p>The default retries a compare-and-set until it wins, which is correct on any
+     * adapter that implements {@link #compareAndSetTagValue} and does not require it to
+     * offer a native add. Adapters whose store can do the whole read-modify-write in one
+     * round trip should override.
+     *
+     * @return the counter's value after adding {@code delta}
+     * @throws IllegalStateException if {@code key} holds something other than a counter
+     * @throws IOException if the write fails
+     */
+    default long incrementTagValue(LogTag tag, String key, long delta) throws IOException {
+        while (true) {
+            byte[] current = getTagValue(tag, key);
+            long next = CounterValues.toLong(current) + delta;
+            if (compareAndSetTagValue(tag, key, current, CounterValues.toBytes(next))) {
+                return next;
+            }
+            // Lost the race; re-read and retry. Unbounded, as a CAS loop is — every
+            // iteration means some other caller made progress.
+        }
     }
 }

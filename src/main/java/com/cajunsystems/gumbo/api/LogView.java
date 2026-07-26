@@ -158,4 +158,60 @@ public interface LogView {
      * Removes the stored value for {@code key}. No-op if absent.
      */
     CompletableFuture<Void> deleteValue(String key);
+
+    // ── Key-Value: conditional mutation ──
+
+    /**
+     * Sets {@code key} to {@code value} only if it currently holds {@code expected},
+     * comparing by content; completes with whether the swap happened.
+     *
+     * <p>Pass {@code expected == null} to require that the key is absent, and
+     * {@code value == null} to remove it. See
+     * {@link com.cajunsystems.gumbo.persistence.PersistenceAdapter#compareAndSetTagValue}
+     * for why the comparison belongs in storage rather than in the caller.
+     *
+     * <pre>{@code
+     * // Take a lease on this stream, or discover someone else holds it.
+     * byte[] mine = (nodeId + "@" + expiresAt).getBytes();
+     * if (!view.setValueIfAbsent("owner", mine).join()) {
+     *     byte[] held = view.getValue("owner").join();
+     *     if (!expired(held) || !view.compareAndSetValue("owner", held, mine).join()) {
+     *         return;   // someone else owns it
+     *     }
+     * }
+     * // Even having won, fence the write on the version — via
+     * // SharedLog.append(request, expectedVersion). The lease says we owned the stream a
+     * // moment ago; only the fence says we still do at the instant the entry lands.
+     * }</pre>
+     *
+     * @throws UnsupportedOperationException if the underlying adapter cannot compare and
+     *         write atomically (delivered through the returned future)
+     */
+    CompletableFuture<Boolean> compareAndSetValue(String key, byte[] expected, byte[] value);
+
+    /**
+     * Sets {@code key} to {@code value} only if it is currently absent — the claim
+     * operation: of N contending callers exactly one completes with {@code true}.
+     */
+    default CompletableFuture<Boolean> setValueIfAbsent(String key, byte[] value) {
+        return compareAndSetValue(key, null, value);
+    }
+
+    /**
+     * Removes {@code key} only if it currently holds {@code expected} — the release
+     * operation, so a holder cannot release a claim that has since passed to someone else.
+     */
+    default CompletableFuture<Boolean> deleteValueIf(String key, byte[] expected) {
+        return compareAndSetValue(key, expected, null);
+    }
+
+    /**
+     * Adds {@code delta} to the counter at {@code key} and completes with the new value.
+     * An absent key counts as {@code 0}.
+     *
+     * <p>The stored value is eight bytes, big-endian — decode it with
+     * {@link com.cajunsystems.gumbo.core.CounterValues#toLong} when reading the same key
+     * through {@link #getValue}.
+     */
+    CompletableFuture<Long> incrementValue(String key, long delta);
 }

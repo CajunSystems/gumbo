@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -493,10 +494,21 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     // Key-Value
     // -------------------------------------------------------------------------
 
+    /*
+     * Every mutation writes the sidecar record and syncs it before publishing the new value
+     * to kvStore, so visibility follows durability here as it does for the log: a caller
+     * that reads back what it just wrote is reading something that survives the crash.
+     *
+     * All four mutators are synchronized, on the same monitor as the conditional append, so
+     * a read-compare-write cannot interleave with another writer's. That is what makes
+     * compareAndSetTagValue atomic; within the single writer this adapter enforces (the
+     * directory lock taken in open()), it is sufficient.
+     */
+
     @Override
-    public void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
-        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+    public synchronized void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
         writeKvRecord(tag, key, value);
+        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
     }
 
     @Override
@@ -506,10 +518,26 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     }
 
     @Override
-    public void deleteTagValue(LogTag tag, String key) throws IOException {
+    public synchronized void deleteTagValue(LogTag tag, String key) throws IOException {
+        writeKvRecord(tag, key, null);  // null → tombstone (valLen = -1)
         ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
         if (tagKv != null) tagKv.remove(key);
-        writeKvRecord(tag, key, null);  // null → tombstone (valLen = -1)
+    }
+
+    @Override
+    public synchronized boolean compareAndSetTagValue(
+            LogTag tag, String key, byte[] expected, byte[] value) throws IOException {
+        ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
+        byte[] current = tagKv == null ? null : tagKv.get(key);
+        if (!Arrays.equals(current, expected)) return false;
+
+        writeKvRecord(tag, key, value);
+        if (value == null) {
+            if (tagKv != null) tagKv.remove(key);
+        } else {
+            kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+        }
+        return true;
     }
 
     private void loadKvFile(Path kvFile) throws IOException {
@@ -560,6 +588,12 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         if (valueLen > 0) buf.put(value);
         buf.flip();
         while (buf.hasRemaining()) kvChannel.write(buf);
+        // Sync here rather than at the call sites: a KV write is durable when this returns,
+        // like an append is, and folding it in means no mutator can forget. Unsynced, an
+        // acknowledged checkpoint or claim could vanish while the log entries written either
+        // side of it survived — the KV is what a caller resumes *from*, so losing it silently
+        // is worse than losing an entry.
+        kvChannel.force(false);
     }
 
     // -------------------------------------------------------------------------

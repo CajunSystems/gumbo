@@ -6,6 +6,7 @@ import com.apple.foundationdb.KeyValue;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
+import com.cajunsystems.gumbo.core.CounterValues;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -18,6 +19,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -638,6 +640,48 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         db.run(tr -> {
             tr.clear(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
             return null;
+        });
+    }
+
+    /**
+     * The read, the comparison and the write happen in one transaction, so the fence holds
+     * across processes rather than only within this JVM: FoundationDB adds the key to the
+     * transaction's read conflict set, and a concurrent writer of the same key makes one of
+     * the two commits fail and retry. This is the adapter where a claim is genuinely
+     * arbitrated by storage.
+     */
+    @Override
+    public boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value) {
+        byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+        return db.run(tr -> {
+            byte[] current = tr.get(k).join();
+            if (!Arrays.equals(current, expected)) return false;
+            if (value == null) {
+                tr.clear(k);
+            } else {
+                tr.set(k, value);
+            }
+            return true;
+        });
+    }
+
+    /**
+     * One transaction, rather than the interface's compare-and-set loop.
+     *
+     * <p>Not FoundationDB's native {@code MutationType.ADD}, though it exists and would be a
+     * single mutation with no read: it interprets the value as <em>little</em>-endian, so a
+     * counter it maintained would disagree byte-for-byte with the big-endian
+     * {@link CounterValues} encoding every other adapter uses and every client decodes. A
+     * read-modify-write inside a serialisable transaction is the same guarantee at the cost
+     * of one read.
+     */
+    @Override
+    public long incrementTagValue(LogTag tag, String key, long delta) {
+        byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+        return db.run(tr -> {
+            long next = CounterValues.toLong(tr.get(k).join()) + delta;
+            tr.set(k, CounterValues.toBytes(next));
+            return next;
         });
     }
 

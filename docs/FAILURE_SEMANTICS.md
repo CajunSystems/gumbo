@@ -49,7 +49,9 @@ that had already landed.
 | `append(PendingAppend, expectedVersion)` | `NOTHING` | The version is assigned in the same operation as the write, so a failure consumes no version — except on the batching adapter, where see below. |
 | `appendBatchAssigningVersions(...)` | `PREFIX` | As `appendBatch`. Versions are assigned in list order. |
 | `trim(upToSeqnum)` | `NOTHING` | The trim point is written to a temp file and atomically renamed, so a crash mid-trim leaves the old point intact. |
-| `setTagValue` / `deleteTagValue` | `NOTHING` \| `PREFIX` | Appended to a sidecar; a torn record is skipped on replay, so the key keeps its previous value. |
+| `setTagValue` / `deleteTagValue` | `NOTHING` \| `UNKNOWN` | Appended to a sidecar and synced before the new value is published. A torn record is skipped on replay, so the key keeps its previous value (`NOTHING`). A failed *sync* is `UNKNOWN`: the record may still become durable, while this process goes on reporting the old value — read the key back after a reopen before deciding. |
+| `compareAndSetTagValue` and its derived forms | `NOTHING` \| `UNKNOWN` | As `setTagValue`, and only once the comparison has passed: a swap rejected on the comparison writes nothing at all, which is a **decision, not a failure** — it returns `false` rather than throwing. On FDB the whole read-compare-write is one transaction, so `NOTHING`. |
+| `incrementTagValue` | `NOTHING` \| `UNKNOWN` | As above, and the `UNKNOWN` matters more here than anywhere else in this table: a counter is the one value where **retrying an in-doubt operation can double-count**, since the retry cannot tell its own earlier increment from someone else's. Read the counter back before retrying. |
 
 ### `getLatestSeqnum()` is a durability boundary
 
@@ -65,6 +67,23 @@ Visibility now follows durability there.
 A third-party adapter that advertises written-but-not-durable entries here will silently
 lose data on the retry path, and nothing will report it.
 
+### The tag KV follows the same rule
+
+A KV mutation is durable when it returns, and the value it publishes is the one that
+survives — the file adapter syncs `kv.dat` before updating the in-memory map, in that order,
+for the same reason the log does.
+
+It did not, until the conditional forms were added. A `setTagValue` returned once the bytes
+had been written to the channel, with no sync, so an acknowledged checkpoint could vanish
+while the log entries written either side of it survived. That asymmetry is worse than it
+sounds: the KV is what a consumer resumes *from*, so losing it means replaying against a
+cursor that points somewhere the stream has moved past. A claim is stricter still — a claim
+that is acknowledged but not durable lets the next owner start work with no record of who
+was allowed to write.
+
+The cost is an fsync per KV write. A KV write is a coordination step, not a hot path, and it
+is the same cost every append already pays.
+
 ## `BatchingPersistenceAdapter`
 
 The decorator defers durability, not identity. Two consequences worth stating plainly:
@@ -77,6 +96,14 @@ The decorator defers durability, not identity. Two consequences worth stating pl
   delegate's `getLatestSeqnum()` names the boundary, since entries flush in seqnum order.
   If the delegate cannot answer, nothing is dropped: a duplicate is recoverable by
   inspection, a discarded entry is not.
+- **The KV is write-through, so a claim outruns the entries it authorises.** KV calls,
+  conditional ones included, go straight to the delegate and are durable when they return,
+  while log entries appended around them may still be pending. So "claim, then append" can
+  leave the claim durable and the work not. That is the safe direction — an orphaned claim
+  can be released or retried, whereas committed work with no record of who was allowed to
+  write it cannot be reconciled — but a caller has to know which way it falls. Batching the
+  KV instead would not help: a deferred compare-and-set is a claim whose outcome is unknown
+  at the moment the caller has to act on it.
 
 Still open, and deliberately so — these need a decision about what the adapter promises
 under sustained write failure, not a patch:

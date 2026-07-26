@@ -5,6 +5,60 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)
+at its item **A3**, the next one in that document's own order: with storage-owned versions
+and conditional append in place (0.3.0), compare-and-set on the tag KV is what turns the KV
+from a place to keep checkpoints into a coordination substrate — leases, ownership records,
+work claims — with no new subsystem.
+
+### Added
+
+**Conditional mutation on the tag key-value store**
+- `PersistenceAdapter.compareAndSetTagValue(tag, key, expected, value)` — writes only if the
+  key still holds `expected`, comparing by content. `expected == null` means *the key must be
+  absent*; `value == null` removes it, so a conditional release is the same operation as a
+  conditional claim
+- Derived forms, defined in terms of it so overriding one supplies all four:
+  `setTagValueIfAbsent` (claim), `deleteTagValueIf` (release),
+  `incrementTagValue(tag, key, delta)` (counter, absent reads as `0`)
+- The same four on `LogView` and `TypedLogView`, scoped to the view's tag:
+  `compareAndSetValue`, `setValueIfAbsent`, `deleteValueIf`, `incrementValue`
+- New `CounterValues` — the counter encoding, eight bytes big-endian, stated once so a
+  client decoding the key through `getValue` and an adapter incrementing it agree. FDB does
+  **not** use its native `MutationType.ADD` here: that op is little-endian, so a counter it
+  maintained would disagree byte-for-byte with every other adapter
+- On FoundationDB the read, comparison and write are one transaction, so a claim is arbitrated
+  across processes. The file and in-memory adapters decide it under their own lock, atomic
+  within the single writer the file adapter enforces
+- No working default, matching `append(PendingAppend, expectedVersion)`: an adapter that
+  compared non-atomically would hand every contender a `true` and report two owners as
+  success, so the base implementation throws `UnsupportedOperationException`
+
+`LogView` and `TypedLogView` each gain two abstract methods (`compareAndSetValue`,
+`incrementValue`; the other two are defaults over them), so a third-party implementation of
+either interface needs those two added. Adapters are unaffected — every new SPI method has a
+default.
+
+**Why a lease still needs the append fence.** Expiry needs a clock, and a clock is the part
+that can be wrong. With the append conditioned on the version, skew that lets two nodes both
+decide a lease is free costs duplicated effort rather than a corrupted stream: only one wins
+the swap, and only one passes the fence. `TagValueCoordinationTest` pins that pair.
+
+### Fixed
+
+- **KV writes were not synced.** `setTagValue` returned once the bytes reached the channel,
+  so an acknowledged checkpoint could be lost while the log entries written either side of it
+  survived — and the KV is what a consumer resumes *from*. `kv.dat` is now synced before the
+  new value is published to the in-memory map, so visibility follows durability as it does for
+  the log
+- **The in-memory adapter aliased KV values to the caller's array**, in and out. It is the one
+  adapter where the stored value is not serialised, so a caller reusing a buffer could change
+  a value nobody wrote — including one another caller was comparing against
+
+---
+
 ## [0.3.0] — 2026-07-26
 
 Correctness work on the log layer, prompted by a

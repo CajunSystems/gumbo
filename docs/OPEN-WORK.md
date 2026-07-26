@@ -15,6 +15,9 @@ reads), A5 (`localId` → `streamVersion`), D1 + A1 (storage-owned versions + co
 append), plus a subscription-delivery rewrite and a mutation-testing gate that were not on
 the report's list.
 
+**A3 (KV compare-and-set) has since landed** and is unreleased — see §2, and the CHANGELOG's
+`[Unreleased]`.
+
 See [`FAILURE_SEMANTICS.md`](FAILURE_SEMANTICS.md) for the write-path contracts, which
 several items below depend on.
 
@@ -120,21 +123,28 @@ it being *dangerous*.
 **Do the fault-injection harness (§4) first** — D2 is squarely a partial-write problem and
 would be its first real customer.
 
-### A3 — KV compare-and-set
+### ~~A3 — KV compare-and-set~~ — done, unreleased
 
-```java
-boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value);
-boolean putTagValueIfAbsent(LogTag tag, String key, byte[] value);
-boolean deleteTagValueIf(LogTag tag, String key, byte[] expected);
-long incrementTagValue(LogTag tag, String key, long delta);
-```
+Shipped ahead of its rank here (this doc put it 7th; it was taken next because the report's
+own order puts it 6th, above A4). See the CHANGELOG's `[Unreleased]`.
 
-The KV already exists and is load-bearing (Catalyst's idempotency index and snapshots). CAS
-turns it into a coordination substrate — leases, ownership records, work claims — with no
-new subsystem. With A1 shipped, clock skew on lease expiry is now an *efficiency* problem
-(two nodes briefly duplicate work) rather than a *correctness* one (the log rejects the
-loser), so a stored `expiresAt` compared by claimants is sufficient; native TTL is not
-required.
+`compareAndSetTagValue` on `PersistenceAdapter`, with `setTagValueIfAbsent` /
+`deleteTagValueIf` / `incrementTagValue` defined over it, and the four mirrored on `LogView`
+and `TypedLogView`. Named `setTagValueIfAbsent` rather than the sketch's
+`putTagValueIfAbsent`, to match the existing `setTagValue`.
+
+Two things it changed that were not on any list, both in the methods it had to touch:
+`kv.dat` was never fsynced, so an acknowledged checkpoint could be lost while the log entries
+around it survived; and `InMemoryPersistenceAdapter` aliased KV values to the caller's array
+in both directions, which a comparison protocol cannot survive.
+
+It also adds one more `removed call to FileChannel::force` mutant — same deliberately-
+unkillable class as the others (§4), now covering `kv.dat` as well as the log.
+
+Still open on this subject: **A3 gave the KV a fence, not a clock.** A lease's `expiresAt` is
+compared by claimants, which is sufficient precisely because A1's version fence makes skew an
+*efficiency* problem rather than a correctness one — the log rejects the loser. If a native
+TTL is ever wanted, that is a new decision, not a gap in this.
 
 ### A6 — multi-tag ergonomics (half done)
 
@@ -306,7 +316,7 @@ Untouched, and all still true.
 4. **Fault-injection harness** (§4) — before D2, which is its first customer
 5. **D2** non-clobbering index
 6. **Batching decision** (§3) and/or the decorator spike (§4) — same subject, take together
-7. **A3**, then **A6** ergonomics
+7. **A6** ergonomics (~~A3~~ done, out of order — see §2)
 8. **Multi-tag versions** last — the only item with a log-migration cost
 
 ---

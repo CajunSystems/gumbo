@@ -165,6 +165,30 @@ public class DefaultLogView implements LogView {
         });
     }
 
+    @Override
+    public CompletableFuture<Boolean> compareAndSetValue(String key, byte[] expected, byte[] value) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return service.adapter().compareAndSetTagValue(tag, key, expected, value);
+            } catch (IOException e) {
+                throw new SharedLogService.LogWriteException(
+                        "compareAndSetValue failed for tag=" + tag + " key=" + key, e);
+            }
+        }, service.asyncPool());
+    }
+
+    @Override
+    public CompletableFuture<Long> incrementValue(String key, long delta) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return service.adapter().incrementTagValue(tag, key, delta);
+            } catch (IOException e) {
+                throw new SharedLogService.LogWriteException(
+                        "incrementValue failed for tag=" + tag + " key=" + key, e);
+            }
+        }, service.asyncPool());
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------

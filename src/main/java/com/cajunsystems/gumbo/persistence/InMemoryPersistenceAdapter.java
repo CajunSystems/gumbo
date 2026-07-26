@@ -6,6 +6,7 @@ import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -206,21 +207,55 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         return idx.lastKey();
     }
 
+    // -------------------------------------------------------------------------
+    // Key-Value
+    // -------------------------------------------------------------------------
+
+    /*
+     * Values are copied in and out. The durable adapters serialise to storage, so a caller
+     * that reuses or mutates a buffer cannot reach what they hold; here the array *is* the
+     * stored state, and handing out a reference to it would let a caller change a value
+     * nobody wrote — including one another caller is comparing against.
+     */
+
     @Override
     public void setTagValue(LogTag tag, String key, byte[] value) {
-        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value.clone());
     }
 
     @Override
     public byte[] getTagValue(LogTag tag, String key) {
         ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
-        return tagKv == null ? null : tagKv.get(key);
+        if (tagKv == null) return null;
+        byte[] stored = tagKv.get(key);
+        return stored == null ? null : stored.clone();
     }
 
     @Override
     public void deleteTagValue(LogTag tag, String key) {
         ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
         if (tagKv != null) tagKv.remove(key);
+    }
+
+    /**
+     * {@code compute} on a {@link ConcurrentHashMap} holds the bin lock across the
+     * comparison and the write, which is the atomicity this method has to provide.
+     * Returning {@code null} from it removes the mapping, so a conditional delete is the
+     * same call as a conditional set.
+     */
+    @Override
+    public boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value) {
+        ConcurrentHashMap<String, byte[]> tagKv =
+                kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>());
+        boolean[] swapped = {false};
+        tagKv.compute(key, (k, current) -> {
+            if (!Arrays.equals(current, expected)) {
+                return current;   // no match: leave it exactly as it was (null stays absent)
+            }
+            swapped[0] = true;
+            return value == null ? null : value.clone();
+        });
+        return swapped[0];
     }
 
     // -------------------------------------------------------------------------
