@@ -348,8 +348,51 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     private void flushUnderLock() throws IOException {
         if (pendingBatch.isEmpty()) return;
         List<LogEntry> batch = List.copyOf(pendingBatch);
-        delegate.appendBatch(batch);
-        pendingBatch.subList(0, batch.size()).clear();
+        try {
+            delegate.appendBatch(batch);
+            pendingBatch.subList(0, batch.size()).clear();
+        } catch (IOException | RuntimeException ex) {
+            dropWhatTheDelegateKept(batch);
+            throw ex;
+        }
+    }
+
+    /**
+     * After a failed flush, drops exactly the entries the delegate acknowledges holding.
+     *
+     * <p>A failed {@code appendBatch} is not necessarily an empty one. The file adapter
+     * writes entry by entry, so a failure part-way leaves a persisted prefix; FoundationDB
+     * chunks large batches and can commit an earlier chunk before a later one fails.
+     * Keeping the whole batch for retry would rewrite that prefix — trading the data loss
+     * this replaced for duplicate records, which is no better in an append-only log that
+     * things are folded from.
+     *
+     * <p>Entries are flushed in seqnum order, so the delegate's latest seqnum names the
+     * boundary precisely: at or below it is durable, above it is not. Reconciling against
+     * that leaves the retry neither losing nor duplicating, without requiring delegates to
+     * make {@code appendBatch} all-or-nothing.
+     *
+     * <p>If the delegate cannot say, nothing is dropped: a duplicate is recoverable by
+     * inspection, whereas a discarded entry is not.
+     */
+    private void dropWhatTheDelegateKept(List<LogEntry> batch) {
+        long persistedThrough;
+        try {
+            persistedThrough = delegate.getLatestSeqnum();
+        } catch (RuntimeException probeFailed) {
+            logger.warn("Could not determine what the delegate persisted after a failed flush;"
+                    + " keeping all {} entries for retry", batch.size(), probeFailed);
+            return;
+        }
+        int persisted = 0;
+        while (persisted < batch.size() && batch.get(persisted).seqnum() <= persistedThrough) {
+            persisted++;
+        }
+        if (persisted > 0) {
+            logger.warn("Flush failed after the delegate persisted {} of {} entries;"
+                    + " retrying only the remainder", persisted, batch.size());
+            pendingBatch.subList(0, persisted).clear();
+        }
     }
 
     private void flushQuietly() {
