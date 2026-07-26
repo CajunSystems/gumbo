@@ -34,6 +34,7 @@ import java.util.zip.CRC32;
  *   log.dat     – append-only stream of binary-encoded {@link LogEntry} records
  *   index.dat   – append-only global index: [seqnum:8][fileOffset:8] = 16 B/entry
  *   trim.dat    – single 8-byte little-endian trim seqnum (0 = nothing trimmed)
+ *   lock        – empty file; holds the exclusive writer lock for the directory
  * </pre>
  *
  * <h2>Log entry binary format</h2>
@@ -61,6 +62,13 @@ import java.util.zip.CRC32;
  * <h2>Thread safety</h2>
  * <p>Writes are guarded externally by the service layer. Reads use in-memory
  * skip-list maps that are safe for concurrent reads.
+ *
+ * <h2>Single-writer</h2>
+ * <p>This adapter is single-writer: local ids are assigned from process-local counters
+ * and {@code index.dat} is written per process, so two adapters sharing a directory
+ * assign colliding ids and overwrite each other's index. {@link #open()} therefore takes
+ * an exclusive {@link java.nio.channels.FileLock} on {@code lock} and fails with
+ * {@link LogAlreadyOpenException} rather than corrupting the log silently.
  */
 public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
@@ -74,6 +82,12 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     private final Path logFile;
     private final Path indexFile;
     private final Path trimFile;
+    private final Path lockFile;
+
+    /** Channel holding {@link #dirLock}; kept open for the lifetime of the lock. */
+    private FileChannel lockChannel;
+    /** Exclusive lock on {@link #lockFile}, held from open() to close(). */
+    private java.nio.channels.FileLock dirLock;
 
     /** Durable write channel for the log; opened in APPEND mode. */
     private FileChannel logChannel;
@@ -106,6 +120,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         this.logFile   = dataDir.resolve("log.dat");
         this.indexFile = dataDir.resolve("index.dat");
         this.trimFile  = dataDir.resolve("trim.dat");
+        this.lockFile  = dataDir.resolve("lock");
     }
 
     public FileBasedPersistenceAdapter(String dataDir) {
@@ -118,8 +133,67 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public void open() throws IOException {
+        if (open) throw new IllegalStateException("Adapter is already open: " + dataDir);
         Files.createDirectories(dataDir);
+        acquireDirectoryLock();
+        try {
+            openLocked();
+        } catch (IOException | RuntimeException e) {
+            // Unwind everything, not just the lock. openLocked() assigns the three write
+            // channels one at a time, so a failure part-way through leaves the earlier
+            // ones open — and with `open` still false, close() would return before
+            // reaching them, leaking a descriptor per failed attempt.
+            closeQuietly(logChannel);   logChannel   = null;
+            closeQuietly(indexChannel); indexChannel = null;
+            closeQuietly(kvChannel);    kvChannel    = null;
+            releaseDirectoryLock();
+            throw e;
+        }
+    }
 
+    /**
+     * Takes the exclusive writer lock on the data directory, so a second adapter fails
+     * loudly here instead of silently duplicating local ids and clobbering the index.
+     *
+     * <p>Both failure modes map to the same error: {@code tryLock} returns {@code null}
+     * when another <em>process</em> holds the lock, and throws
+     * {@link java.nio.channels.OverlappingFileLockException} when another adapter in
+     * <em>this</em> JVM does (file locks are held per JVM, not per channel).
+     */
+    private void acquireDirectoryLock() throws IOException {
+        // Held in a local until the lock is actually taken. Publishing the channel to the
+        // field first would let a failed acquisition overwrite a channel this adapter is
+        // already holding a lock through, orphaning its descriptor.
+        FileChannel channel = FileChannel.open(lockFile,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        java.nio.channels.FileLock lock;
+        try {
+            lock = channel.tryLock();
+        } catch (java.nio.channels.OverlappingFileLockException e) {
+            closeQuietly(channel);
+            throw new LogAlreadyOpenException(dataDir, e);
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(channel);
+            throw e;
+        }
+        if (lock == null) {
+            closeQuietly(channel);
+            throw new LogAlreadyOpenException(dataDir, null);
+        }
+        this.lockChannel = channel;
+        this.dirLock = lock;
+    }
+
+    private void releaseDirectoryLock() {
+        if (dirLock != null) {
+            try { dirLock.release(); } catch (IOException ignored) { /* channel close covers it */ }
+            dirLock = null;
+        }
+        closeQuietly(lockChannel);
+        lockChannel = null;
+    }
+
+    private void openLocked() throws IOException {
         // Load trim seqnum
         if (Files.exists(trimFile)) {
             byte[] trimBytes = Files.readAllBytes(trimFile);
@@ -162,6 +236,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         closeQuietly(logChannel);
         closeQuietly(indexChannel);
         closeQuietly(kvChannel);
+        releaseDirectoryLock();
         log.info("FileBasedPersistenceAdapter closed");
     }
 

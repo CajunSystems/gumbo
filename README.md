@@ -490,6 +490,28 @@ Append-only binary WAL (`log.dat`) with:
 - **Crash recovery**: On open, loads the index file; if it is missing or not a
   multiple of 16 bytes, falls back to scanning `log.dat` and rebuilding from scratch.
   Per-tag in-memory indices are always rebuilt from the verified log entries.
+- **Single-writer, enforced**: `open()` takes an exclusive `FileLock` on `{dataDir}/lock`
+  and throws `LogAlreadyOpenException` if another adapter — in this JVM or another
+  process — already holds it. See below.
+
+**Why single-writer.** `localId` is assigned from a process-local counter and `index.dat`
+is written per process, so two adapters sharing a directory hand out the same ids and the
+second to close overwrites the first's view of the log. Both failures are silent: the
+entries are on disk but unreadable, and the duplicate ids address two different entries.
+The lock turns that into an error at `open()` instead:
+
+```java
+var first  = new FileBasedPersistenceAdapter("/var/data");
+first.open();
+
+var second = new FileBasedPersistenceAdapter("/var/data");
+second.open();   // throws LogAlreadyOpenException
+```
+
+The lock is released by `close()` and by process exit (including a crash — the OS drops
+it), so a restart reopens the directory normally. A stale `lock` file is never a problem
+and never needs removing by hand; it is the OS lock, not the file's existence, that
+guards the directory.
 
 ### BatchingPersistenceAdapter
 

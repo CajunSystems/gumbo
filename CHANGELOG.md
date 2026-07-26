@@ -29,6 +29,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**Single-writer enforcement for `FileBasedPersistenceAdapter`**
+- `open()` now takes an exclusive `FileLock` on `{dataDir}/lock` and throws the new
+  `LogAlreadyOpenException` when another adapter already holds the directory — whether it
+  is in this JVM or another process
+- Previously a second writer was accepted silently and corrupted the log two ways: both
+  processes assigned the same `localId` values for a tag (process-local counters, never
+  reconciled), and the last one to close overwrote the other's `index.dat`, leaving
+  entries on disk that no reader could see
+- The lock is released on `close()` and by process exit, so restart-after-crash is
+  unaffected and a leftover `lock` file never needs removing by hand
+
 **Version-keyed reads** — read a tag's stream by its own position instead of the global seqnum
 - `SharedLog.readFromVersion(LogTag, long)` / `readAfterVersion(LogTag, long)`
 - `LogView.readFromVersion(long)` / `readAfterVersion(long)` / `getLatestVersion()`
