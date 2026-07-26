@@ -106,12 +106,33 @@ public class SharedLogService implements SharedLog {
     @Override
     public CompletableFuture<AppendResult> append(AppendRequest request) {
         return CompletableFuture.supplyAsync(
-                () -> doAppend(request, PersistenceAdapter.ANY_VERSION), asyncPool);
+                () -> doAppend(request, request.tags().iterator().next(),
+                        PersistenceAdapter.ANY_VERSION),
+                asyncPool);
     }
 
     @Override
     public CompletableFuture<AppendResult> append(AppendRequest request, long expectedVersion) {
-        return CompletableFuture.supplyAsync(() -> doAppend(request, expectedVersion), asyncPool);
+        if (request.tags().size() != 1) {
+            throw new IllegalArgumentException(
+                    "Conditional append on a multi-tag request must name the tag to fence:"
+                    + " use append(request, fencedTag, expectedVersion). Tags were "
+                    + request.tags());
+        }
+        LogTag only = request.tags().iterator().next();
+        return CompletableFuture.supplyAsync(
+                () -> doAppend(request, only, expectedVersion), asyncPool);
+    }
+
+    @Override
+    public CompletableFuture<AppendResult> append(
+            AppendRequest request, LogTag fencedTag, long expectedVersion) {
+        if (!request.tags().contains(fencedTag)) {
+            throw new IllegalArgumentException(
+                    "fencedTag " + fencedTag + " is not among the request's tags " + request.tags());
+        }
+        return CompletableFuture.supplyAsync(
+                () -> doAppend(request, fencedTag, expectedVersion), asyncPool);
     }
 
     /**
@@ -168,12 +189,11 @@ public class SharedLogService implements SharedLog {
         }
     }
 
-    private AppendResult doAppend(AppendRequest request, long expectedVersion) {
+    private AppendResult doAppend(AppendRequest request, LogTag primaryTag, long expectedVersion) {
         ensureNotClosed();
         writeLock.lock();
         try {
             Set<LogTag> tags = request.tags();
-            LogTag primaryTag = tags.iterator().next();
             PendingAppend pending = new PendingAppend(
                     sequencer.next(), primaryTag, tags, request.dataUnsafe(), Instant.now());
 

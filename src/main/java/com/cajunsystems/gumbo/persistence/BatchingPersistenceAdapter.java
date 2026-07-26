@@ -333,11 +333,23 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     // -------------------------------------------------------------------------
 
     /** Flushes the pending batch to the delegate; caller must hold flushLock. */
+    /**
+     * Writes the pending entries to the delegate, and drops them only once that has
+     * succeeded.
+     *
+     * <p>Clearing first loses them outright if the delegate throws: the background flush
+     * logs the failure after the data is already gone, and a caller that received an
+     * {@code AppendResult} — with a version assigned and consumed — has no way to learn
+     * its entry was discarded. Leaving them pending means the next flush retries.
+     *
+     * <p>Always called with {@link #flushLock} held, so nothing is appended between the
+     * write and the removal.
+     */
     private void flushUnderLock() throws IOException {
         if (pendingBatch.isEmpty()) return;
         List<LogEntry> batch = List.copyOf(pendingBatch);
-        pendingBatch.clear();
         delegate.appendBatch(batch);
+        pendingBatch.subList(0, batch.size()).clear();
     }
 
     private void flushQuietly() {

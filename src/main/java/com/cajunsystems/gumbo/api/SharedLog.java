@@ -63,10 +63,13 @@ public interface SharedLog extends AutoCloseable {
      * log.append(AppendRequest.to(tag, decide(state)), at).join();   // rejected if overtaken
      * }</pre>
      *
-     * <p>For a multi-tag append the condition applies to the <strong>primary tag only</strong>.
-     * That is the shape real callers have — one entity stream that needs fencing, one
-     * fan-out tag that does not — and conditioning on every tag would make an append fail
-     * for reasons unrelated to the entity being written.
+     * <p>This form requires a <strong>single-tag</strong> request, so the stream being
+     * fenced is unambiguous. For a multi-tag append use
+     * {@link #append(AppendRequest, LogTag, long)} and name the tag: the primary tag of a
+     * multi-tag request is {@code tags.iterator().next()} over an immutable {@code Set},
+     * whose iteration order Java salts per JVM run, so which stream a fence applied to
+     * would otherwise vary between runs of the same program — accepting a stale entity
+     * update in one and rejecting a valid one in the next.
      *
      * <p>Not every adapter can do this: it requires comparing and incrementing the version
      * in one atomic storage operation. An adapter that cannot throws
@@ -78,6 +81,24 @@ public interface SharedLog extends AutoCloseable {
      * @param expectedVersion the version the primary tag must still be at
      */
     CompletableFuture<AppendResult> append(AppendRequest request, long expectedVersion);
+
+    /**
+     * Appends only if {@code fencedTag} is still at {@code expectedVersion}.
+     *
+     * <p>The explicit form of {@link #append(AppendRequest, long)}, for a multi-tag append
+     * where one stream needs a fence and the others do not — a workflow recording history
+     * while enqueueing work, say. {@code fencedTag} must be among the request's tags, and
+     * is also the tag whose version the entry takes, so both the fence and the numbering
+     * follow the caller's choice rather than a set's iteration order.
+     *
+     * <p>Only that one tag is conditioned. Requiring every tag to be at an expected
+     * version would fail appends for reasons unrelated to the entity being written.
+     *
+     * @param request         the payload and target tags
+     * @param fencedTag       the tag to condition on; must be among {@code request.tags()}
+     * @param expectedVersion the version {@code fencedTag} must still be at
+     */
+    CompletableFuture<AppendResult> append(AppendRequest request, LogTag fencedTag, long expectedVersion);
 
     /**
      * Appends multiple entries to the log, claiming all seqnums in a single

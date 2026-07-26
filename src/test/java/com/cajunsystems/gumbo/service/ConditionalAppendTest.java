@@ -173,6 +173,97 @@ class ConditionalAppendTest {
         assertThat(append(INVENTORY, "i0", 0).streamVersion()).isEqualTo(0L);
     }
 
+    /**
+     * A multi-tag conditional append must name the tag it is fencing.
+     *
+     * <p>The primary tag of a multi-tag request is {@code tags.iterator().next()} over an
+     * immutable {@code Set}, whose iteration order Java salts per JVM run. Left implicit,
+     * the fence would apply to whichever stream that yielded — rejecting a valid entity
+     * update in one run and accepting a stale one in the next, with nothing in the code to
+     * show which. Refused up front instead.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void aMultiTagConditionalAppendMustNameTheFencedTag(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
+        open(factory);
+        AppendRequest both = AppendRequest.to(Set.of(ORDERS, INVENTORY), "work".getBytes());
+
+        assertThatThrownBy(() -> service.append(both, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must name the tag to fence");
+
+        assertThatThrownBy(() -> service.append(both, LogTag.of("unrelated"), 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("is not among the request's tags");
+    }
+
+    /**
+     * With the tag named, both the fence and the numbering follow the caller's choice
+     * rather than a set's iteration order — the workflow shape: fence the entity's
+     * history, fan out to a queue that needs no fence.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void namingTheFencedTagDecidesBothTheFenceAndTheVersion(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
+        LogTag history = LogTag.of("history", "wf-1");
+        LogTag queue   = LogTag.of("queue");
+        open(factory);
+
+        for (int i = 0; i < 3; i++) {
+            service.append(AppendRequest.to(history, ("h" + i).getBytes())).join();
+        }
+
+        AppendRequest both = AppendRequest.to(Set.of(history, queue), "work".getBytes());
+
+        // Stale expectation on the named tag is rejected, whichever way the set iterates.
+        assertThatThrownBy(() -> service.append(both, history, 0).join())
+                .hasRootCauseInstanceOf(VersionConflictException.class);
+
+        AppendResult r = service.append(both, history, 3).join();
+        assertThat(r.primaryTag()).isEqualTo(history);
+        assertThat(r.streamVersion()).isEqualTo(3L);
+    }
+
+    /**
+     * A multi-tag append must never lower a secondary tag's version count.
+     *
+     * <p>An entry carries one version — its primary tag's — so on a multi-tag append a
+     * secondary tag may already be further along its own sequence. Writing
+     * {@code thisEntry.version + 1} as that tag's count rewinds it, which hands out
+     * versions that already exist and, now that the count is what a conditional append
+     * reads, lets a stale writer pass a fence it should have failed.
+     *
+     * <p>The in-memory and file adapters take a max and were always safe; FoundationDB
+     * overwrote. The invariant is asserted here for every adapter rather than only where
+     * it was broken, so it is checked wherever the suite runs.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void aMultiTagAppendNeverRewindsASecondaryTagsVersion(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
+        open(factory);
+
+        // INVENTORY is well ahead; ORDERS has nothing.
+        for (int i = 0; i < 3; i++) {
+            service.append(AppendRequest.to(INVENTORY, ("i" + i).getBytes())).join();
+        }
+
+        // One entry on both, fenced on (and numbered by) ORDERS, whose version is 0.
+        AppendResult r = service.append(
+                AppendRequest.to(Set.of(ORDERS, INVENTORY), "both".getBytes()),
+                ORDERS, 0).join();
+        assertThat(r.streamVersion()).isEqualTo(0L);
+
+        // INVENTORY's next version must not have been rewound to 1.
+        assertThatThrownBy(() -> append(INVENTORY, "stale", 1))
+                .as("a rewound count would let this stale writer through the fence")
+                .isInstanceOf(RuntimeException.class);
+
+        assertThat(append(INVENTORY, "i3", 3).streamVersion()).isEqualTo(3L);
+    }
+
     // -------------------------------------------------------------------------
     // Storage-owned assignment
     // -------------------------------------------------------------------------

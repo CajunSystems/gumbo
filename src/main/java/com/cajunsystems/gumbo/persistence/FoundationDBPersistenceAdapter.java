@@ -374,10 +374,25 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         for (LogTag tag : entry.tags()) {
             tr.set(tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
                    longBytes(entry.streamVersion()));
-            tr.set(tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
-                   longBytes(entry.streamVersion() + 1));
-            tr.set(tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
-                   longBytes(entry.seqnum()));
+
+            // Raise the tag's count, never lower it. An entry carries one version — its
+            // primary tag's — so on a multi-tag append a secondary tag may already be
+            // further along its own sequence. Overwriting its count with this entry's
+            // version + 1 would hand out versions that already exist on that tag, and,
+            // now that the conditional append reads this key as its fence, would let a
+            // stale writer pass a check it should have failed.
+            byte[] countKey = tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
+            byte[] rawCount = tr.get(countKey).join();
+            long currentCount = rawCount == null ? 0L : ByteBuffer.wrap(rawCount).getLong();
+            long candidate = entry.streamVersion() + 1;
+            if (candidate > currentCount) tr.set(countKey, longBytes(candidate));
+
+            // Same reasoning for the tag's latest seqnum. Seqnums only grow, so this
+            // rarely differs — but "rarely" is not a reason to write a lower value.
+            byte[] latestKey = tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
+            byte[] rawLatest = tr.get(latestKey).join();
+            long currentLatest = rawLatest == null ? -1L : ByteBuffer.wrap(rawLatest).getLong();
+            if (entry.seqnum() > currentLatest) tr.set(latestKey, longBytes(entry.seqnum()));
         }
     }
 
@@ -404,29 +419,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 long maxSeqnum = latestSeqnum;
 
                 for (LogEntry entry : entries) {
-                    // Primary log record
-                    tr.set(logSubspace.pack(Tuple.from(entry.seqnum())), encodeEntry(entry));
-
-                    for (LogTag tag : entry.tags()) {
-                        // Tag index: (namespace, key, seqnum) → streamVersion
-                        tr.set(
-                            tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
-                            longBytes(entry.streamVersion())
-                        );
-                        // Compact per-tag count (last streamVersion + 1)
-                        long newCount = entry.streamVersion() + 1;
-                        tr.set(
-                            tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
-                            longBytes(newCount)
-                        );
-                        // Track latest seqnum for this tag
-                        long newLatest = entry.seqnum();
-                        tr.set(
-                            tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
-                            longBytes(newLatest)
-                        );
-                    }
-
+                    // Shared with the version-assigning append so both raise per-tag
+                    // metadata rather than overwriting it — one copy of that rule, not two.
+                    writeEntry(tr, entry);
                     if (entry.seqnum() > maxSeqnum) maxSeqnum = entry.seqnum();
                 }
 
