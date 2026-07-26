@@ -2,6 +2,7 @@ package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.io.IOException;
 import java.util.List;
@@ -167,7 +168,7 @@ public interface PersistenceAdapter extends AutoCloseable {
      * @throws IOException if a read error occurs
      */
     default List<LogEntry> readAfterVersion(LogTag tag, long afterVersion) throws IOException {
-        return readFromVersion(tag, afterVersion < 0 ? 0L : afterVersion + 1);
+        return readFromVersion(tag, StreamVersions.afterToInclusive(afterVersion));
     }
 
     // -------------------------------------------------------------------------

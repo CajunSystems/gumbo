@@ -212,6 +212,28 @@ class VersionKeyedReadTest {
         return true;
     }
 
+    /**
+     * {@code Long.MAX_VALUE} is this codebase's sentinel for "the very end" — it is what
+     * {@code DefaultLogView.checkTail} passes. Naively adding one to it wraps to
+     * {@code Long.MIN_VALUE}, which every version filter reads as "no lower bound", so
+     * asking for the entries after everything would return the entire stream: the exact
+     * inverse of the answer, delivered silently.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void aCursorAtTheMaximumVersionReturnsNothingRatherThanEverything(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
+        open(factory);
+        append(ORDERS, "o0"); append(INVENTORY, "i0"); append(ORDERS, "o1");
+
+        LogView orders = service.getView(ORDERS);
+        assertThat(orders.readAfterVersion(Long.MAX_VALUE).join()).isEmpty();
+        assertThat(orders.readAfterVersion(Long.MAX_VALUE - 1).join()).isEmpty();
+
+        // The tag is not empty — the reads above are bounded, not broken.
+        assertThat(payloadsOf(orders.readAfterVersion(-1).join())).containsExactly("o0", "o1");
+    }
+
     @Test
     void versionsSurviveAReopenOfTheLog() throws IOException {
         open(FileBasedPersistenceAdapter::new);

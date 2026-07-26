@@ -3,6 +3,7 @@ package com.cajunsystems.gumbo.api;
 import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -106,7 +107,7 @@ public interface TypedLogView<T> {
      * entry's own version.
      */
     default CompletableFuture<List<T>> readAfterVersion(long afterVersion) {
-        return readFromVersion(afterVersion < 0 ? 0L : afterVersion + 1);
+        return readFromVersion(StreamVersions.afterToInclusive(afterVersion));
     }
 
     /**

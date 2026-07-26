@@ -5,6 +5,7 @@ import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -113,7 +114,7 @@ public interface SharedLog extends AutoCloseable {
      * processed. Pass {@code -1} for the whole stream.
      */
     default CompletableFuture<List<LogEntry>> readAfterVersion(LogTag tag, long afterVersion) {
-        return readFromVersion(tag, afterVersion < 0 ? 0L : afterVersion + 1);
+        return readFromVersion(tag, StreamVersions.afterToInclusive(afterVersion));
     }
 
     // -------------------------------------------------------------------------
