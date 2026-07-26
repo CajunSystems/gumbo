@@ -369,7 +369,10 @@ public class SharedLogService implements SharedLog {
      */
     private static final class SubscriptionImpl implements Subscription {
 
-        /** How long {@link #close()} waits for an in-flight listener call to return. */
+        /**
+         * Total budget {@link #close()} spends waiting for an in-flight listener call,
+         * split between waiting politely and waiting after an interrupt.
+         */
         private static final long CLOSE_TIMEOUT_MS = 5_000;
 
         /**
@@ -456,16 +459,25 @@ public class SharedLogService implements SharedLog {
         }
 
         /**
-         * Stops delivery, and does not return until it has actually stopped.
+         * Stops delivery and waits for any in-flight listener call to return.
          *
-         * <p>Waits for an in-flight {@code listener.accept} to return, so once this
-         * returns the listener is not running and will not run again — callers routinely
-         * release resources the listener closes over on the next line.
+         * <p>No entry is delivered after this is called. When it returns <em>normally</em>
+         * the listener has also stopped running, which is the property a caller needs
+         * before releasing whatever the listener closes over.
          *
-         * <p>The pump is woken with a queued sentinel rather than an interrupt, so a
-         * listener mid-call is left alone to finish. Only if it has not finished within
-         * {@link #CLOSE_TIMEOUT_MS} is it interrupted, and the wait then gives up with a
-         * warning rather than leaving an unclosable subscription.
+         * <p>It escalates rather than waiting on one timer. The pump is first woken with
+         * a queued sentinel, which leaves a listener mid-call alone to finish. If it has
+         * not returned within half the {@link #CLOSE_TIMEOUT_MS} budget the thread is
+         * interrupted and waited on again, so a listener that honours interruption is
+         * reaped before this method returns rather than after it.
+         *
+         * <p><strong>The guarantee has a limit, and it is the JVM's, not this class's.</strong>
+         * A listener that neither returns nor honours interruption cannot be stopped —
+         * Java has no way to force it. After the full budget this method logs a warning
+         * and returns while that listener is still running, because the alternative is an
+         * unclosable subscription that hangs {@link SharedLogService#close()} with it.
+         * A caller whose listener can block indefinitely and whose resources must not be
+         * released early has to coordinate that with the listener itself.
          *
          * <p>Closing from inside the listener does nothing beyond deactivating: waiting
          * for the pump from the pump would deadlock.
@@ -476,19 +488,33 @@ public class SharedLogService implements SharedLog {
             Thread t = pump;
             if (t == null || t == Thread.currentThread()) return;
 
+            long half = CLOSE_TIMEOUT_MS / 2;
             queue.add(POISON);   // wakes take() without touching a running listener
-            try {
-                t.join(CLOSE_TIMEOUT_MS);
-                if (t.isAlive()) {
+
+            if (!awaitPump(t, half)) {
+                // Mid-listener. Interrupt, then wait again — interrupting and returning
+                // immediately would deny an interruptible listener the one chance the
+                // interrupt exists to give it.
+                t.interrupt();
+                if (!awaitPump(t, CLOSE_TIMEOUT_MS - half)) {
                     LoggerFactory.getLogger(SubscriptionImpl.class)
-                            .warn("Listener for tag={} still running {} ms after close;"
-                                    + " interrupting and abandoning the wait", tag, CLOSE_TIMEOUT_MS);
-                    t.interrupt();
+                            .warn("Listener for tag={} still running {} ms after close and did"
+                                    + " not respond to interruption; abandoning the wait."
+                                    + " It may still be using resources the caller releases next.",
+                                    tag, CLOSE_TIMEOUT_MS);
                 }
+            }
+            queue.clear();
+        }
+
+        /** Joins {@code t} for {@code ms}; returns whether it actually finished. */
+        private static boolean awaitPump(Thread t, long ms) {
+            try {
+                t.join(ms);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
-            queue.clear();
+            return !t.isAlive();
         }
 
         @Override
