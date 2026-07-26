@@ -106,7 +106,7 @@ class AppendBatchTest {
     }
 
     @Test
-    void appendBatch_localIdsArePerTagMonotonic() {
+    void appendBatch_versionsArePerTagMonotonic() {
         List<AppendRequest> requests = List.of(
                 AppendRequest.to(ORDERS,    "o0".getBytes()),
                 AppendRequest.to(INVENTORY, "i0".getBytes()),
@@ -115,14 +115,14 @@ class AppendBatchTest {
 
         List<AppendResult> results = service.appendBatch(requests).join();
 
-        // ORDERS entries should have localId 0, 1
+        // ORDERS entries should have streamVersion 0, 1
         AppendResult o0 = results.get(0);
         AppendResult o1 = results.get(2);
-        assertThat(o0.localId()).isEqualTo(0L);
-        assertThat(o1.localId()).isEqualTo(1L);
+        assertThat(o0.streamVersion()).isEqualTo(0L);
+        assertThat(o1.streamVersion()).isEqualTo(1L);
 
-        // INVENTORY entry should have localId 0
-        assertThat(results.get(1).localId()).isEqualTo(0L);
+        // INVENTORY entry should have streamVersion 0
+        assertThat(results.get(1).streamVersion()).isEqualTo(0L);
     }
 
     @Test
@@ -167,7 +167,7 @@ class AppendBatchTest {
 
         assertThat(batch).hasSize(1);
         assertThat(batch.get(0).seqnum()).isEqualTo(single.seqnum()); // both start from 0
-        assertThat(batch.get(0).localId()).isEqualTo(single.localId());
+        assertThat(batch.get(0).streamVersion()).isEqualTo(single.streamVersion());
     }
 
     // -------------------------------------------------------------------------

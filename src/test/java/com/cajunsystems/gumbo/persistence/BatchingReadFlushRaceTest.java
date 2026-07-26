@@ -48,7 +48,7 @@ class BatchingReadFlushRaceTest {
         @Override public void appendBatch(List<LogEntry> es) throws IOException { inner.appendBatch(es); }
         @Override public void trim(long s) throws IOException { inner.trim(s); }
         @Override public long getLatestSeqnum() { return inner.getLatestSeqnum(); }
-        @Override public long getLocalIdCountForTag(LogTag t) { return inner.getLocalIdCountForTag(t); }
+        @Override public long getNextStreamVersion(LogTag t) { return inner.getNextStreamVersion(t); }
 
         @Override public List<LogEntry> readAll() throws IOException { fire(); return inner.readAll(); }
         @Override public List<LogEntry> readFrom(long s) throws IOException { fire(); return inner.readFrom(s); }

@@ -49,12 +49,12 @@ class QuickStartExample {
             AppendResult r1 = log.append(AppendRequest.to(orders, "order-placed".getBytes())).join();
             AppendResult r2 = log.append(AppendRequest.to(orders, "order-confirmed".getBytes())).join();
 
-            System.out.printf("r1: seqnum=%d localId=%d%n", r1.seqnum(), r1.localId());
-            System.out.printf("r2: seqnum=%d localId=%d%n", r2.seqnum(), r2.localId());
+            System.out.printf("r1: seqnum=%d streamVersion=%d%n", r1.seqnum(), r1.streamVersion());
+            System.out.printf("r2: seqnum=%d streamVersion=%d%n", r2.seqnum(), r2.streamVersion());
 
-            // localIds are per-tag counters (0, 1, 2, …)
-            assertThat(r1.localId()).isEqualTo(0);
-            assertThat(r2.localId()).isEqualTo(1);
+            // versions are per-tag counters (0, 1, 2, …)
+            assertThat(r1.streamVersion()).isEqualTo(0);
+            assertThat(r2.streamVersion()).isEqualTo(1);
 
             List<LogEntry> entries = log.readAll(orders).join();
             assertThat(entries).hasSize(2);

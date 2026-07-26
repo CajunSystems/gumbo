@@ -140,13 +140,13 @@ class InMemoryPersistenceAdapterTest {
     }
 
     @Test
-    void localIdCountReflectsAppendedEntries() throws IOException {
+    void nextStreamVersionReflectsAppendedEntries() throws IOException {
         adapter.append(entry(0, 0, TAG_A, "e0"));
         adapter.append(entry(1, 1, TAG_A, "e1"));
         adapter.append(entry(2, 0, TAG_B, "f0"));
 
-        assertThat(adapter.getLocalIdCountForTag(TAG_A)).isEqualTo(2L);
-        assertThat(adapter.getLocalIdCountForTag(TAG_B)).isEqualTo(1L);
+        assertThat(adapter.getNextStreamVersion(TAG_A)).isEqualTo(2L);
+        assertThat(adapter.getNextStreamVersion(TAG_B)).isEqualTo(1L);
     }
 
     @Test
@@ -208,7 +208,7 @@ class InMemoryPersistenceAdapterTest {
     // Helpers
     // -------------------------------------------------------------------------
 
-    private static LogEntry entry(long seqnum, long localId, LogTag tag, String data) {
-        return new LogEntry(seqnum, localId, Set.of(tag), data.getBytes(), Instant.now());
+    private static LogEntry entry(long seqnum, long streamVersion, LogTag tag, String data) {
+        return new LogEntry(seqnum, streamVersion, Set.of(tag), data.getBytes(), Instant.now());
     }
 }
