@@ -164,7 +164,7 @@ class VersionKeyedReadTest {
     /**
      * The boundary of what a version means today, pinned rather than papered over.
      *
-     * <p>An entry carries <em>one</em> {@code localId}, drawn from its primary tag's
+     * <p>An entry carries <em>one</em> {@code streamVersion}, drawn from its primary tag's
      * counter, so an atomic multi-tag append leaves one of the two streams mis-numbered:
      * the fan-out tag's first entry is numbered 3 rather than 0 if the history tag is
      * primary, and the history tag's stream reads {@code 0,1,2,0} — a repeated version —
@@ -240,7 +240,7 @@ class VersionKeyedReadTest {
     }
 
     private static List<Long> versionsOf(List<LogEntry> entries) {
-        return entries.stream().map(LogEntry::localId).toList();
+        return entries.stream().map(LogEntry::streamVersion).toList();
     }
 
     private static List<String> payloadsOf(List<LogEntry> entries) {

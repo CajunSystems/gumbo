@@ -7,6 +7,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — breaking
+
+**`localId` renamed to `streamVersion`**
+- `LogEntry.localId()` → `LogEntry.streamVersion()`; `AppendResult.localId()` →
+  `AppendResult.streamVersion()`. Both old accessors remain as
+  `@Deprecated(forRemoval = true)` delegates, so 0.2.0 code compiles with a warning
+  rather than an error
+- `PersistenceAdapter.getLocalIdCountForTag(LogTag)` → `getNextStreamVersion(LogTag)`,
+  deliberately with **no** default: an adapter that silently inherited one would hand out
+  versions colliding with those already on disk, so third-party adapters get a compile
+  error instead
+- The name was a fossil of Boki's per-*engine* `localid` — a write-path id superseded once
+  the sequencer assigns a `seqnum`. What this field holds is a per-*tag*, externally
+  visible, permanent position in a stream: a different quantity that happened to share a
+  name. `streamVersion` also names what conditional append will condition on and what
+  version-keyed reads are keyed by
+- **No log migration.** The on-disk and FDB layouts are byte-identical — same field, same
+  offset, same width — and the assigned values are unchanged, so every existing log reads
+  back as before and every persisted cursor stays valid
+
 ### Added
 
 **Version-keyed reads** — read a tag's stream by its own position instead of the global seqnum
@@ -24,13 +44,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- `BatchingPersistenceAdapter.getLocalIdCountForTag` ignored the pending buffer, on the
+- `BatchingPersistenceAdapter.getNextStreamVersion` (then `getLocalIdCountForTag`) ignored the pending buffer, on the
   assumption that its only caller asked once per brand-new tag. It now counts pending entries,
   so a tag's version tip is correct between flushes
 
 ### Known limitation
 
-- An entry carries one `localId`, drawn from its primary tag, so a tag carried only as a
+- An entry carries one `streamVersion`, drawn from its primary tag, so a tag carried only as a
   *secondary* tag on an atomic multi-tag append inherits the primary's numbering instead of
   counting its own — and which tag is primary is `tags.iterator().next()` over a
   `Set.copyOf`, whose order Java salts per JVM run. Version-keyed reads are therefore defined

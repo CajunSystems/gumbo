@@ -57,7 +57,7 @@ public interface PersistenceAdapter extends AutoCloseable {
 
     /**
      * Persists a single entry.  The entry already has its {@code seqnum} and
-     * {@code localId} assigned by the caller.
+     * {@code streamVersion} assigned by the caller.
      *
      * @param entry the entry to store
      * @throws IOException if the write fails
@@ -112,7 +112,7 @@ public interface PersistenceAdapter extends AutoCloseable {
     List<LogEntry> readByTag(LogTag tag, long fromSeqnum) throws IOException;
 
     /**
-     * Returns entries visible to {@code tag} with {@code localId >= fromVersion}, in
+     * Returns entries visible to {@code tag} with {@code streamVersion >= fromVersion}, in
      * seqnum order — the tag's <em>own</em> stream position, not the global seqnum.
      *
      * <p>This is the read a per-stream cursor needs. {@link #readByTag} takes a global
@@ -127,7 +127,7 @@ public interface PersistenceAdapter extends AutoCloseable {
      * this returns what remains rather than failing.
      *
      * <h2>Multi-tag entries</h2>
-     * <p>An entry carries <em>one</em> {@code localId}, assigned from its primary tag's
+     * <p>An entry carries <em>one</em> {@code streamVersion}, assigned from its primary tag's
      * counter, so a version identifies a position in the primary tag's stream. For a tag
      * that an entry carries only as a <em>secondary</em> tag, that number belongs to a
      * different stream: it does not count that tag's entries and it need not start at
@@ -146,23 +146,23 @@ public interface PersistenceAdapter extends AutoCloseable {
      * adapters shipped with Gumbo do.
      *
      * @param tag         the stream to read
-     * @param fromVersion inclusive lower bound on {@code localId} within {@code tag}
+     * @param fromVersion inclusive lower bound on {@code streamVersion} within {@code tag}
      * @throws IOException if a read error occurs
      */
     default List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
         if (fromVersion <= 0) return readByTag(tag, 0L);
         return readByTag(tag, 0L).stream()
-                .filter(e -> e.localId() >= fromVersion)
+                .filter(e -> e.streamVersion() >= fromVersion)
                 .toList();
     }
 
     /**
-     * Returns entries visible to {@code tag} with {@code localId > afterVersion} — the
+     * Returns entries visible to {@code tag} with {@code streamVersion > afterVersion} — the
      * exclusive form of {@link #readFromVersion}, for a consumer holding the version of
      * the last entry it processed.
      *
      * @param tag          the stream to read
-     * @param afterVersion exclusive lower bound on {@code localId} within {@code tag};
+     * @param afterVersion exclusive lower bound on {@code streamVersion} within {@code tag};
      *                     pass {@code -1} for the whole stream
      * @throws IOException if a read error occurs
      */
@@ -193,11 +193,15 @@ public interface PersistenceAdapter extends AutoCloseable {
     long getLatestSeqnum();
 
     /**
-     * Returns the number of entries visible to {@code tag} that have been
-     * persisted (i.e. the next {@code localId} that would be assigned for
-     * that tag).
+     * Returns the next {@code streamVersion} that would be assigned for {@code tag} —
+     * one past the highest version persisted for it, and {@code 0} for an unused tag.
+     *
+     * <p>Deliberately has no default: an adapter that silently inherited one would hand
+     * out versions that collide with those already on disk. Third-party adapters
+     * implementing the old {@code getNextStreamVersion} will fail to compile, which is
+     * the intended outcome — the rename is not cosmetic at this seam.
      */
-    long getLocalIdCountForTag(LogTag tag);
+    long getNextStreamVersion(LogTag tag);
 
     /**
      * Returns the highest {@code seqnum} of any entry visible to {@code tag},

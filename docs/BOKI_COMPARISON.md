@@ -28,7 +28,7 @@ a single physical log therefore serves many logical streams simultaneously.
 | Boki concept | Gumbo |
 |---|---|
 | Global `seqnum` (64-bit monotonic) | `LogEntry.seqnum()` — assigned by `Sequencer` |
-| Per-engine `localid` | `LogEntry.localId()` — per-tag counter assigned at append time |
+| Per-engine `localid` | `LogEntry.streamVersion()` — per-tag counter assigned at append time. The name diverged deliberately: Boki's `localid` is a write-path id owned by an engine and superseded once the sequencer assigns a `seqnum`, whereas this is a permanent, externally visible position within a tag's stream. |
 | `user_tags: repeated uint64` | `LogTag(namespace, key)` — typed tag objects instead of raw integers |
 | `user_logspace` (application namespace) | `LogTag.namespace` |
 | Per-object tag (e.g. `objectLogTag(hash)`) | `LogTag.of("orders", "order-42")` |

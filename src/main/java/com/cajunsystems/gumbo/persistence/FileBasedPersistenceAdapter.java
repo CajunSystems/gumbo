@@ -41,7 +41,7 @@ import java.util.zip.CRC32;
  * [MAGIC    : 4 bytes  = 0xC0FFEE42  ]
  * [seqnum   : 8 bytes, big-endian    ]
  * [timestamp: 8 bytes, millis epoch  ]
- * [localId  : 8 bytes, big-endian    ]
+ * [version  : 8 bytes, big-endian    ]
  * [numTags  : 4 bytes, big-endian    ]
  *   per tag:
  *     [nsLen  : 2 bytes unsigned     ]
@@ -67,7 +67,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     private static final Logger log = LoggerFactory.getLogger(FileBasedPersistenceAdapter.class);
 
     private static final int MAGIC = 0xC0FFEE42;
-    /** Fixed-size overhead per entry: magic(4)+seqnum(8)+ts(8)+localId(8)+numTags(4)+dataLen(4)+crc(4) = 40 bytes */
+    /** Fixed-size overhead per entry: magic(4)+seqnum(8)+ts(8)+version(8)+numTags(4)+dataLen(4)+crc(4) = 40 bytes */
     private static final int FIXED_OVERHEAD = 40;
 
     private final Path dataDir;
@@ -86,12 +86,12 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     /** In-memory global index: seqnum → file offset in log.dat */
     private final ConcurrentSkipListMap<Long, Long> globalIndex = new ConcurrentSkipListMap<>();
 
-    /** In-memory per-tag index: tag → (seqnum → localId) */
+    /** In-memory per-tag index: tag → (seqnum → streamVersion) */
     private final ConcurrentHashMap<LogTag, ConcurrentSkipListMap<Long, Long>> tagSeqnums =
             new ConcurrentHashMap<>();
 
     /** Per-tag local-id counter. */
-    private final ConcurrentHashMap<LogTag, AtomicLong> tagLocalIdCount =
+    private final ConcurrentHashMap<LogTag, AtomicLong> tagVersionCount =
             new ConcurrentHashMap<>();
 
     private volatile long trimSeqnum = 0L;
@@ -216,10 +216,10 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         for (LogTag tag : entry.tags()) {
             tagSeqnums
                     .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
-                    .put(entry.seqnum(), entry.localId());
-            tagLocalIdCount
+                    .put(entry.seqnum(), entry.streamVersion());
+            tagVersionCount
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
-                    .updateAndGet(c -> Math.max(c, entry.localId() + 1));
+                    .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
         }
     }
 
@@ -252,7 +252,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
         long effectiveFrom = Math.max(fromSeqnum, trimSeqnum);
         NavigableMap<Long, Long> range = idx.tailMap(effectiveFrom, true);
-        // range: seqnum → localId; we need offsets from the global index
+        // range: seqnum → streamVersion; we need offsets from the global index
         List<Long> offsets = new ArrayList<>(range.size());
         for (long seqnum : range.keySet()) {
             Long offset = globalIndex.get(seqnum);
@@ -266,8 +266,8 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
      * matching entries from {@code log.dat} — so the cost on storage is proportional to
      * the result, not to the tag's history.
      *
-     * <p>The index is keyed by seqnum with the localId as its value, and within a tag the
-     * two ascend together (localIds are handed out in append order), so walking it in
+     * <p>The index is keyed by seqnum with the version as its value, and within a tag the
+     * two ascend together (versions are handed out in append order), so walking it in
      * seqnum order yields versions in ascending order too.
      */
     @Override
@@ -276,7 +276,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         if (idx == null || idx.isEmpty()) return Collections.emptyList();
 
         List<Long> offsets = new ArrayList<>();
-        for (Map.Entry<Long, Long> e : idx.entrySet()) {  // seqnum → localId, ascending seqnum
+        for (Map.Entry<Long, Long> e : idx.entrySet()) {  // seqnum → streamVersion, ascending seqnum
             if (e.getValue() < fromVersion) continue;
             if (e.getKey() < trimSeqnum) continue;
             Long offset = globalIndex.get(e.getKey());
@@ -325,8 +325,8 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     }
 
     @Override
-    public long getLocalIdCountForTag(LogTag tag) {
-        AtomicLong c = tagLocalIdCount.get(tag);
+    public long getNextStreamVersion(LogTag tag) {
+        AtomicLong c = tagVersionCount.get(tag);
         return c == null ? 0L : c.get();
     }
 
@@ -435,7 +435,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         buf.putInt(MAGIC);
         buf.putLong(entry.seqnum());
         buf.putLong(entry.timestamp().toEpochMilli());
-        buf.putLong(entry.localId());
+        buf.putLong(entry.streamVersion());
         buf.putInt(entry.tags().size());
         for (int i = 0; i < nsBytes.size(); i++) {
             buf.putShort((short) nsBytes.get(i).length);
@@ -456,7 +456,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     /**
      * Fixed-size prefix before the variable-length tag section:
-     * magic(4) + seqnum(8) + timestamp(8) + localId(8) + numTags(4) = 32 bytes.
+     * magic(4) + seqnum(8) + timestamp(8) + version(8) + numTags(4) = 32 bytes.
      * Note: FIXED_OVERHEAD (40) = PREFIX_SIZE(32) + dataLen(4) + checksum(4),
      * used for total entry size calculation but NOT as the cursor start.
      */
@@ -471,10 +471,10 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         int magic = header.getInt();
         if (magic != MAGIC) throw new IOException("Bad magic at offset " + offset);
 
-        long seqnum   = header.getLong();
-        long tsMillis = header.getLong();
-        long localId  = header.getLong();
-        int numTags   = header.getInt();
+        long seqnum        = header.getLong();
+        long tsMillis      = header.getLong();
+        long streamVersion = header.getLong();
+        int  numTags       = header.getInt();
 
         // Variable-length tag section starts immediately after the 32-byte prefix
         long cursor = offset + PREFIX_SIZE;
@@ -514,7 +514,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         // checksum (skip verification here for read performance; it's done on open/recovery)
         // cursor += 4;
 
-        return new LogEntry(seqnum, localId, tags, data, Instant.ofEpochMilli(tsMillis));
+        return new LogEntry(seqnum, streamVersion, tags, data, Instant.ofEpochMilli(tsMillis));
     }
 
     // -------------------------------------------------------------------------
@@ -594,7 +594,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     private void rebuildTagIndices() throws IOException {
         tagSeqnums.clear();
-        tagLocalIdCount.clear();
+        tagVersionCount.clear();
         if (globalIndex.isEmpty() || !Files.exists(logFile)) return;
 
         try (FileChannel ch = FileChannel.open(logFile, StandardOpenOption.READ)) {
@@ -605,10 +605,10 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
                     for (LogTag tag : entry.tags()) {
                         tagSeqnums
                                 .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
-                                .put(entry.seqnum(), entry.localId());
-                        tagLocalIdCount
+                                .put(entry.seqnum(), entry.streamVersion());
+                        tagVersionCount
                                 .computeIfAbsent(tag, k -> new AtomicLong(0))
-                                .updateAndGet(c -> Math.max(c, entry.localId() + 1));
+                                .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
                     }
                 } catch (IOException ex) {
                     log.warn("Could not decode entry at offset {}; skipping: {}", e.getValue(), ex.getMessage());

@@ -62,7 +62,7 @@ public class SharedLogService implements SharedLog {
     private final ReentrantLock writeLock = new ReentrantLock();
 
     /** Per-tag local-id counters, initialised from persisted state on open. */
-    private final ConcurrentHashMap<LogTag, AtomicLong> localIdCounters = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<LogTag, AtomicLong> versionCounters = new ConcurrentHashMap<>();
 
     /** Active subscriptions keyed by tag. */
     private final ConcurrentHashMap<LogTag, CopyOnWriteArrayList<SubscriptionImpl>> subscriptions =
@@ -136,10 +136,10 @@ public class SharedLogService implements SharedLog {
                 AppendRequest req      = requests.get(i);
                 long          seqnum   = seqnums[i];
                 LogTag        primary  = req.tags().iterator().next();
-                long          localId  = localIdFor(primary);
-                LogEntry      entry    = new LogEntry(seqnum, localId, req.tags(), req.dataUnsafe(), now);
+                long          version  = nextVersionFor(primary);
+                LogEntry      entry    = new LogEntry(seqnum, version, req.tags(), req.dataUnsafe(), now);
                 entries.add(entry);
-                results.add(new AppendResult(seqnum, localId, primary, now));
+                results.add(new AppendResult(seqnum, version, primary, now));
             }
 
             // Single persistence call — 1 FDB transaction for entire batch when using FDB adapter
@@ -163,16 +163,16 @@ public class SharedLogService implements SharedLog {
             long seqnum    = sequencer.next();
             Set<LogTag> tags = request.tags();
             LogTag primaryTag = tags.iterator().next();
-            long localId   = localIdFor(primaryTag);
+            long version   = nextVersionFor(primaryTag);
             Instant now    = Instant.now();
 
-            LogEntry entry = new LogEntry(seqnum, localId, tags, request.dataUnsafe(), now);
+            LogEntry entry = new LogEntry(seqnum, version, tags, request.dataUnsafe(), now);
             adapter.append(entry);
 
             // Deliver to subscribers (each on its own virtual thread)
             notifySubscribers(entry);
 
-            return new AppendResult(seqnum, localId, primaryTag, now);
+            return new AppendResult(seqnum, version, primaryTag, now);
         } catch (IOException e) {
             throw new LogWriteException("Failed to persist log entry", e);
         } finally {
@@ -319,9 +319,9 @@ public class SharedLogService implements SharedLog {
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    private long localIdFor(LogTag primaryTag) {
-        return localIdCounters
-                .computeIfAbsent(primaryTag, k -> new AtomicLong(adapter.getLocalIdCountForTag(k)))
+    private long nextVersionFor(LogTag primaryTag) {
+        return versionCounters
+                .computeIfAbsent(primaryTag, k -> new AtomicLong(adapter.getNextStreamVersion(k)))
                 .getAndIncrement();
     }
 

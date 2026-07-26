@@ -54,7 +54,7 @@ public interface LogView {
      *
      * <p>Note that {@code afterSeqnum} is a <em>global</em> seqnum. If the position you
      * are resuming from came from this view's own stream — a checkpointed
-     * {@code localId}, the version of the last entry you handled — use
+     * {@code streamVersion}, the version of the last entry you handled — use
      * {@link #readAfterVersion} instead. The two agree only while the log holds a single
      * tag; with more than one tag this method silently returns entries you have already
      * seen, because the other tags' entries push this tag's seqnums past the cursor.
@@ -65,7 +65,7 @@ public interface LogView {
 
     /**
      * Reads entries from {@code fromVersion} (inclusive) in this tag's <em>own</em>
-     * numbering — the {@code localId} carried by every {@link LogEntry} and returned by
+     * numbering — the {@code streamVersion} carried by every {@link LogEntry} and returned by
      * every append — rather than the global seqnum.
      *
      * <p>This is the read for a per-stream cursor. A view's entries are numbered
@@ -77,7 +77,7 @@ public interface LogView {
      * long cursor = Long.parseLong(new String(view.getValue("cursor").join()));
      * for (LogEntry e : view.readAfterVersion(cursor).join()) {
      *     state = apply(state, e);
-     *     cursor = e.localId();
+     *     cursor = e.streamVersion();
      * }
      * view.setValue("cursor", Long.toString(cursor).getBytes()).join();
      * }</pre>
@@ -98,7 +98,7 @@ public interface LogView {
 
     /**
      * Returns the latest version in this tag's own numbering (the highest
-     * {@code localId} written to it), or {@code -1} if the tag is empty.
+     * {@code streamVersion} written to it), or {@code -1} if the tag is empty.
      *
      * <p>This is the counterpart to {@link #getLatestSeqnum()} for a per-stream cursor,
      * and the value to pass to {@link #readAfterVersion}.

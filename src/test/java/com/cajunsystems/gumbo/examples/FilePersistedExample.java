@@ -60,8 +60,8 @@ class FilePersistedExample {
 
             System.out.println("Second run: recovered " + recovered.size() + " entries:");
             for (LogEntry e : recovered) {
-                System.out.printf("  [seqnum=%d, localId=%d] %s%n",
-                        e.seqnum(), e.localId(), new String(e.data()));
+                System.out.printf("  [seqnum=%d, streamVersion=%d] %s%n",
+                        e.seqnum(), e.streamVersion(), new String(e.data()));
             }
 
             // The sequencer resumes after the last persisted seqnum
@@ -97,10 +97,10 @@ class FilePersistedExample {
             assertThat(orderEntries).hasSize(2);
             assertThat(stockEntries).hasSize(1);
 
-            // localIds are tag-local: orders has localIds 0 and 1; inventory has 0
-            assertThat(orderEntries.get(0).localId()).isEqualTo(0);
-            assertThat(orderEntries.get(1).localId()).isEqualTo(1);
-            assertThat(stockEntries.get(0).localId()).isEqualTo(0);
+            // versions are tag-local: orders has versions 0 and 1; inventory has 0
+            assertThat(orderEntries.get(0).streamVersion()).isEqualTo(0);
+            assertThat(orderEntries.get(1).streamVersion()).isEqualTo(1);
+            assertThat(stockEntries.get(0).streamVersion()).isEqualTo(0);
 
             System.out.printf("Recovered: %d order entries, %d inventory entries%n",
                     orderEntries.size(), stockEntries.size());

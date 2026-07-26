@@ -216,11 +216,11 @@ class FileBasedPersistenceAdapterTest {
 
     // -------------------------------------------------------------------------
 
-    private static LogEntry entry(long seqnum, long localId, LogTag tag, String data) {
-        return entry(seqnum, localId, tag, data.getBytes());
+    private static LogEntry entry(long seqnum, long streamVersion, LogTag tag, String data) {
+        return entry(seqnum, streamVersion, tag, data.getBytes());
     }
 
-    private static LogEntry entry(long seqnum, long localId, LogTag tag, byte[] data) {
-        return new LogEntry(seqnum, localId, Set.of(tag), data, Instant.now());
+    private static LogEntry entry(long seqnum, long streamVersion, LogTag tag, byte[] data) {
+        return new LogEntry(seqnum, streamVersion, Set.of(tag), data, Instant.now());
     }
 }
