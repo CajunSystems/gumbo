@@ -5,94 +5,125 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.3.0] — 2026-07-26
 
-### Added
-
-**Storage-owned stream versions + conditional append** (D1 / A1)
-- `SharedLog.append(AppendRequest, long expectedVersion)` — appends only if the primary tag
-  is still at that version, else fails with the new `VersionConflictException`
-- `PersistenceAdapter.append(PendingAppend, long expectedVersion)` returns the persisted
-  `LogEntry`; the **adapter** assigns `streamVersion`, not the caller.
-  `PersistenceAdapter.ANY_VERSION` appends unconditionally
-- `PersistenceAdapter.appendBatchAssigningVersions(List<PendingAppend>)` — batch form;
-  versions are assigned in list order so repeated appends to one tag stay consecutive
-- New `PendingAppend` record: an append whose version has not been assigned yet, which
-  `LogEntry` cannot express since it requires one at construction
-- `SharedLogService` no longer keeps per-tag version counters. They were seeded once from
-  storage and then diverged silently from every other writer's copy — two processes on one
-  log both handing out `0, 1, 2` with nothing to reconcile them (D1)
-- The SPI default assigns from `getNextStreamVersion` and writes, which is what callers did
-  before and no weaker, but **rejects** a conditional append with
-  `UnsupportedOperationException` rather than performing a non-atomic check. An adapter that
-  appeared to fence while doing nothing of the sort would surface as corruption, not an error
-- On FoundationDB the read, compare and write happen in **one transaction**, so the fence is
-  enforced by the store and holds across processes. The file and in-memory adapters assign
-  under their own lock, which is atomic within the single-writer configuration they support
-  (enforced by the directory lock added earlier)
+Correctness work on the log layer, prompted by a
+[requirements report from Catalyst](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md).
+Several defects here were silent — data lost or duplicated with no error — so the notes say
+what was wrong as well as what changed.
 
 ### Changed — breaking
 
 **`localId` renamed to `streamVersion`**
 - `LogEntry.localId()` → `LogEntry.streamVersion()`; `AppendResult.localId()` →
   `AppendResult.streamVersion()`. Both old accessors remain as
-  `@Deprecated(forRemoval = true)` delegates, so 0.2.0 code compiles with a warning
-  rather than an error
+  `@Deprecated(forRemoval = true)` delegates, so 0.2.0 code compiles with a warning rather
+  than an error
 - `PersistenceAdapter.getLocalIdCountForTag(LogTag)` → `getNextStreamVersion(LogTag)`,
   deliberately with **no** default: an adapter that silently inherited one would hand out
   versions colliding with those already on disk, so third-party adapters get a compile
   error instead
 - The name was a fossil of Boki's per-*engine* `localid` — a write-path id superseded once
-  the sequencer assigns a `seqnum`. What this field holds is a per-*tag*, externally
-  visible, permanent position in a stream: a different quantity that happened to share a
-  name. `streamVersion` also names what conditional append will condition on and what
-  version-keyed reads are keyed by
+  the sequencer assigns a `seqnum`. What the field holds is a per-*tag*, externally visible,
+  permanent position in a stream
 - **No log migration.** The on-disk and FDB layouts are byte-identical — same field, same
-  offset, same width — and the assigned values are unchanged, so every existing log reads
-  back as before and every persisted cursor stays valid
+  offset, same width — so every existing log reads back as before and every persisted
+  cursor stays valid
+
+**Subscription delivery is ordered and serialised**
+- Each subscription now owns one virtual thread delivering its entries in seqnum order.
+  Previously a thread was spawned per entry, leaving order to the scheduler
+- A listener is never called concurrently with itself, so it needs no synchronisation of
+  its own. The trade is that a slow listener delays its own subscription rather than
+  running deliveries in parallel — the only way ordered delivery is achievable
+- `Subscription.close()` now **waits** for an in-flight listener call to return, so once it
+  returns the listener is not running and will not run again. The wait is bounded and not
+  shortened by an interrupt on the calling thread
+
+**Conditional append names its tag**
+- `SharedLog.append(request, expectedVersion)` requires a single-tag request;
+  `append(request, fencedTag, expectedVersion)` is the multi-tag form. The primary tag of a
+  multi-tag request is `tags.iterator().next()` over a `Set`, whose iteration order Java
+  salts per JVM run, so an implicit fence would apply to a different stream between runs
 
 ### Added
 
-**Single-writer enforcement for `FileBasedPersistenceAdapter`**
-- `open()` now takes an exclusive `FileLock` on `{dataDir}/lock` and throws the new
-  `LogAlreadyOpenException` when another adapter already holds the directory — whether it
-  is in this JVM or another process
-- Previously a second writer was accepted silently and corrupted the log two ways: both
-  processes assigned the same `localId` values for a tag (process-local counters, never
-  reconciled), and the last one to close overwrote the other's `index.dat`, leaving
-  entries on disk that no reader could see
-- The lock is released on `close()` and by process exit, so restart-after-crash is
-  unaffected and a leftover `lock` file never needs removing by hand
+**Storage-owned stream versions + conditional append**
+- `SharedLog.append(AppendRequest, long expectedVersion)` — appends only if the tag is
+  still at that version, else fails with the new `VersionConflictException`
+- `PersistenceAdapter.append(PendingAppend, long expectedVersion)` returns the persisted
+  `LogEntry`; the **adapter** assigns `streamVersion`, not the caller.
+  `PersistenceAdapter.ANY_VERSION` appends unconditionally
+- `PersistenceAdapter.appendBatchAssigningVersions(List<PendingAppend>)` — batch form
+- New `PendingAppend` record: an append whose version has not been assigned yet, which
+  `LogEntry` cannot express since it requires one at construction
+- `SharedLogService` no longer keeps per-tag version counters. Seeded once from storage,
+  they then diverged silently from every other writer's copy — two processes on one log
+  both handing out `0, 1, 2` with nothing to reconcile them
+- On FoundationDB the read, compare and write happen in **one transaction**, so the fence
+  holds across processes. The file and in-memory adapters assign under their own lock,
+  atomic within the single-writer configuration they enforce
 
 **Version-keyed reads** — read a tag's stream by its own position instead of the global seqnum
-- `SharedLog.readFromVersion(LogTag, long)` / `readAfterVersion(LogTag, long)`
-- `LogView.readFromVersion(long)` / `readAfterVersion(long)` / `getLatestVersion()`
-- `TypedLogView.readFromVersion(long)` / `readAfterVersion(long)` / `getLatestVersion()`
-- `PersistenceAdapter.readFromVersion(LogTag, long)` / `readAfterVersion(LogTag, long)`, with a
-  correct filtering default for third-party adapters and an efficient override in all four
-  shipped adapters
+- `SharedLog.readFromVersion` / `readAfterVersion`; the same pair plus `getLatestVersion()`
+  on `LogView` and `TypedLogView`; `readFromVersion` / `readAfterVersion` on
+  `PersistenceAdapter`, with a correct filtering default and an efficient override in all
+  four shipped adapters
 - Every existing read is keyed on the global `seqnum`, which coincides with a tag's own
   numbering only while the log holds a single tag. A consumer resuming from a cursor into
-  one stream — an executor from a checkpoint, a workflow replaying its history — previously
-  had to pass its version into a seqnum-keyed API, silently re-reading entries it had already
-  processed as soon as a second tag shared the log
+  one stream previously had to pass its version into a seqnum-keyed API, silently
+  re-reading entries it had already processed as soon as a second tag shared the log
+
+**Single-writer enforcement for `FileBasedPersistenceAdapter`**
+- `open()` takes an exclusive `FileLock` on `{dataDir}/lock` and throws the new
+  `LogAlreadyOpenException` when another adapter already holds the directory
+- Previously a second writer was accepted silently and corrupted the log two ways: both
+  processes assigned the same versions for a tag, and the last to close overwrote the
+  other's `index.dat`, leaving entries on disk that no reader could see
+
+**Documented failure semantics** — `docs/FAILURE_SEMANTICS.md`
+- What every mutating operation leaves behind when it fails: `NOTHING`, `PREFIX`, or
+  `UNKNOWN`. `appendBatch` is `PREFIX` on both durable adapters, so callers must not assume
+  all-or-nothing
+- `getLatestSeqnum()` is defined as a **durability** boundary, not a visibility one
+
+**Mutation testing** — PIT over `persistence` and `service`, gated in CI at the measured
+score so it cannot drift down
 
 ### Fixed
 
-- `BatchingPersistenceAdapter.getNextStreamVersion` (then `getLocalIdCountForTag`) ignored the pending buffer, on the
-  assumption that its only caller asked once per brand-new tag. It now counts pending entries,
-  so a tag's version tip is correct between flushes
+- **Entries appended during a subscriber's backlog delivery were silently dropped.** The
+  backlog read had already happened and the live path skipped not-yet-ready subscribers, so
+  the entry arrived by neither route — no error, no retry, nothing logged
+- **A failed flush in `BatchingPersistenceAdapter` discarded its entries.** The pending
+  buffer was cleared before the delegate write returned. It now drops only what the delegate
+  confirms it holds, so a retry neither loses nor duplicates
+- **The file adapter published entries before their fsync**, so `getLatestSeqnum()` reported
+  writes that were not durable and a failed sync was indistinguishable from a successful one
+- **FoundationDB rewound a secondary tag's version count** on a multi-tag append, which
+  under the new conditional append would let a stale writer pass the fence. Counts are now
+  raised, never lowered
+- **A read racing a flush could return an entry twice** in `BatchingPersistenceAdapter`;
+  all four read paths now deduplicate by seqnum
+- **`readAfterVersion(Long.MAX_VALUE)` returned the entire stream** instead of nothing, via
+  integer overflow in the exclusive-to-inclusive conversion
+- **A failed `open()` leaked file descriptors** — the unwind released the directory lock but
+  not the channels already opened
+- A listener throwing an `Error` no longer stops delivery for every later entry
+- `BatchingPersistenceAdapter` forwards `trim` to its delegate; a truncated `index.dat` is
+  now rejected and rebuilt rather than partially trusted
 
 ### Known limitation
 
-- An entry carries one `streamVersion`, drawn from its primary tag, so a tag carried only as a
-  *secondary* tag on an atomic multi-tag append inherits the primary's numbering instead of
-  counting its own — and which tag is primary is `tags.iterator().next()` over a
-  `Set.copyOf`, whose order Java salts per JVM run. Version-keyed reads are therefore defined
-  for a tag's own primary stream; use the seqnum-keyed reads for a shared fan-out tag.
-  Resolving it needs a version per tag per entry (storage-owned per-tag versions), and
+- An entry carries one `streamVersion`, drawn from its primary tag, so a tag carried only as
+  a *secondary* tag on a multi-tag append inherits the primary's numbering instead of
+  counting its own. Version-keyed reads are defined for a tag's own primary stream; use the
+  seqnum-keyed reads for a shared fan-out tag. Resolving it needs a version per tag per
+  entry, which changes the record layout and forces a log migration.
   `VersionKeyedReadTest.anAtomicMultiTagAppendLeavesOneStreamMisNumbered` pins the current
   behaviour until then
+- `BatchingPersistenceAdapter`'s pending buffer is unbounded, and `flushQuietly` swallows
+  the error, so a persistently failing delegate grows memory without telling anyone
 
 ---
 

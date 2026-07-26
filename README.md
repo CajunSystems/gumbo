@@ -106,7 +106,7 @@ Then add the dependency:
 <dependency>
     <groupId>com.github.CajunSystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
 </dependency>
 ```
 
@@ -118,7 +118,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.CajunSystems:gumbo:0.2.0'
+    implementation 'com.github.CajunSystems:gumbo:0.3.0'
 }
 ```
 
@@ -1083,7 +1083,7 @@ Requires Java 21 and Maven 3.9+.
 
 ```bash
 mvn verify          # compile + test
-mvn package         # produce gumbo-0.2.0.jar
+mvn package         # produce gumbo-0.3.0.jar
 ```
 
 GitHub Actions runs `mvn verify` on every push using Java 21 (Temurin).

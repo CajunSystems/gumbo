@@ -6,7 +6,7 @@
 
     <groupId>com.cajunsystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
     <packaging>jar</packaging>
 
     <name>Shared Log</name>
@@ -128,7 +128,7 @@
                         Ratchet, not a target: set to the measured score, so a decline
                         fails the build rather than being absorbed by slack.
 
-                        Baseline at introduction: 364/486 killed, test strength 81%.
+                        Measured on main at 0.3.0: 421/553 killed, test strength 82%.
                         PIT rounds, so the real headroom is about two mutants — 363 still
                         reports 75 and passes, 362 reports 74 and fails. Observed
                         run-to-run variance is one mutant (363-364), from timing-sensitive
@@ -136,7 +136,7 @@
                         not fewer, since a timed-out mutant counts as killed. Raise this
                         when the score rises.
                     -->
-                    <mutationThreshold>75</mutationThreshold>
+                    <mutationThreshold>76</mutationThreshold>
                 </configuration>
             </plugin>
             <plugin>
