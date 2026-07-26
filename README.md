@@ -36,7 +36,7 @@ try (SharedLogService log = SharedLogService.open(config)) {
 
     // 2. Append
     AppendResult r = log.append(AppendRequest.to(orders, "order-placed".getBytes())).join();
-    System.out.println("seqnum=" + r.seqnum() + " localId=" + r.localId());
+    System.out.println("seqnum=" + r.seqnum() + " streamVersion=" + r.streamVersion());
 
     // 3. Read
     List<LogEntry> entries = log.readAll(orders).join();
@@ -169,14 +169,17 @@ A `LogView` is a lightweight, tag-scoped window over the shared log. It supports
 reads, appends (which write back to the underlying log with the view's tag included),
 and push subscriptions.
 
-### Sequence numbers and local IDs
+### Sequence numbers and stream versions
 
 Every entry has two identifiers:
 
 - **`seqnum`** — globally unique, monotonically increasing across all tags. Provides
   total ordering. Assigned by the `Sequencer`.
-- **`localId`** — monotonically increasing *within* a tag's stream. Useful as a
-  per-entity cursor (equivalent to Boki's `localid`).
+- **`streamVersion`** — monotonically increasing *within* a tag's stream, dense from
+  zero. The per-entity cursor. (Called `localId` before 0.3.0, after Boki's `localid`;
+  renamed because Boki's is a per-*engine* write-path id, superseded once the sequencer
+  assigns a seqnum, rather than the permanent per-*tag* position this has always been.
+  `localId()` still works and is deprecated for removal.)
 
 In Boki, `seqnum = [logspace_id:32 | position:32]` encodes the physical log shard.
 Here it is a plain `long` from an `AtomicLong`; a distributed implementation would
@@ -190,7 +193,7 @@ while their versions stay independent:
 ```
 seqnum    0        1        2        3        4
 tag       orders   inv      orders   inv      orders
-localId   0        0        1        1        2
+version   0        0        1        1        2
 ```
 
 A consumer of `orders` that has processed through its version 1 and asks
@@ -209,7 +212,7 @@ long tip = orders.getLatestVersion();   // -1 when the tag is empty
 
 Both forms exist on `SharedLog`, `LogView` and `TypedLogView`.
 
-> **One caveat.** An entry carries a single `localId`, taken from its *primary* tag, so a
+> **One caveat.** An entry carries a single `streamVersion`, taken from its *primary* tag, so a
 > tag that appears only as a secondary tag on an atomic multi-tag append inherits the
 > other stream's numbering rather than counting its own. Version-keyed reads are meant for
 > a tag whose entries are written with it as the primary tag — a per-entity stream. For a
@@ -300,7 +303,7 @@ LogTag tag = LogTag.of("orders", "order-42");  // instance-scoped
 // Entry: immutable log record
 record LogEntry(
     long seqnum,        // global sequence number
-    long localId,       // per-tag sequence number
+    long streamVersion, // position within the primary tag's stream
     Set<LogTag> tags,   // tags this entry belongs to
     byte[] data,        // payload
     long timestamp      // append timestamp
@@ -318,7 +321,7 @@ AppendRequest req = AppendRequest.to(Set.of(tag1, tag2), data);  // multi-tag
 // Append result
 record AppendResult(
     long seqnum,
-    long localId,
+    long streamVersion,
     LogTag primaryTag,
     long timestamp
 )
@@ -336,8 +339,8 @@ record AppendResult(
 │    │                                                                │
 │    ├── writeLock.lock()                                             │
 │    ├── sequencer.next()          ←── LocalSequencer (AtomicLong)    │
-│    ├── localIdCounters[tag]++                                       │
-│    ├── new LogEntry(seqnum, localId, tags, data, now)               │
+│    ├── versionCounters[tag]++                                       │
+│    ├── new LogEntry(seqnum, version, tags, data, now)               │
 │    ├── persistenceAdapter.append(entry)                             │
 │    └── notifySubscribers(entry)  ──▶  [virtual thread per listener] │
 │                                                                     │
@@ -382,10 +385,10 @@ record AppendResult(
 1. Caller invokes `sharedLog.append(request)` — returns a `CompletableFuture`.
 2. The async pool submits the work to a virtual-thread executor.
 3. Inside the write lock: `sequencer.next()` issues the next seqnum; the per-tag
-   `localId` counter increments; a `LogEntry` is constructed.
+   `streamVersion` counter increments; a `LogEntry` is constructed.
 4. `persistenceAdapter.append(entry)` persists durably (fsync for file adapter).
 5. Active subscribers for the entry's tags are notified on individual virtual threads.
-6. `AppendResult(seqnum, localId, primaryTag, timestamp)` is returned.
+6. `AppendResult(seqnum, streamVersion, primaryTag, timestamp)` is returned.
 
 ### Read path
 
@@ -401,7 +404,7 @@ src/main/java/com/cajunsystems/gumbo/
 │
 ├── core/                       Pure value types — no dependencies
 │   ├── LogTag.java             Logical stream identifier (namespace + key)
-│   ├── LogEntry.java           Immutable log record (seqnum, localId, tags, data)
+│   ├── LogEntry.java           Immutable log record (seqnum, streamVersion, tags, data)
 │   ├── LogPosition.java        Read cursor (wraps seqnum)
 │   ├── AppendResult.java       Result of a successful append
 │   └── AppendRequest.java      Payload + target tags for an append call
@@ -445,7 +448,7 @@ src/main/java/com/cajunsystems/gumbo/
 
 ```
 ┌──────────┬──────────┬──────────────┬──────────┬──────────────────────────┬──────────┬───────────┬──────────┐
-│ MAGIC    │ seqnum   │ timestamp    │ localId  │ tags (variable)          │ dataLen  │ data      │ CRC32    │
+│ MAGIC    │ seqnum   │ timestamp    │ version  │ tags (variable)          │ dataLen  │ data      │ CRC32    │
 │ 4 bytes  │ 8 bytes  │ 8 bytes      │ 8 bytes  │ see below                │ 4 bytes  │ N bytes   │ 4 bytes  │
 │ 0xC0FFEE42│ big-end │ millis epoch │ big-end  │                          │ big-end  │           │          │
 └──────────┴──────────┴──────────────┴──────────┴──────────────────────────┴──────────┴───────────┴──────────┘
@@ -470,7 +473,7 @@ rebuild it (same recovery path Boki uses when an engine node restarts cold).
 ### InMemoryPersistenceAdapter
 
 Backed by a `ConcurrentSkipListMap<seqnum, LogEntry>` plus per-tag
-`ConcurrentSkipListMap<seqnum, localId>` indices. Fully concurrent reads; writes are
+`ConcurrentSkipListMap<seqnum, streamVersion>` indices. Fully concurrent reads; writes are
 externally serialised by `SharedLogService`'s write lock. All data is lost on JVM
 exit. Use for unit tests and local development.
 
@@ -551,10 +554,10 @@ persistence back-end for **multi-node or production-scale deployments**.
 
 ```
 {root} / "log"  / seqnum                         → entry bytes
-{root} / "tag"  / namespace / key / seqnum        → localId (8 bytes)
+{root} / "tag"  / namespace / key / seqnum        → streamVersion (8 bytes)
 {root} / "meta" / "latest"                        → latestSeqnum (8 bytes)
 {root} / "meta" / "trim"                          → trimSeqnum (8 bytes)
-{root} / "meta" / "tagcount" / namespace / key    → localIdCount (8 bytes)
+{root} / "meta" / "tagcount" / namespace / key    → versionCount (8 bytes)
 ```
 
 FDB's tuple-layer key encoding preserves ordering, so range reads over the log

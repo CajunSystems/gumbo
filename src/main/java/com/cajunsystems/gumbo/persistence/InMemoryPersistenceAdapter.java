@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * write lock is held by the service layer (the skip-list provides cheap
  * concurrent reads regardless).
  *
- * <p>A secondary per-tag index ({@code ConcurrentSkipListMap<localId, seqnum>})
+ * <p>A secondary per-tag index ({@code ConcurrentSkipListMap<streamVersion, seqnum>})
  * enables O(log n) tag-scoped reads without scanning the full log.
  */
 public class InMemoryPersistenceAdapter implements PersistenceAdapter {
@@ -37,7 +37,7 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
             new ConcurrentHashMap<>();
 
     /** Per-tag local-id counter (mirrors the counters in SharedLogService). */
-    private final ConcurrentHashMap<LogTag, AtomicLong> tagLocalIdCount =
+    private final ConcurrentHashMap<LogTag, AtomicLong> tagVersionCount =
             new ConcurrentHashMap<>();
 
     /** Per-tag key-value store for arbitrary metadata. */
@@ -71,13 +71,13 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         for (LogTag tag : entry.tags()) {
             // Use seqnum as the tagIndex key — it is globally unique across all tags,
             // avoiding collisions when entries have different primary tags but share a
-            // secondary tag (which would cause localId-keyed entries to overwrite each other).
+            // secondary tag (which would cause version-keyed entries to overwrite each other).
             tagIndex
                     .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
                     .put(entry.seqnum(), entry.seqnum());
-            tagLocalIdCount
+            tagVersionCount
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
-                    .updateAndGet(current -> Math.max(current, entry.localId() + 1));
+                    .updateAndGet(current -> Math.max(current, entry.streamVersion() + 1));
         }
     }
 
@@ -124,7 +124,7 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         List<LogEntry> result = new ArrayList<>();
         for (long seqnum : idx.keySet()) {
             LogEntry entry = log.get(seqnum);
-            if (entry != null && entry.localId() >= fromVersion) result.add(entry);
+            if (entry != null && entry.streamVersion() >= fromVersion) result.add(entry);
         }
         return Collections.unmodifiableList(result);
     }
@@ -157,8 +157,8 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
     }
 
     @Override
-    public long getLocalIdCountForTag(LogTag tag) {
-        AtomicLong counter = tagLocalIdCount.get(tag);
+    public long getNextStreamVersion(LogTag tag) {
+        AtomicLong counter = tagVersionCount.get(tag);
         return counter == null ? 0L : counter.get();
     }
 

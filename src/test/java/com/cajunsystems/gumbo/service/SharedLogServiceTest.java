@@ -48,19 +48,19 @@ class SharedLogServiceTest {
         AppendResult r2 = service.append(AppendRequest.to(ORDERS, "e2".getBytes())).join();
 
         assertThat(r1.seqnum()).isLessThan(r2.seqnum());
-        assertThat(r1.localId()).isEqualTo(0L);
-        assertThat(r2.localId()).isEqualTo(1L);
+        assertThat(r1.streamVersion()).isEqualTo(0L);
+        assertThat(r2.streamVersion()).isEqualTo(1L);
     }
 
     @Test
-    void appendAssignsPerTagLocalIds() {
+    void appendAssignsPerTagStreamVersions() {
         AppendResult o1 = service.append(AppendRequest.to(ORDERS,    "o1".getBytes())).join();
         AppendResult i1 = service.append(AppendRequest.to(INVENTORY, "i1".getBytes())).join();
         AppendResult o2 = service.append(AppendRequest.to(ORDERS,    "o2".getBytes())).join();
 
-        assertThat(o1.localId()).isEqualTo(0L);
-        assertThat(i1.localId()).isEqualTo(0L); // fresh local counter for inventory
-        assertThat(o2.localId()).isEqualTo(1L);
+        assertThat(o1.streamVersion()).isEqualTo(0L);
+        assertThat(i1.streamVersion()).isEqualTo(0L); // fresh local counter for inventory
+        assertThat(o2.streamVersion()).isEqualTo(1L);
     }
 
     @Test

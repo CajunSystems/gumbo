@@ -63,7 +63,7 @@ public class DefaultLogView implements LogView {
     public long getLatestVersion() {
         // The adapter tracks the next version to hand out, so the latest written is one
         // below it — and -1 for an empty tag, matching getLatestSeqnum().
-        return service.adapter().getLocalIdCountForTag(tag) - 1;
+        return service.adapter().getNextStreamVersion(tag) - 1;
     }
 
     @Override
