@@ -3,6 +3,7 @@ package com.cajunsystems.gumbo.api;
 import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -87,6 +88,34 @@ public interface TypedLogView<T> {
     default CompletableFuture<List<T>> readAfter(long afterSeqnum) {
         return readFrom(new LogPosition(afterSeqnum + 1), Integer.MAX_VALUE);
     }
+
+    /**
+     * Reads entries from {@code fromVersion} (inclusive) in this tag's own numbering,
+     * deserializing each payload.
+     *
+     * @see LogView#readFromVersion(long)
+     */
+    CompletableFuture<List<T>> readFromVersion(long fromVersion);
+
+    /**
+     * Reads entries after {@code afterVersion} (exclusive) in this tag's own numbering.
+     * Pass {@code -1} to read the whole stream.
+     *
+     * <p>Deserialized values carry no version, so pair this with
+     * {@link #getLatestVersion()} to advance the cursor — read the tip first, then read
+     * up to it, and checkpoint the tip. Use a raw {@link LogView} if you need each
+     * entry's own version.
+     */
+    default CompletableFuture<List<T>> readAfterVersion(long afterVersion) {
+        return readFromVersion(StreamVersions.afterToInclusive(afterVersion));
+    }
+
+    /**
+     * Returns the latest version in this tag's own numbering, or {@code -1} if empty.
+     *
+     * @see LogView#getLatestVersion()
+     */
+    long getLatestVersion();
 
     // -------------------------------------------------------------------------
     // Subscribe

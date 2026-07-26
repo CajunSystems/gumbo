@@ -5,6 +5,7 @@ import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -93,6 +94,27 @@ public interface SharedLog extends AutoCloseable {
      */
     default CompletableFuture<List<LogEntry>> readAll(LogTag tag) {
         return read(tag, LogPosition.BEGINNING, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Reads entries with the given tag from {@code fromVersion} (inclusive) in that
+     * tag's <em>own</em> numbering — its {@code localId} — rather than the global
+     * seqnum {@link #read} takes.
+     *
+     * <p>Use this whenever the position came from a previous entry of this tag:
+     * a checkpoint, a stored cursor, a resume point. A seqnum-keyed read is only
+     * equivalent while the log holds a single tag, and silently returns entries
+     * already consumed once it holds more than one.
+     */
+    CompletableFuture<List<LogEntry>> readFromVersion(LogTag tag, long fromVersion);
+
+    /**
+     * Reads entries with the given tag after {@code afterVersion} (exclusive) in that
+     * tag's own numbering — for a caller holding the version of the last entry it
+     * processed. Pass {@code -1} for the whole stream.
+     */
+    default CompletableFuture<List<LogEntry>> readAfterVersion(LogTag tag, long afterVersion) {
+        return readFromVersion(tag, StreamVersions.afterToInclusive(afterVersion));
     }
 
     // -------------------------------------------------------------------------

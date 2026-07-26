@@ -46,12 +46,24 @@ public class DefaultLogView implements LogView {
     }
 
     @Override
+    public CompletableFuture<List<LogEntry>> readFromVersion(long fromVersion) {
+        return service.readFromVersion(tag, fromVersion);
+    }
+
+    @Override
     public long getLatestSeqnum() {
         try {
             return service.adapter().getLatestSeqnumForTag(tag);
         } catch (IOException e) {
             throw new SharedLogService.LogReadException("getLatestSeqnum failed for tag=" + tag, e);
         }
+    }
+
+    @Override
+    public long getLatestVersion() {
+        // The adapter tracks the next version to hand out, so the latest written is one
+        // below it — and -1 for an empty tag, matching getLatestSeqnum().
+        return service.adapter().getLocalIdCountForTag(tag) - 1;
     }
 
     @Override

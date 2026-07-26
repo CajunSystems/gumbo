@@ -2,6 +2,7 @@ package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.io.IOException;
 import java.util.List;
@@ -110,6 +111,65 @@ public interface PersistenceAdapter extends AutoCloseable {
      * @throws IOException if a read error occurs
      */
     List<LogEntry> readByTag(LogTag tag, long fromSeqnum) throws IOException;
+
+    /**
+     * Returns entries visible to {@code tag} with {@code localId >= fromVersion}, in
+     * seqnum order — the tag's <em>own</em> stream position, not the global seqnum.
+     *
+     * <p>This is the read a per-stream cursor needs. {@link #readByTag} takes a global
+     * {@code seqnum}, and the two number spaces coincide only when the log holds a
+     * single tag: with two tags in one log, {@code readByTag(second, 3)} returns
+     * everything the second tag has (its seqnums start above 3), not the entries after
+     * its own third. A consumer holding a cursor into one stream — an executor resuming
+     * from a checkpoint, a workflow replaying its history — wants this method instead.
+     *
+     * <p>{@code fromVersion} is inclusive, so {@code readFromVersion(tag, 0)} is
+     * equivalent to {@code readByTag(tag, 0)}. Versions below the trim point are gone;
+     * this returns what remains rather than failing.
+     *
+     * <h2>Multi-tag entries</h2>
+     * <p>An entry carries <em>one</em> {@code localId}, assigned from its primary tag's
+     * counter, so a version identifies a position in the primary tag's stream. For a tag
+     * that an entry carries only as a <em>secondary</em> tag, that number belongs to a
+     * different stream: it does not count that tag's entries and it need not start at
+     * zero. Version-keyed reads are therefore well-defined for a tag whose entries were
+     * all written with it as the primary tag — the normal case, and the only one for a
+     * per-entity stream — and are not meaningful for a tag used purely as a secondary
+     * fan-out tag, such as a shared work queue fed by atomic multi-tag appends.
+     *
+     * <p>Fixing that requires a version per tag per entry, which means storage-owned
+     * per-tag versions rather than one field on the entry. Until then, seqnum-keyed
+     * {@link #readByTag} remains the correct read for a fan-out tag.
+     *
+     * <p>The default implementation reads the tag's whole stream and filters, which is
+     * correct but reads storage it discards. Adapters that maintain a per-tag index
+     * should override it to resolve the range first and read only the result. All four
+     * adapters shipped with Gumbo do.
+     *
+     * @param tag         the stream to read
+     * @param fromVersion inclusive lower bound on {@code localId} within {@code tag}
+     * @throws IOException if a read error occurs
+     */
+    default List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
+        if (fromVersion <= 0) return readByTag(tag, 0L);
+        return readByTag(tag, 0L).stream()
+                .filter(e -> e.localId() >= fromVersion)
+                .toList();
+    }
+
+    /**
+     * Returns entries visible to {@code tag} with {@code localId > afterVersion} — the
+     * exclusive form of {@link #readFromVersion}, for a consumer holding the version of
+     * the last entry it processed.
+     *
+     * @param tag          the stream to read
+     * @param afterVersion exclusive lower bound on {@code localId} within {@code tag};
+     *                     pass {@code -1} for the whole stream
+     * @throws IOException if a read error occurs
+     */
+    default List<LogEntry> readAfterVersion(LogTag tag, long afterVersion) throws IOException {
+        return readFromVersion(tag, StreamVersions.afterToInclusive(afterVersion));
+    }
 
     // -------------------------------------------------------------------------
     // Housekeeping

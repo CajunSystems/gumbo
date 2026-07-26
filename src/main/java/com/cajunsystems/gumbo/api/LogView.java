@@ -4,6 +4,7 @@ import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -51,13 +52,59 @@ public interface LogView {
     /**
      * Reads all entries with {@code seqnum > afterSeqnum}, i.e. the "delta"
      * since a known position. Useful for incremental state updates in executors.
+     *
+     * <p>Note that {@code afterSeqnum} is a <em>global</em> seqnum. If the position you
+     * are resuming from came from this view's own stream — a checkpointed
+     * {@code localId}, the version of the last entry you handled — use
+     * {@link #readAfterVersion} instead. The two agree only while the log holds a single
+     * tag; with more than one tag this method silently returns entries you have already
+     * seen, because the other tags' entries push this tag's seqnums past the cursor.
      */
     default CompletableFuture<List<LogEntry>> readAfter(long afterSeqnum) {
         return readFrom(new LogPosition(afterSeqnum + 1), Integer.MAX_VALUE);
     }
 
+    /**
+     * Reads entries from {@code fromVersion} (inclusive) in this tag's <em>own</em>
+     * numbering — the {@code localId} carried by every {@link LogEntry} and returned by
+     * every append — rather than the global seqnum.
+     *
+     * <p>This is the read for a per-stream cursor. A view's entries are numbered
+     * {@code 0, 1, 2, …} within its own tag no matter how many other tags share the
+     * physical log, so a version survives the log gaining new writers; a seqnum does
+     * not.
+     *
+     * <pre>{@code
+     * long cursor = Long.parseLong(new String(view.getValue("cursor").join()));
+     * for (LogEntry e : view.readAfterVersion(cursor).join()) {
+     *     state = apply(state, e);
+     *     cursor = e.localId();
+     * }
+     * view.setValue("cursor", Long.toString(cursor).getBytes()).join();
+     * }</pre>
+     */
+    CompletableFuture<List<LogEntry>> readFromVersion(long fromVersion);
+
+    /**
+     * Reads entries after {@code afterVersion} (exclusive) in this tag's own numbering —
+     * the delta since the last entry this reader processed. Pass {@code -1} to read the
+     * whole stream.
+     */
+    default CompletableFuture<List<LogEntry>> readAfterVersion(long afterVersion) {
+        return readFromVersion(StreamVersions.afterToInclusive(afterVersion));
+    }
+
     /** Returns the latest seqnum visible in this view, or {@code -1} if empty. */
     long getLatestSeqnum();
+
+    /**
+     * Returns the latest version in this tag's own numbering (the highest
+     * {@code localId} written to it), or {@code -1} if the tag is empty.
+     *
+     * <p>This is the counterpart to {@link #getLatestSeqnum()} for a per-stream cursor,
+     * and the value to pass to {@link #readAfterVersion}.
+     */
+    long getLatestVersion();
 
     /** Returns the current read tip as a {@link LogPosition}. */
     default LogPosition currentPosition() {

@@ -171,31 +171,36 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     public List<LogEntry> readAll() throws IOException {
         List<LogEntry> snapshot = pendingSnapshot();
         List<LogEntry> fromDelegate = delegate.readAll();
-        return merge(fromDelegate, snapshot, 0);
+        return merge(fromDelegate, snapshot, e -> true);
     }
 
     @Override
     public List<LogEntry> readFrom(long fromSeqnum) throws IOException {
         List<LogEntry> snapshot = pendingSnapshot();
         List<LogEntry> fromDelegate = delegate.readFrom(fromSeqnum);
-        return merge(fromDelegate, snapshot, fromSeqnum);
+        return merge(fromDelegate, snapshot, e -> e.seqnum() >= fromSeqnum);
     }
 
     @Override
     public List<LogEntry> readByTag(LogTag tag, long fromSeqnum) throws IOException {
         List<LogEntry> snapshot = pendingSnapshot();
         List<LogEntry> fromDelegate = delegate.readByTag(tag, fromSeqnum);
-        if (snapshot.isEmpty()) return fromDelegate;
+        return merge(fromDelegate, snapshot,
+                e -> e.seqnum() >= fromSeqnum && e.tags().contains(tag));
+    }
 
-        List<LogEntry> fromPending = snapshot.stream()
-                .filter(e -> e.seqnum() >= fromSeqnum && e.tags().contains(tag))
-                .toList();
-        if (fromPending.isEmpty()) return fromDelegate;
-
-        List<LogEntry> merged = new ArrayList<>(fromDelegate.size() + fromPending.size());
-        merged.addAll(fromDelegate);
-        merged.addAll(fromPending);
-        return merged;
+    /**
+     * Same merge as {@link #readByTag}, keyed on the tag's own version instead of the
+     * global seqnum. Delegating rather than inheriting the interface default matters
+     * here: the default filters {@link #readByTag}, which would read the delegate's
+     * whole stream from storage and then discard most of it.
+     */
+    @Override
+    public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
+        List<LogEntry> snapshot = pendingSnapshot();
+        List<LogEntry> fromDelegate = delegate.readFromVersion(tag, fromVersion);
+        return merge(fromDelegate, snapshot,
+                e -> e.tags().contains(tag) && e.localId() >= fromVersion);
     }
 
     // -------------------------------------------------------------------------
@@ -224,9 +229,15 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public long getLocalIdCountForTag(LogTag tag) {
-        // Called by SharedLogService only on first use per tag (computeIfAbsent).
-        // At that point the tag is brand-new — no pending entries exist for it yet.
-        return delegate.getLocalIdCountForTag(tag);
+        // The pending buffer has to be counted too. SharedLogService only asks on first
+        // use of a tag, when nothing is pending — but a caller reading a tag's version
+        // tip (LogView.getLatestVersion) asks at any time, and would otherwise see a
+        // count that stops at the last flush.
+        long count = delegate.getLocalIdCountForTag(tag);
+        for (LogEntry e : pendingSnapshot()) {
+            if (e.tags().contains(tag)) count = Math.max(count, e.localId() + 1);
+        }
+        return count;
     }
 
     @Override
@@ -292,14 +303,32 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
      * Appends pending entries whose seqnum >= {@code fromSeqnum} to the
      * delegate result list.
      */
+    /**
+     * Merges the delegate's view with the still-pending entries that {@code keep} selects.
+     *
+     * <p>Drops any pending entry the delegate already returned. The snapshot is taken
+     * before the delegate is read, so a flush landing between the two puts the same entry
+     * in both — and a consumer using these reads to avoid reprocessing what it has
+     * already seen would be handed a duplicate by the very call meant to prevent that.
+     * Seqnums are globally unique, which makes them the identity to dedupe on.
+     *
+     * <p>Ordering survives: every pending entry that is not in the delegate's result was
+     * appended after everything in it, so appending them keeps the result ascending.
+     */
     private static List<LogEntry> merge(List<LogEntry> fromDelegate,
                                         List<LogEntry> pending,
-                                        long fromSeqnum) {
+                                        java.util.function.Predicate<LogEntry> keep) {
         if (pending.isEmpty()) return fromDelegate;
+
+        java.util.Set<Long> alreadyFlushed = new java.util.HashSet<>(fromDelegate.size());
+        for (LogEntry e : fromDelegate) alreadyFlushed.add(e.seqnum());
+
         List<LogEntry> fromPending = pending.stream()
-                .filter(e -> e.seqnum() >= fromSeqnum)
+                .filter(keep)
+                .filter(e -> !alreadyFlushed.contains(e.seqnum()))
                 .toList();
         if (fromPending.isEmpty()) return fromDelegate;
+
         List<LogEntry> merged = new ArrayList<>(fromDelegate.size() + fromPending.size());
         merged.addAll(fromDelegate);
         merged.addAll(fromPending);

@@ -60,6 +60,19 @@ final class DefaultTypedLogView<T> implements TypedLogView<T> {
                         .toList());
     }
 
+    @Override
+    public CompletableFuture<List<T>> readFromVersion(long fromVersion) {
+        return delegate.readFromVersion(fromVersion)
+                .thenApply(entries -> entries.stream()
+                        .map(e -> serializer.deserialize(e.data()))
+                        .toList());
+    }
+
+    @Override
+    public long getLatestVersion() {
+        return delegate.getLatestVersion();
+    }
+
     // -------------------------------------------------------------------------
     // Subscribe
     // -------------------------------------------------------------------------

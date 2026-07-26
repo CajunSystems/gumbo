@@ -336,6 +336,30 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         return readEntries(offsets);
     }
 
+    /**
+     * Resolves the version range against the in-memory per-tag index and reads only the
+     * matching entries from {@code log.dat} — so the cost on storage is proportional to
+     * the result, not to the tag's history.
+     *
+     * <p>The index is keyed by seqnum with the localId as its value, and within a tag the
+     * two ascend together (localIds are handed out in append order), so walking it in
+     * seqnum order yields versions in ascending order too.
+     */
+    @Override
+    public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
+        ConcurrentSkipListMap<Long, Long> idx = tagSeqnums.get(tag);
+        if (idx == null || idx.isEmpty()) return Collections.emptyList();
+
+        List<Long> offsets = new ArrayList<>();
+        for (Map.Entry<Long, Long> e : idx.entrySet()) {  // seqnum → localId, ascending seqnum
+            if (e.getValue() < fromVersion) continue;
+            if (e.getKey() < trimSeqnum) continue;
+            Long offset = globalIndex.get(e.getKey());
+            if (offset != null) offsets.add(offset);
+        }
+        return readEntries(offsets);
+    }
+
     // -------------------------------------------------------------------------
     // Housekeeping
     // -------------------------------------------------------------------------

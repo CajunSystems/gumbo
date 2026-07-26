@@ -182,6 +182,39 @@ In Boki, `seqnum = [logspace_id:32 | position:32]` encodes the physical log shar
 Here it is a plain `long` from an `AtomicLong`; a distributed implementation would
 encode the node and term in the high bits.
 
+**Read with the number you are holding.** The two are interchangeable only while a log
+holds a single tag — the configuration most tests and examples use, and the reason the
+distinction is easy to miss. Once a log carries two streams, their seqnums interleave
+while their versions stay independent:
+
+```
+seqnum    0        1        2        3        4
+tag       orders   inv      orders   inv      orders
+localId   0        0        1        1        2
+```
+
+A consumer of `orders` that has processed through its version 1 and asks
+`readAfter(1)` — a seqnum-keyed read — gets back versions 1 *and* 2, and reprocesses an
+entry it has already seen. `readAfterVersion(1)` returns only version 2. Use the
+version-keyed reads whenever the position came from this tag's own stream:
+
+```java
+LogView orders = log.getView(LogTag.of("orders"));
+
+List<LogEntry> backlog = orders.readAfterVersion(cursor).join();  // this tag's numbering
+List<LogEntry> delta   = orders.readAfter(seqnum).join();         // the global sequence
+
+long tip = orders.getLatestVersion();   // -1 when the tag is empty
+```
+
+Both forms exist on `SharedLog`, `LogView` and `TypedLogView`.
+
+> **One caveat.** An entry carries a single `localId`, taken from its *primary* tag, so a
+> tag that appears only as a secondary tag on an atomic multi-tag append inherits the
+> other stream's numbering rather than counting its own. Version-keyed reads are meant for
+> a tag whose entries are written with it as the primary tag — a per-entity stream. For a
+> shared fan-out tag fed by multi-tag appends, keep using the seqnum-keyed reads.
+
 ---
 
 ## API overview
