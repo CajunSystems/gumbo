@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -271,6 +272,83 @@ class SubscriptionDeliveryTest {
         assertThat(received).containsExactly("in-flight");
     }
 
+    /**
+     * A listener that honours interruption must be reaped <em>before</em> close returns.
+     *
+     * <p>Close escalates: sentinel, wait, interrupt, wait again. Dropping that second
+     * wait is the easy mistake — the interrupt is sent and the method returns in the same
+     * breath, so the one chance the interrupt exists to give the listener is denied and
+     * the caller frees resources under a listener that is still unwinding.
+     */
+    @Test
+    void closeWaitsAgainAfterInterruptingAListenerThatHonoursIt() {
+        CountDownLatch inListener = new CountDownLatch(1);
+        AtomicBoolean finishedUnwinding = new AtomicBoolean(false);
+
+        SharedLog.Subscription sub = service.subscribe(ORDERS, LogPosition.BEGINNING, e -> {
+            inListener.countDown();
+            try {
+                Thread.sleep(60_000);            // blocks until interrupted
+            } catch (InterruptedException ie) {
+                sleepUninterruptibly(300);       // a measurable unwind
+                finishedUnwinding.set(true);
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        append("blocks-the-listener");
+        awaitQuietly(inListener);
+
+        long start = System.nanoTime();
+        sub.close();
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertThat(finishedUnwinding.get())
+                .as("close() returned while the listener was still unwinding from its interrupt")
+                .isTrue();
+        // Interrupted at the half-way point, not left for the whole budget.
+        assertThat(elapsedMs).isLessThan(5_000);
+    }
+
+    /**
+     * An interrupt on the <em>calling</em> thread must not cut close's wait short.
+     *
+     * <p>Shutdown paths routinely run on an already-interrupted thread — a {@code finally}
+     * after an {@code InterruptedException}, say. {@link Thread#join(long)} throws
+     * immediately for such a caller, so a close that honours it skips its waits entirely
+     * and returns while the listener runs on: the failure mode is worst exactly when the
+     * caller is about to tear down what the listener is using. The interrupt is deferred
+     * and restored, not obeyed and not swallowed.
+     */
+    @Test
+    void anInterruptedCallerStillGetsTheFullCloseWait() {
+        CountDownLatch inListener = new CountDownLatch(1);
+        AtomicBoolean listenerFinished = new AtomicBoolean(false);
+
+        SharedLog.Subscription sub = service.subscribe(ORDERS, LogPosition.BEGINNING, e -> {
+            inListener.countDown();
+            sleepUninterruptibly(500);
+            listenerFinished.set(true);
+        });
+
+        append("blocks-the-listener");
+        awaitQuietly(inListener);
+
+        Thread.currentThread().interrupt();   // caller arrives at close() already interrupted
+        try {
+            sub.close();
+
+            assertThat(listenerFinished.get())
+                    .as("close() skipped its wait because the caller was interrupted")
+                    .isTrue();
+            assertThat(Thread.currentThread().isInterrupted())
+                    .as("the caller's interrupt must be restored, not swallowed")
+                    .isTrue();
+        } finally {
+            Thread.interrupted();   // clear, so the flag does not leak into teardown
+        }
+    }
+
     /** Closing from inside the listener must not wait for the thread doing the closing. */
     @Test
     void aListenerMayCloseItsOwnSubscriptionWithoutDeadlocking() {
@@ -309,6 +387,19 @@ class SubscriptionDeliveryTest {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
+        }
+    }
+
+    /** Sleeps without letting an interrupt cut it short, so the unwind is observable. */
+    private static void sleepUninterruptibly(long ms) {
+        long deadline = System.nanoTime() + ms * 1_000_000L;
+        long remaining;
+        while ((remaining = deadline - System.nanoTime()) > 0) {
+            try {
+                Thread.sleep(remaining / 1_000_000L, (int) (remaining % 1_000_000L));
+            } catch (InterruptedException ignored) {
+                // deliberate: this models a listener that finishes its cleanup
+            }
         }
     }
 
