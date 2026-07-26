@@ -6,7 +6,7 @@
 
     <groupId>com.cajunsystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
     <packaging>jar</packaging>
 
     <name>Shared Log</name>
@@ -25,7 +25,7 @@
         <slf4j.version>2.0.12</slf4j.version>
         <logback.version>1.5.3</logback.version>
         <junit.version>5.10.2</junit.version>
-        <assertj.version>3.25.3</assertj.version>
+        <assertj.version>3.27.7</assertj.version>
         <awaitility.version>4.2.1</awaitility.version>
         <kryo.version>5.6.0</kryo.version>
         <fdb.version>7.3.43</fdb.version>
@@ -128,24 +128,34 @@
                         Ratchet, not a target: set to the measured score, so a decline
                         fails the build rather than being absorbed by slack.
 
-                        Measured on main at 0.3.0: 421-422 of 553 killed (the count varies
-                        by one between runs, from timing-sensitive tests in the service
-                        package), test strength 82%.
+                        Measured at 0.4.0: 462 of 592 killed on CI, 460 locally — 78.0% and
+                        77.7%, which straddles a rounding boundary. Both halves of the
+                        fraction moved when A3 landed (the conditional KV added mutable
+                        code and the tests to kill it), so the floor is recomputed here
+                        rather than carried over.
 
-                        PIT compares a rounded integer, so the floor is 418: that reports
-                        76 and passes, while 417 reports 75 and fails. Roughly three or
-                        four mutants of headroom, not the round number it looks like.
-                        A slower machine tends to kill more, not fewer, since a timed-out
-                        mutant counts as killed. Raise this when the score rises — and
-                        recompute the floor with it, since it moves with the denominator.
+                        PIT compares a rounded integer, so the floor is 453: that reports
+                        77 and passes, while 452 reports 76 and fails.
+
+                        Set to 77 rather than the 78 the CI run alone would justify. At 78
+                        the floor is 459, and the observed low is 460 — one mutant of
+                        headroom against a score that already varies by two between runs,
+                        which is a gate that fails on timing rather than on a regression.
+                        77 still ratchets up from 76 and leaves seven. A slower machine
+                        tends to kill more, not fewer, since a timed-out mutant counts as
+                        killed.
+
+                        Raise this when the score rises — and recompute the floor with it,
+                        since it moves with the denominator. Previously 76, against
+                        421-422 of 553 at 0.3.0.
                     -->
-                    <mutationThreshold>76</mutationThreshold>
+                    <mutationThreshold>77</mutationThreshold>
                 </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.12.1</version>
+                <version>3.15.0</version>
                 <configuration>
                     <source>${java.version}</source>
                     <target>${java.version}</target>

@@ -10,54 +10,60 @@ its numbering (D1–D4, A1–A6).
 
 ## Where things stand
 
-**0.3.0 is cut and merged** (`47db570`). Shipped: D3 (directory lock), A2 (version-keyed
-reads), A5 (`localId` → `streamVersion`), D1 + A1 (storage-owned versions + conditional
-append), plus a subscription-delivery rewrite and a mutation-testing gate that were not on
-the report's list.
+**0.3.0 is cut, merged and tagged** (`47db570`). Shipped: D3 (directory lock), A2
+(version-keyed reads), A5 (`localId` → `streamVersion`), D1 + A1 (storage-owned versions +
+conditional append), plus a subscription-delivery rewrite and a mutation-testing gate that
+were not on the report's list.
 
-**A3 (KV compare-and-set) has since landed** and is unreleased — see §2, and the CHANGELOG's
-`[Unreleased]`.
+**0.4.0 carries A3** (KV compare-and-set), the release-hygiene work listed in §0 and §4, and
+two KV defects found while implementing it — see the CHANGELOG.
+
+Report items now outstanding: **A4**, **A6** (half), **D2**, and the multi-tag version
+defect. Everything else below is testing, process or cross-cutting.
 
 See [`FAILURE_SEMANTICS.md`](FAILURE_SEMANTICS.md) for the write-path contracts, which
 several items below depend on.
 
 ---
 
-## 0. Release: the 0.3.0 tag is not pushed
+## 0. ~~Release: the 0.3.0 tag is not pushed~~ — done
 
-**Blocks everything downstream.** JitPack builds from tags, and the tag does not exist.
+The tag is pushed (`0.3.0` → `47db570`, lightweight, matching the `0.2.0` convention) and
+JitPack has built it: `jitpack.io/api/builds/com.github.CajunSystems/gumbo` reports
+`"0.3.0" : "ok"`, with the jar, sources jar and pom published.
+
+`0.4.0` follows it, carrying A3 — see the CHANGELOG. It is a minor bump rather than a patch
+because `LogView` and `TypedLogView` each gained two abstract methods, which is source-
+breaking for implementors.
+
+### ~~Coordinates need checking~~ — settled, and measured
+
+The two coordinates are both real and name the same jar:
+
+| Obtained by | Coordinate |
+|---|---|
+| JitPack | `com.github.CajunSystems:gumbo` (JitPack rewrites the groupId to `com.github.{owner}`) |
+| `mvn install` | `com.cajunsystems:gumbo` — what this repo's `pom.xml` declares |
+
+Verified against the published artifact: `gumbo-0.3.0.pom` on JitPack carries
+`<groupId>com.github.CajunSystems</groupId>`.
+
+**Use the JitPack one.** It was tested end to end from a machine with normal egress, and the
+control matters as much as the result:
 
 ```
-git tag 0.3.0 47db570
-git push origin 0.3.0
+before: Could not find artifact com.cajunsystems:gumbo:jar:0.3.0 in central
+after:  Downloaded from jitpack.io: .../com/github/CajunSystems/gumbo/0.3.0/gumbo-0.3.0.jar
+        Catalyst reactor: 11 modules SUCCESS, catalyst-gumbo tests 9/9
 ```
 
-Lightweight, matching the `0.2.0` convention (`git cat-file -t 0.2.0` → `commit`).
+So the earlier note in Catalyst's pom — that jitpack.io is blocked and gumbo must come from a
+local `mvn install` — was true of one sandboxed environment, not of the delivery mechanism.
+The README now documents which coordinate to use and why there are two.
 
-This could not be done from the session that cut the release: `git push` of a tag ref is
-refused by that environment's git proxy (`--dry-run` reports `[new tag] 0.3.0 -> 0.3.0`,
-the real push disconnects), the GitHub MCP surface has no `create_tag`/`create_release`,
-and the REST API returns `403 Write access to this GitHub API path is not permitted`.
-Branch pushes worked throughout, so it is tag refs specifically.
-
-Verified before tagging: `mvn install` at `47db570` produces `gumbo-0.3.0.jar`, 212 tests
-pass, and the PIT plugin has **no `<executions>` binding** so it will not run during
-JitPack's build.
-
-After pushing, force a build before pointing anything at it — the first fetch triggers it,
-and a failure means the tag is already public and you need a `0.3.1`:
-
-```
-curl -s https://jitpack.io/com/github/CajunSystems/gumbo/0.3.0/build.log | tail -20
-```
-
-### Coordinates need checking
-
-`pom.xml` declares `com.cajunsystems:gumbo`; the README install snippets say
-`com.github.CajunSystems:gumbo` (JitPack rewrites coordinates). Catalyst currently depends
-on `com.cajunsystems:gumbo:0.2.0`, which therefore is **not** resolving from JitPack — most
-likely a local `mvn install`. Settle which coordinate Catalyst should use before bumping it,
-or the D4 fix will appear to land and then fail to resolve on a clean machine.
+**Still to do on this:** Catalyst's pom change (groupId + the `jitpack.io` repository) is
+written but not committed. It is what unblocks §1 on CI rather than only on a machine where
+someone ran the install.
 
 ---
 
@@ -241,15 +247,24 @@ That needs real crash injection (`kill -9` between write and read).
 
 ### Mutation-testing backlog
 
-`mvn test-compile org.pitest:pitest-maven:mutationCoverage`. Currently **421–422 of 553
-killed**, threshold ratcheted at 76.
+`mvn test-compile org.pitest:pitest-maven:mutationCoverage`. Currently **462 of 592 killed**
+on CI and **460** locally (test strength 83–84%), threshold ratcheted at 77, floor 453. Was
+421–422 of 553 at 76; A3 moved both halves of the fraction, which is why the floor was
+recomputed rather than carried over.
+
+The gap between those two runs is the useful part. The score varies by about two, so a
+threshold set to the best observed run leaves the gate failing on timing rather than on a
+regression: 78 would have had one mutant of headroom, 77 has seven. The same reasoning applies
+next time it is raised — take the *low* run, not the flattering one.
 
 The distribution is the useful part: survivors cluster in code that only runs *after
 something has already gone wrong*, which is the same distribution as the defects found in
 review, arrived at independently. Still uncovered:
 
 - **`loadKvFile`** — every partial-record boundary check survives. The torn-KV-record path
-  is entirely unexercised.
+  is entirely unexercised, and this got *more* load-bearing in 0.4.0: the KV now carries
+  claims and counters, not just checkpoints, so a torn record silently reverting a key is no
+  longer only a lost checkpoint. Reachable by the fault-injection harness below.
 - **`decodeAt`** — cursor arithmetic in the binary decoder; `Replaced long addition with
   subtraction` survives.
 - **`tryLoadGlobalIndex`** — partly covered now by `RecoveryAndTrimTest`, some survivors
@@ -284,16 +299,15 @@ adapter *has*: it owns the WAL and the fsync. Worth spiking whether group commit
 the durable adapters and the decorator disappears. That deletes a whole category rather than
 fixing four things. Bigger call than it sounds — it removes a public class.
 
-### GitHub Actions are pinned to mutable tags
+### ~~GitHub Actions are pinned to mutable tags~~ — done in 0.4.0
 
-`.github/workflows/ci.yml` uses `actions/checkout@v4`, `setup-java@v4`, `upload-artifact@v4`.
-An upstream tag repoint changes what CI executes with no change here. Pin all three to
-commit SHAs — **across both jobs**, since pinning only one is security theatre.
+All three are pinned to commit SHAs across both jobs, taken to the current majors while
+pinning (`checkout` v7.0.1, `setup-java` v5.6.0, `upload-artifact` v7.0.1), which also clears
+the Node 20 deprecation warning the runner had begun emitting. Dependabot rewrites the
+trailing version comment, so the pins will not rot.
 
-This could not be done from the session that raised it: resolving the SHAs needs read access
-to `actions/*`, outside that session's repo scope. `.github/dependabot.yml` is already in
-place so the pins will not rot once applied — and Dependabot has already opened PRs bumping
-these actions, which is the natural moment to pin them.
+The three Dependabot PRs proposing those bumps (#15, #16, #17) are superseded and can be
+closed.
 
 ---
 
@@ -318,14 +332,18 @@ Untouched, and all still true.
 
 ## Suggested order
 
-1. **Push the 0.3.0 tag** and verify JitPack builds (§0) — blocks everything downstream
-2. **Fix Catalyst's D4** (§1) — the live corruption that started this
+1. **Tag 0.4.0** once it merges, and check JitPack builds it before pointing Catalyst at it
+2. **Commit Catalyst's coordinate change**, then **fix its D4** (§0, §1) — the live
+   corruption that started all of this, and the reason the coordinate had to be settled first
 3. **A4 capabilities** (§2) — cheap, and stops the next caller assuming the wrong guarantee
 4. **Fault-injection harness** (§4) — before D2, which is its first customer
 5. **D2** non-clobbering index
 6. **Batching decision** (§3) and/or the decorator spike (§4) — same subject, take together
-7. **A6** ergonomics (~~A3~~ done, out of order — see §2)
+7. **A6** ergonomics (~~A3~~ shipped in 0.4.0, out of order — see §2)
 8. **Multi-tag versions** last — the only item with a log-migration cost
+
+~~Push the 0.3.0 tag~~ and ~~pin the GitHub Actions~~ are done; both were §0/§4 items that
+blocked or shadowed everything else.
 
 ---
 

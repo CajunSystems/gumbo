@@ -5,13 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.4.0] — 2026-07-26
 
 Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)
-at its item **A3**, the next one in that document's own order: with storage-owned versions
-and conditional append in place (0.3.0), compare-and-set on the tag KV is what turns the KV
-from a place to keep checkpoints into a coordination substrate — leases, ownership records,
-work claims — with no new subsystem.
+at its item **A3**: with storage-owned versions and conditional append in place (0.3.0),
+compare-and-set on the tag KV is what turns the KV from a place to keep checkpoints into a
+coordination substrate — leases, ownership records, work claims — with no new subsystem.
+
+**Why 0.4.0 and not 0.3.1.** The KV additions are additive for callers but not for
+implementors: `LogView` and `TypedLogView` each gain two abstract methods, so anything
+implementing those interfaces stops compiling until they are added. That is the same class of
+change as 0.2.0 → 0.3.0, and it gets the same treatment. Adapters are unaffected — every new
+`PersistenceAdapter` method has a default.
 
 ### Added
 
@@ -36,10 +41,8 @@ work claims — with no new subsystem.
   compared non-atomically would hand every contender a `true` and report two owners as
   success, so the base implementation throws `UnsupportedOperationException`
 
-`LogView` and `TypedLogView` each gain two abstract methods (`compareAndSetValue`,
-`incrementValue`; the other two are defaults over them), so a third-party implementation of
-either interface needs those two added. Adapters are unaffected — every new SPI method has a
-default.
+The two new abstract methods are `compareAndSetValue` and `incrementValue`; the other two are
+defaults over them.
 
 **Why a lease still needs the append fence.** Expiry needs a clock, and a clock is the part
 that can be wrong. With the append conditioned on the version, skew that lets two nodes both
@@ -61,6 +64,33 @@ the swap, and only one passes the fence. `TagValueCoordinationTest` pins that pa
   the committed value stayed put, so the divergence was invisible until a reopen silently
   reverted it. FoundationDB is exempt — the bytes leave the process when the transaction sets
   them
+
+### Build and CI
+
+- **Mutation ratchet raised from 76 to 77**, measured at 462 of 592 killed on CI and 460
+  locally (test strength 83-84%, up from 82%). Both halves of the fraction moved when the
+  conditional KV landed, so the floor is recomputed with it: 453 reports 77 and passes, 452
+  reports 76 and fails. Not 78, which the CI number alone would justify — its floor of 459 sits
+  one mutant under the observed low of 460, on a score that varies by two between runs, so the
+  gate would fail on timing rather than on a regression
+- **GitHub Actions pinned to commit SHAs** — `checkout`, `setup-java` and `upload-artifact`,
+  across both jobs. A tag is mutable, so an upstream repoint changed what CI executed with no
+  change here and no review; pinning one job and not the other would have left the same path
+  open. Taken to the current majors while pinning, which also clears the Node 20 deprecation
+  warning the runner had started emitting
+- `assertj` 3.25.3 → 3.27.7 and `maven-compiler-plugin` 3.12.1 → 3.15.0. The other open
+  dependency bumps are deliberately not here: `fdb-java` 7.3.43 → 7.4.6 cannot be exercised
+  without a live cluster and the API version is pinned at 730 in code, and `logback`
+  1.5.3 → 1.6.0 is a runtime logging change that should not ride along with a release cut
+
+### Documentation
+
+- The README now says which Maven coordinate to use and why there are two. JitPack rewrites
+  the groupId to `com.github.{owner}` when it publishes, so the same jar is
+  `com.cajunsystems:gumbo` when built locally and `com.github.CajunSystems:gumbo` when
+  fetched — a difference that had a downstream build depending on a coordinate only resolvable
+  on a machine where gumbo had been installed by hand
+- `docs/OPEN-WORK.md` refreshed against what has actually landed
 
 ---
 

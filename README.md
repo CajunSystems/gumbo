@@ -106,7 +106,7 @@ Then add the dependency:
 <dependency>
     <groupId>com.github.CajunSystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>0.3.0</version>
+    <version>0.4.0</version>
 </dependency>
 ```
 
@@ -118,11 +118,28 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.CajunSystems:gumbo:0.3.0'
+    implementation 'com.github.CajunSystems:gumbo:0.4.0'
 }
 ```
 
 > **Note**: Gumbo requires Java 21+.
+
+### Which groupId — `com.github.CajunSystems` or `com.cajunsystems`?
+
+Both name the same jar, and which one resolves depends on where you got it. **Use
+`com.github.CajunSystems` unless you built gumbo yourself.**
+
+| How you obtained it | Coordinate |
+|---|---|
+| Fetched from JitPack (the snippets above) | `com.github.CajunSystems:gumbo` |
+| Built locally with `mvn install` | `com.cajunsystems:gumbo` — what [`pom.xml`](pom.xml) declares |
+
+JitPack rewrites the groupId to `com.github.{owner}` when it publishes, so the coordinate in
+gumbo's own pom is *not* the one you depend on when you fetch it. Depending on
+`com.cajunsystems:gumbo` works on a machine where gumbo has been installed by hand and fails
+everywhere else — including CI — with `Could not find artifact ... in central`. That is not
+hypothetical: a downstream build was pinned that way and could only be built by whoever had
+run the install.
 
 ---
 
@@ -1126,7 +1143,7 @@ Requires Java 21 and Maven 3.9+.
 
 ```bash
 mvn verify          # compile + test
-mvn package         # produce gumbo-0.3.0.jar
+mvn package         # produce gumbo-0.4.0.jar
 ```
 
 GitHub Actions runs `mvn verify` on every push using Java 21 (Temurin).

@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: ["main"]
 
+# Actions are pinned to commit SHAs, not tags. A tag is mutable: an upstream repoint
+# changes what this workflow executes with no change in this repository and no review.
+# The trailing comment is the human-readable version, and is what Dependabot rewrites
+# when it proposes a bump — .github/dependabot.yml keeps the pins from rotting.
+#
+# Pinned across both jobs deliberately: pinning one job and not the other leaves the
+# same untrusted-code path open, which is security theatre rather than security.
 jobs:
   build:
     name: Build & Test (Java ${{ matrix.java }})
@@ -18,10 +25,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up JDK ${{ matrix.java }}
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
         with:
           java-version: ${{ matrix.java }}
           distribution: temurin
@@ -32,7 +39,7 @@ jobs:
 
       - name: Upload test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: test-reports-java${{ matrix.java }}
           path: target/surefire-reports/
@@ -43,10 +50,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
         with:
           java-version: "21"
           distribution: temurin
@@ -61,7 +68,7 @@ jobs:
 
       - name: Upload mutation report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pit-report
           path: target/pit-reports/
