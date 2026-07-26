@@ -85,6 +85,53 @@
 
     <build>
         <plugins>
+            <!--
+                Mutation testing. A passing test suite says the tests ran; it does not say
+                they would have failed had the code been wrong. Several tests in this repo
+                did pass against the very defect they were written for, so that gap is
+                checked rather than assumed.
+
+                Scoped to persistence + service: that is where the durability and
+                concurrency invariants live, and where every defect found in review landed.
+                Run with `mvn test-compile org.pitest:pitest-maven:mutationCoverage`.
+            -->
+            <plugin>
+                <groupId>org.pitest</groupId>
+                <artifactId>pitest-maven</artifactId>
+                <version>1.16.1</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-junit5-plugin</artifactId>
+                        <version>1.2.1</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <targetClasses>
+                        <param>com.cajunsystems.gumbo.persistence.*</param>
+                        <param>com.cajunsystems.gumbo.service.*</param>
+                    </targetClasses>
+                    <targetTests>
+                        <param>com.cajunsystems.gumbo.*</param>
+                    </targetTests>
+                    <excludedClasses>
+                        <!-- Needs a live FDB cluster; its tests skip, so every mutant survives. -->
+                        <param>com.cajunsystems.gumbo.persistence.FoundationDBPersistenceAdapter*</param>
+                    </excludedClasses>
+                    <outputFormats>
+                        <param>HTML</param>
+                        <param>XML</param>
+                    </outputFormats>
+                    <timestampedReports>false</timestampedReports>
+                    <threads>4</threads>
+                    <!--
+                        Ratchet, not a target. Set just under the measured score so the
+                        number cannot drift down unnoticed; raise it when it goes up.
+                        Baseline at introduction: 75% mutation, 81% test strength.
+                    -->
+                    <mutationThreshold>74</mutationThreshold>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
