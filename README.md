@@ -1093,6 +1093,9 @@ Test reports are uploaded as workflow artifacts.
 
 ## Further reading
 
+- [Failure semantics](docs/FAILURE_SEMANTICS.md) — what each mutating operation leaves behind when it fails
+- [Open work](docs/OPEN-WORK.md) — the remaining backlog, with evidence
+
 - **[Boki Comparison](docs/BOKI_COMPARISON.md)** — How Gumbo relates to and differs from Boki
 - [Boki paper — SOSP 2021](https://www.cs.utexas.edu/~witchel/pubs/jia21sosp-boki.pdf)
 - [Boki source code](https://github.com/ut-osa/boki)
