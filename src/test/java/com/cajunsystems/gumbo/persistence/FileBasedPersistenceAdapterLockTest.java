@@ -87,6 +87,59 @@ class FileBasedPersistenceAdapterLockTest {
         retry.close();
     }
 
+    /**
+     * A failure part-way through {@code open()} must close the channels already opened,
+     * not only release the lock. The three write channels are opened one at a time, and
+     * with {@code open} still false a later {@code close()} returns before reaching them
+     * — so anything left behind leaks a descriptor per attempt, invisibly.
+     */
+    @Test
+    void aFailedOpenLeaksNoDescriptors() throws IOException {
+        // index.dat as a directory: log.dat's channel is already open when this fails.
+        Files.createDirectories(tempDir.resolve("index.dat"));
+
+        long before = openDescriptors();
+        for (int i = 0; i < 20; i++) {
+            FileBasedPersistenceAdapter broken = new FileBasedPersistenceAdapter(tempDir);
+            assertThatThrownBy(broken::open).isInstanceOf(IOException.class);
+            broken.close();  // must be a no-op, and must not be what saves us
+        }
+        long after = openDescriptors();
+
+        assertThat(after - before)
+                .as("20 failed opens should leak no descriptors (before=%d after=%d)", before, after)
+                .isLessThanOrEqualTo(2);  // slack for unrelated JVM activity
+    }
+
+    /** Opening an already-open adapter is a programming error, and must not disturb the lock. */
+    @Test
+    void openingAnAlreadyOpenAdapterIsRejectedWithoutLosingTheLock() throws Exception {
+        FileBasedPersistenceAdapter adapter = new FileBasedPersistenceAdapter(tempDir);
+        adapter.open();
+        try {
+            assertThatThrownBy(adapter::open).isInstanceOf(IllegalStateException.class);
+
+            // The original lock is intact: another process still cannot get in...
+            assertThat(runProbe(tempDir)).isEqualTo(LockProbe.LOCKED);
+            // ...and the adapter is still usable.
+            adapter.append(new LogEntry(0, 0, Set.of(TAG), "a".getBytes(), Instant.now()));
+            assertThat(adapter.readAll()).hasSize(1);
+        } finally {
+            adapter.close();
+        }
+        // And close() still hands the directory back, rather than the lock outliving it.
+        assertThat(runProbe(tempDir)).isEqualTo(LockProbe.OPENED);
+    }
+
+    /** Descriptors held by this process, or {@code -1} where the OS does not expose them. */
+    private static long openDescriptors() throws IOException {
+        Path fd = Path.of("/proc/self/fd");
+        if (!Files.isDirectory(fd)) return -1;
+        try (var entries = Files.list(fd)) {
+            return entries.count();
+        }
+    }
+
     /** Runs {@link LockProbe} in a fresh JVM against {@code dir} and returns its exit code. */
     private static int runProbe(Path dir) throws Exception {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java");

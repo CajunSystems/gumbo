@@ -133,11 +133,19 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public void open() throws IOException {
+        if (open) throw new IllegalStateException("Adapter is already open: " + dataDir);
         Files.createDirectories(dataDir);
         acquireDirectoryLock();
         try {
             openLocked();
         } catch (IOException | RuntimeException e) {
+            // Unwind everything, not just the lock. openLocked() assigns the three write
+            // channels one at a time, so a failure part-way through leaves the earlier
+            // ones open — and with `open` still false, close() would return before
+            // reaching them, leaking a descriptor per failed attempt.
+            closeQuietly(logChannel);   logChannel   = null;
+            closeQuietly(indexChannel); indexChannel = null;
+            closeQuietly(kvChannel);    kvChannel    = null;
             releaseDirectoryLock();
             throw e;
         }
@@ -153,24 +161,27 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
      * <em>this</em> JVM does (file locks are held per JVM, not per channel).
      */
     private void acquireDirectoryLock() throws IOException {
-        lockChannel = FileChannel.open(lockFile,
+        // Held in a local until the lock is actually taken. Publishing the channel to the
+        // field first would let a failed acquisition overwrite a channel this adapter is
+        // already holding a lock through, orphaning its descriptor.
+        FileChannel channel = FileChannel.open(lockFile,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        java.nio.channels.FileLock lock;
         try {
-            dirLock = lockChannel.tryLock();
+            lock = channel.tryLock();
         } catch (java.nio.channels.OverlappingFileLockException e) {
-            closeQuietly(lockChannel);
-            lockChannel = null;
+            closeQuietly(channel);
             throw new LogAlreadyOpenException(dataDir, e);
-        } catch (IOException e) {
-            closeQuietly(lockChannel);
-            lockChannel = null;
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(channel);
             throw e;
         }
-        if (dirLock == null) {
-            closeQuietly(lockChannel);
-            lockChannel = null;
+        if (lock == null) {
+            closeQuietly(channel);
             throw new LogAlreadyOpenException(dataDir, null);
         }
+        this.lockChannel = channel;
+        this.dirLock = lock;
     }
 
     private void releaseDirectoryLock() {
