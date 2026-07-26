@@ -481,6 +481,14 @@ public class SharedLogService implements SharedLog {
          *
          * <p>Closing from inside the listener does nothing beyond deactivating: waiting
          * for the pump from the pump would deadlock.
+         *
+         * <p>An interrupt on the <em>calling</em> thread does not cut the wait short.
+         * Shutdown paths frequently run on a thread that is already interrupted, and
+         * {@link Thread#join(long)} throws immediately for such a caller — so honouring
+         * it here would make this method skip both waits and return while the listener
+         * ran on, in precisely the situation where a caller is about to tear down what
+         * the listener is using. The interrupt is deferred instead and restored before
+         * returning, so the caller still observes it.
          */
         @Override
         public void close() {
@@ -488,33 +496,54 @@ public class SharedLogService implements SharedLog {
             Thread t = pump;
             if (t == null || t == Thread.currentThread()) return;
 
-            long half = CLOSE_TIMEOUT_MS / 2;
-            queue.add(POISON);   // wakes take() without touching a running listener
+            boolean interrupted = false;
+            try {
+                long half = CLOSE_TIMEOUT_MS / 2;
+                queue.add(POISON);   // wakes take() without touching a running listener
 
-            if (!awaitPump(t, half)) {
-                // Mid-listener. Interrupt, then wait again — interrupting and returning
-                // immediately would deny an interruptible listener the one chance the
-                // interrupt exists to give it.
-                t.interrupt();
-                if (!awaitPump(t, CLOSE_TIMEOUT_MS - half)) {
-                    LoggerFactory.getLogger(SubscriptionImpl.class)
-                            .warn("Listener for tag={} still running {} ms after close and did"
-                                    + " not respond to interruption; abandoning the wait."
-                                    + " It may still be using resources the caller releases next.",
-                                    tag, CLOSE_TIMEOUT_MS);
+                interrupted = awaitPump(t, half);
+                if (t.isAlive()) {
+                    // Mid-listener. Interrupt, then wait again — interrupting and
+                    // returning immediately would deny an interruptible listener the one
+                    // chance the interrupt exists to give it.
+                    t.interrupt();
+                    interrupted |= awaitPump(t, CLOSE_TIMEOUT_MS - half);
+                    if (t.isAlive()) {
+                        LoggerFactory.getLogger(SubscriptionImpl.class)
+                                .warn("Listener for tag={} still running {} ms after close and did"
+                                        + " not respond to interruption; abandoning the wait."
+                                        + " It may still be using resources the caller releases next.",
+                                        tag, CLOSE_TIMEOUT_MS);
+                    }
                 }
+                queue.clear();
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
             }
-            queue.clear();
         }
 
-        /** Joins {@code t} for {@code ms}; returns whether it actually finished. */
+        /**
+         * Joins {@code t} for up to {@code ms}, without letting an interrupt of the
+         * calling thread end the wait early.
+         *
+         * <p>Returns whether the caller was interrupted while waiting, so {@link #close()}
+         * can restore the flag once it is done rather than dropping it. Whether the
+         * thread finished is read from {@link Thread#isAlive()} by the caller — keeping
+         * the two answers separate is what stops an interrupt being mistaken for
+         * "still running".
+         */
         private static boolean awaitPump(Thread t, long ms) {
-            try {
-                t.join(ms);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
+            boolean interrupted = false;
+            long deadline = System.nanoTime() + ms * 1_000_000L;
+            long remaining;
+            while (t.isAlive() && (remaining = deadline - System.nanoTime()) > 0) {
+                try {
+                    t.join(Math.max(1L, remaining / 1_000_000L));
+                } catch (InterruptedException ie) {
+                    interrupted = true;   // deferred; close() restores it before returning
+                }
             }
-            return !t.isAlive();
+            return interrupted;
         }
 
         @Override
