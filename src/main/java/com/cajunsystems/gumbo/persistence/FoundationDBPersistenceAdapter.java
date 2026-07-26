@@ -7,6 +7,8 @@ import com.apple.foundationdb.Range;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -294,6 +296,106 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         if (!chunk.isEmpty()) {
             commitChunk(chunk);
         }
+    }
+
+    /**
+     * Reads the tag's current version, checks it, and writes — all inside <em>one FDB
+     * transaction</em>. This is the adapter where storage-owned versioning is fully
+     * realised: FDB serialises conflicting transactions, so two processes appending to the
+     * same tag cannot both be assigned the same version, and a conditional append is
+     * rejected by the store rather than by anything a client believes about the store.
+     *
+     * <p>The version is read from the transaction rather than from {@link #tagVersionCount},
+     * which is a local cache and therefore exactly the kind of per-process opinion this is
+     * meant to stop trusting.
+     */
+    @Override
+    public LogEntry append(PendingAppend pending, long expectedVersion) throws IOException {
+        ensureOpen();
+        LogTag primary = pending.primaryTag();
+        byte[] countKey = tagCountSubspace.pack(Tuple.from(primary.namespace(), primary.key()));
+        try {
+            LogEntry entry = db.run(tr -> {
+                byte[] raw = tr.get(countKey).join();
+                long next = raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
+                if (expectedVersion != ANY_VERSION && expectedVersion != next) {
+                    throw new ConflictSignal(new VersionConflictException(primary, expectedVersion, next));
+                }
+                LogEntry e = pending.withVersion(next);
+                writeEntry(tr, e);
+                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)),
+                       longBytes(Math.max(latestSeqnum, e.seqnum())));
+                return e;
+            });
+            cacheAfterCommit(entry);
+            return entry;
+        } catch (ConflictSignal cs) {
+            throw cs.conflict;
+        } catch (Exception e) {
+            throw new IOException("FDB append failed for tag=" + primary, e);
+        }
+    }
+
+    @Override
+    public List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        ensureOpen();
+        try {
+            List<LogEntry> entries = db.run(tr -> {
+                java.util.Map<LogTag, Long> next = new java.util.HashMap<>();
+                List<LogEntry> out = new ArrayList<>(pendings.size());
+                long maxSeqnum = latestSeqnum;
+                for (PendingAppend p : pendings) {
+                    LogTag primary = p.primaryTag();
+                    long v = next.computeIfAbsent(primary, t -> {
+                        byte[] raw = tr.get(tagCountSubspace.pack(
+                                Tuple.from(t.namespace(), t.key()))).join();
+                        return raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
+                    });
+                    next.put(primary, v + 1);
+                    LogEntry e = p.withVersion(v);
+                    writeEntry(tr, e);
+                    out.add(e);
+                    if (e.seqnum() > maxSeqnum) maxSeqnum = e.seqnum();
+                }
+                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)), longBytes(maxSeqnum));
+                return out;
+            });
+            for (LogEntry e : entries) cacheAfterCommit(e);
+            return entries;
+        } catch (Exception e) {
+            throw new IOException("FDB batch append failed", e);
+        }
+    }
+
+    /** Writes one entry's log record, tag index, per-tag count and per-tag latest seqnum. */
+    private void writeEntry(com.apple.foundationdb.Transaction tr, LogEntry entry) {
+        tr.set(logSubspace.pack(Tuple.from(entry.seqnum())), encodeEntry(entry));
+        for (LogTag tag : entry.tags()) {
+            tr.set(tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
+                   longBytes(entry.streamVersion()));
+            tr.set(tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
+                   longBytes(entry.streamVersion() + 1));
+            tr.set(tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
+                   longBytes(entry.seqnum()));
+        }
+    }
+
+    /** Refreshes the local caches once a commit is durable. */
+    private void cacheAfterCommit(LogEntry entry) {
+        if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
+        for (LogTag tag : entry.tags()) {
+            tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0))
+                    .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
+            tagLatestSeqnum.computeIfAbsent(tag, k -> new AtomicLong(-1L))
+                    .updateAndGet(c -> Math.max(c, entry.seqnum()));
+        }
+    }
+
+    /** Carries a conflict out of the FDB retry loop, which only propagates RuntimeExceptions. */
+    private static final class ConflictSignal extends RuntimeException {
+        final VersionConflictException conflict;
+        ConflictSignal(VersionConflictException conflict) { super(conflict); this.conflict = conflict; }
     }
 
     private void commitChunk(List<LogEntry> entries) throws IOException {

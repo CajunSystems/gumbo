@@ -212,6 +212,39 @@ long tip = orders.getLatestVersion();   // -1 when the tag is empty
 
 Both forms exist on `SharedLog`, `LogView` and `TypedLogView`.
 
+### Conditional append
+
+A version is also a fence. `append(request, expectedVersion)` writes only if the primary tag
+is still where the writer last saw it:
+
+```java
+List<LogEntry> history = log.readAll(tag).join();
+long at = history.isEmpty() ? 0 : history.getLast().streamVersion() + 1;
+
+log.append(AppendRequest.to(tag, decide(fold(history))), at).join();
+// VersionConflictException if anyone appended in between
+```
+
+The check happens **in storage**, in the same operation as the write. That matters because a
+lock service can tell a node it *holds* a lock but never that it still holds it at the instant
+the write lands — a pause between those two moments is enough for two writers to both believe
+they own the stream. Conditioning on the version closes that gap: the loser is rejected by the
+store rather than by a coordination layer that may itself be stale.
+
+The version is assigned by the adapter, never by the caller — a caller-side counter is seeded
+once and then drifts from every other writer's copy with nothing to reconcile them.
+
+Two limits worth knowing:
+
+- **The condition applies to the primary tag only.** That is the shape real callers have — one
+  entity stream that needs fencing, one fan-out tag that does not — and conditioning on every
+  tag would fail appends for reasons unrelated to the entity being written.
+- **Not every adapter can fence.** It needs an atomic compare-and-increment in the same store.
+  FoundationDB does it in one transaction, so it holds across processes. The file and
+  in-memory adapters do it under their own lock, which is atomic within the single-writer
+  configuration they support. An adapter that cannot throws `UnsupportedOperationException`
+  rather than writing unconditionally.
+
 > **One caveat.** An entry carries a single `streamVersion`, taken from its *primary* tag, so a
 > tag that appears only as a secondary tag on an atomic multi-tag append inherits the
 > other stream's numbering rather than counting its own. Version-keyed reads are meant for

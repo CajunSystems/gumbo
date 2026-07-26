@@ -1,6 +1,8 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -148,6 +150,63 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         } finally {
             flushLock.unlock();
         }
+    }
+
+    /**
+     * Assigns the version at append time rather than at flush time, because the caller
+     * needs it in the {@code AppendResult} now — the batching here defers durability, not
+     * identity.
+     *
+     * <p>The tag's next version is the delegate's, advanced past anything still pending
+     * for that tag. Held under the flush lock so a concurrent flush cannot land between
+     * counting the pending entries and adding this one.
+     */
+    @Override
+    public LogEntry append(PendingAppend pending, long expectedVersion) throws IOException {
+        flushLock.lock();
+        try {
+            LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
+            pendingBatch.add(entry);
+            if (pendingBatch.size() >= maxBatchSize) flushUnderLock();
+            return entry;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    @Override
+    public List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        flushLock.lock();
+        try {
+            List<LogEntry> entries = new ArrayList<>(pendings.size());
+            for (PendingAppend p : pendings) {
+                LogEntry e = p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION));
+                entries.add(e);
+                pendingBatch.add(e);
+            }
+            if (pendingBatch.size() >= maxBatchSize) flushUnderLock();
+            return entries;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    /** Next version for {@code tag}: the delegate's, plus anything pending for it. */
+    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
+        long next = getNextStreamVersionUnderLock(tag);
+        if (expectedVersion != ANY_VERSION && expectedVersion != next) {
+            throw new VersionConflictException(tag, expectedVersion, next);
+        }
+        return next;
+    }
+
+    private long getNextStreamVersionUnderLock(LogTag tag) {
+        long next = delegate.getNextStreamVersion(tag);
+        for (LogEntry e : pendingBatch) {
+            if (e.tags().contains(tag)) next = Math.max(next, e.streamVersion() + 1);
+        }
+        return next;
     }
 
     /**

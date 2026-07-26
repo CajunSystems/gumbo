@@ -46,6 +46,40 @@ public interface SharedLog extends AutoCloseable {
     CompletableFuture<AppendResult> append(AppendRequest request);
 
     /**
+     * Appends only if the primary tag is still at {@code expectedVersion}, failing with
+     * {@link com.cajunsystems.gumbo.core.VersionConflictException} otherwise.
+     *
+     * <p>This is optimistic concurrency on a stream, and the fence is in storage rather
+     * than in whatever decided this writer should be the one writing. A lock service can
+     * say a node <em>holds</em> a lock; it cannot say the node still holds it at the
+     * instant the write lands, and a pause between those two moments is enough for two
+     * writers to both believe they own the stream. Conditioning the write on the version
+     * this writer last saw removes that gap: the loser is rejected by the store.
+     *
+     * <pre>{@code
+     * List<LogEntry> history = log.readAll(tag).join();
+     * long at = history.isEmpty() ? 0 : history.getLast().streamVersion() + 1;
+     * State state = fold(history);
+     * log.append(AppendRequest.to(tag, decide(state)), at).join();   // rejected if overtaken
+     * }</pre>
+     *
+     * <p>For a multi-tag append the condition applies to the <strong>primary tag only</strong>.
+     * That is the shape real callers have — one entity stream that needs fencing, one
+     * fan-out tag that does not — and conditioning on every tag would make an append fail
+     * for reasons unrelated to the entity being written.
+     *
+     * <p>Not every adapter can do this: it requires comparing and incrementing the version
+     * in one atomic storage operation. An adapter that cannot throws
+     * {@link UnsupportedOperationException} rather than writing unconditionally, since a
+     * log that looked like it was fencing while doing nothing of the sort would surface as
+     * corruption rather than as an error.
+     *
+     * @param request         the payload and target tags
+     * @param expectedVersion the version the primary tag must still be at
+     */
+    CompletableFuture<AppendResult> append(AppendRequest request, long expectedVersion);
+
+    /**
      * Appends multiple entries to the log, claiming all seqnums in a single
      * sequencer operation where supported.  Results are returned in the same
      * order as the input list.

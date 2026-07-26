@@ -1,6 +1,8 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -302,6 +304,52 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     private void syncChannels() throws IOException {
         logChannel.force(false);
         indexChannel.force(false);
+    }
+
+    /**
+     * Assigns the version from this adapter's own durable state and writes, both under one
+     * lock — so the version comes from the log rather than from a caller's counter, and
+     * the compare and increment of a conditional append cannot be split.
+     *
+     * <p>Within this process that makes the pair atomic. Across processes it is the
+     * directory lock taken in {@link #open()} that holds the line: this adapter is
+     * single-writer, and a second one is refused rather than allowed to race here.
+     */
+    @Override
+    public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
+            throws IOException {
+        LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
+        writeNoSync(entry);
+        syncChannels();
+        return entry;
+    }
+
+    @Override
+    public synchronized List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        List<LogEntry> entries = new ArrayList<>(pendings.size());
+        for (PendingAppend p : pendings) {
+            entries.add(p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION)));
+        }
+        for (LogEntry e : entries) writeNoSync(e);
+        syncChannels();   // one fdatasync for the batch, as before
+        return entries;
+    }
+
+    /**
+     * Reserves the tag's next version, enforcing {@code expectedVersion} if given.
+     *
+     * <p>Reads from {@code tagVersionCount}, which is rebuilt from the log on open, so a
+     * restart continues the sequence rather than restarting it.
+     */
+    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
+        AtomicLong counter = tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0));
+        long next = counter.get();
+        if (expectedVersion != ANY_VERSION && expectedVersion != next) {
+            throw new VersionConflictException(tag, expectedVersion, next);
+        }
+        counter.set(next + 1);
+        return next;
     }
 
     // -------------------------------------------------------------------------
