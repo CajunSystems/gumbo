@@ -1,0 +1,20 @@
+version: 2
+
+updates:
+  # Pinning workflow actions to commit SHAs is the right thing — a mutable `v4` tag can be
+  # repointed upstream and change what CI executes with no change here. But pinning without
+  # automation is its own hazard: a pinned SHA stops receiving security fixes, silently,
+  # and the pin ages into a liability. This keeps the pins current so the trade is one-way.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps

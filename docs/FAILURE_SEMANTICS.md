@@ -96,7 +96,8 @@ after something has already gone wrong:
   still passing. Trim is the one operation that destroys data.
 
 The first and third are now covered by `RecoveryAndTrimTest`. The rest stand as the
-backlog, and the mutation threshold in `pom.xml` stops the number going backwards.
+backlog, and the mutation threshold in `pom.xml` stops the number going backwards: it is
+set to the measured score, not below it, so a decline fails the build.
 
 Two classes of mutant here are **not** worth killing with unit tests, and are recorded so
 nobody wastes effort on them:
