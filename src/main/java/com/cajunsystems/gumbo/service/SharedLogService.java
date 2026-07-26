@@ -26,7 +26,10 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The primary {@link SharedLog} implementation.
@@ -36,8 +39,9 @@ import java.util.function.Consumer;
  *   <li>A single {@link ReentrantLock} serialises appends so that seqnum
  *       assignment and persistence are an atomic unit.</li>
  *   <li>Reads are lock-free; they query the persistence adapter directly.</li>
- *   <li>Subscriber notifications run on virtual threads (one per delivery) so
- *       slow listeners never block other appends or each other.</li>
+ *   <li>Each subscription owns one virtual thread that delivers its entries in
+ *       seqnum order, so a slow listener blocks neither appends nor other
+ *       subscribers — and never runs concurrently with itself.</li>
  * </ul>
  *
  * <h2>Lifecycle</h2>
@@ -145,7 +149,7 @@ public class SharedLogService implements SharedLog {
             // Single persistence call — 1 FDB transaction for entire batch when using FDB adapter
             adapter.appendBatch(entries);
 
-            // Notify subscribers for each entry
+            // Queue for delivery; each subscription drains its own queue.
             for (LogEntry entry : entries) notifySubscribers(entry);
 
             return List.copyOf(results);
@@ -169,7 +173,7 @@ public class SharedLogService implements SharedLog {
             LogEntry entry = new LogEntry(seqnum, localId, tags, request.dataUnsafe(), now);
             adapter.append(entry);
 
-            // Deliver to subscribers (each on its own virtual thread)
+            // Queue for delivery; each subscription drains its own queue.
             notifySubscribers(entry);
 
             return new AppendResult(seqnum, localId, primaryTag, now);
@@ -239,21 +243,21 @@ public class SharedLogService implements SharedLog {
     @Override
     public Subscription subscribe(LogTag tag, LogPosition from, Consumer<LogEntry> listener) {
         ensureNotClosed();
-        SubscriptionImpl sub = new SubscriptionImpl(tag, listener);
+        SubscriptionImpl sub = new SubscriptionImpl(tag, listener, from.seqnum());
+
+        // Registered before the backlog is read, so anything appended from here on is
+        // queued rather than missed. The pump below decides what to skip.
         subscriptions.computeIfAbsent(tag, k -> new CopyOnWriteArrayList<>()).add(sub);
 
-        // Deliver backlog of existing entries on a virtual thread so subscribe() returns fast
-        Thread.ofVirtual().name("sharedlog-backlog-" + tag).start(() -> {
-            if (!sub.isActive()) return;
+        // One virtual thread per subscription: it reads the backlog, delivers it, then
+        // drains the queue for as long as the subscription lives. subscribe() returns
+        // without waiting for any of it.
+        sub.start(() -> {
             try {
-                List<LogEntry> backlog = adapter.readByTag(tag, from.seqnum());
-                for (LogEntry e : backlog) {
-                    if (!sub.isActive()) return;
-                    sub.deliver(e);
-                }
-                sub.markBacklogDone();
+                return adapter.readByTag(tag, from.seqnum());
             } catch (IOException ex) {
-                logger.warn("Error delivering backlog for tag={}: {}", tag, ex.getMessage());
+                logger.warn("Error reading backlog for tag={}: {}", tag, ex.getMessage());
+                return List.of();
             }
         });
 
@@ -325,16 +329,23 @@ public class SharedLogService implements SharedLog {
                 .getAndIncrement();
     }
 
+    /**
+     * Hands {@code entry} to every live subscription on its tags.
+     *
+     * <p>Only enqueues — it never delivers, and never decides whether a subscriber is
+     * "ready". Both were the bug: a subscriber still working through its backlog was
+     * skipped here, and the backlog read had already happened, so the entry reached it
+     * by neither route and was silently lost.
+     *
+     * <p>Called under the append write lock, so entries enter each queue in seqnum
+     * order, and the enqueue never blocks.
+     */
     private void notifySubscribers(LogEntry entry) {
         for (LogTag tag : entry.tags()) {
             CopyOnWriteArrayList<SubscriptionImpl> subs = subscriptions.get(tag);
             if (subs == null || subs.isEmpty()) continue;
             for (SubscriptionImpl sub : subs) {
-                if (sub.isActive() && sub.isBacklogDone()) {
-                    Thread.ofVirtual()
-                            .name("sharedlog-notify-" + tag + "-" + entry.seqnum())
-                            .start(() -> sub.deliver(entry));
-                }
+                sub.enqueue(entry);
             }
         }
     }
@@ -347,33 +358,150 @@ public class SharedLogService implements SharedLog {
     // Subscription implementation
     // -------------------------------------------------------------------------
 
+    /**
+     * A subscription and its single delivery thread.
+     *
+     * <p>Everything the listener ever sees goes through one queue drained by one virtual
+     * thread: the backlog first, then live entries. That gives three properties the
+     * previous design could not.
+     *
+     * <p><strong>Nothing is lost at the handover.</strong> Live entries are queued from
+     * the moment the subscription is registered, which is before the backlog is read, so
+     * an entry appended while the backlog is still being delivered waits its turn instead
+     * of being dropped by a not-yet-ready check.
+     *
+     * <p><strong>Delivery is ordered.</strong> Appends enqueue under the write lock, so
+     * the queue is in seqnum order and one draining thread keeps it that way. Spawning a
+     * thread per entry left ordering to the scheduler.
+     *
+     * <p><strong>The listener is never called concurrently with itself</strong>, so it
+     * needs no synchronisation of its own. It still runs on a virtual thread and may
+     * block freely; a slow listener now delays its own subscription rather than
+     * consuming a thread per pending entry.
+     */
     private static final class SubscriptionImpl implements Subscription {
+
+        /** How long {@link #close()} waits for an in-flight listener call to return. */
+        private static final long CLOSE_TIMEOUT_MS = 5_000;
+
+        /**
+         * Queued by {@link #close()} to wake a pump blocked on {@code take()}.
+         *
+         * <p>An interrupt would do it too, but only by landing wherever the pump happens
+         * to be — including inside {@code listener.accept}, where it aborts whatever the
+         * listener was waiting on. Matched by identity, so no real entry can collide.
+         */
+        private static final LogEntry POISON = new LogEntry(
+                0, 0, Set.of(LogTag.of("gumbo", "close")), new byte[0], Instant.EPOCH);
+
         private final LogTag tag;
         private final Consumer<LogEntry> listener;
-        private volatile boolean active = true;
-        private volatile boolean backlogDone = false;
+        private final BlockingQueue<LogEntry> queue = new LinkedBlockingQueue<>();
 
-        SubscriptionImpl(LogTag tag, Consumer<LogEntry> listener) {
+        /** Highest seqnum handed to the listener; guards against redelivering the backlog. */
+        private long lastDelivered;
+
+        private volatile boolean active = true;
+        private volatile Thread pump;
+
+        SubscriptionImpl(LogTag tag, Consumer<LogEntry> listener, long fromSeqnum) {
             this.tag = tag;
             this.listener = listener;
+            this.lastDelivered = fromSeqnum - 1;
         }
 
-        void deliver(LogEntry entry) {
-            if (active) {
+        /** Queues an entry for delivery. Non-blocking; safe to call under the write lock. */
+        void enqueue(LogEntry entry) {
+            if (active) queue.add(entry);
+        }
+
+        /** Starts the delivery thread: {@code backlog} is read on it, then the queue is drained. */
+        void start(Supplier<List<LogEntry>> backlog) {
+            pump = Thread.ofVirtual().name("sharedlog-deliver-" + tag).start(() -> {
                 try {
-                    listener.accept(entry);
-                } catch (Exception e) {
-                    LoggerFactory.getLogger(SubscriptionImpl.class)
-                            .warn("Listener threw for tag={}: {}", tag, e.getMessage(), e);
+                    for (LogEntry e : backlog.get()) {
+                        if (!active) return;
+                        deliver(e);
+                    }
+                    while (active) {
+                        LogEntry e;
+                        try {
+                            e = queue.take();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        if (e == POISON) return;
+                        // An entry appended between registration and the backlog read is
+                        // in both, so the seqnum decides. Without this the fix for losing
+                        // entries would trade it for delivering them twice.
+                        if (e.seqnum() > lastDelivered) deliver(e);
+                    }
+                } finally {
+                    // However this thread ends, the subscription is over. Without this a
+                    // pump killed by an unexpected throwable would leave isActive()
+                    // reporting true while entries piled up in a queue nobody drains —
+                    // the same silent loss this class exists to remove, one level up.
+                    active = false;
+                    queue.clear();
                 }
+            });
+        }
+
+        private void deliver(LogEntry entry) {
+            lastDelivered = entry.seqnum();
+            // Re-checked here, not only at the top of the loop: close() can land while
+            // this entry is being dequeued, and a listener must not be called after the
+            // caller has torn down whatever it closes over.
+            if (!active) return;
+            try {
+                listener.accept(entry);
+            } catch (Throwable t) {
+                // Throwable, not Exception. One thread now serves the whole subscription,
+                // so an Error escaping a listener would kill delivery for every later
+                // entry — where the previous thread-per-entry design lost only its own.
+                // A broken listener must not become a broken subscription.
+                LoggerFactory.getLogger(SubscriptionImpl.class)
+                        .warn("Listener threw for tag={} seqnum={}: {}",
+                                tag, entry.seqnum(), t.toString(), t);
             }
         }
 
-        void markBacklogDone() { backlogDone = true; }
-        boolean isBacklogDone() { return backlogDone; }
-
+        /**
+         * Stops delivery, and does not return until it has actually stopped.
+         *
+         * <p>Waits for an in-flight {@code listener.accept} to return, so once this
+         * returns the listener is not running and will not run again — callers routinely
+         * release resources the listener closes over on the next line.
+         *
+         * <p>The pump is woken with a queued sentinel rather than an interrupt, so a
+         * listener mid-call is left alone to finish. Only if it has not finished within
+         * {@link #CLOSE_TIMEOUT_MS} is it interrupted, and the wait then gives up with a
+         * warning rather than leaving an unclosable subscription.
+         *
+         * <p>Closing from inside the listener does nothing beyond deactivating: waiting
+         * for the pump from the pump would deadlock.
+         */
         @Override
-        public void close() { active = false; }
+        public void close() {
+            active = false;
+            Thread t = pump;
+            if (t == null || t == Thread.currentThread()) return;
+
+            queue.add(POISON);   // wakes take() without touching a running listener
+            try {
+                t.join(CLOSE_TIMEOUT_MS);
+                if (t.isAlive()) {
+                    LoggerFactory.getLogger(SubscriptionImpl.class)
+                            .warn("Listener for tag={} still running {} ms after close;"
+                                    + " interrupting and abandoning the wait", tag, CLOSE_TIMEOUT_MS);
+                    t.interrupt();
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            queue.clear();
+        }
 
         @Override
         public boolean isActive() { return active; }
