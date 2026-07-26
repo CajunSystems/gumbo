@@ -15,6 +15,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -194,6 +195,106 @@ class SubscriptionDeliveryTest {
                .atMost(2, TimeUnit.SECONDS)
                .until(() -> received.size() == 1);
         assertThat(received).containsExactly("before-close");
+    }
+
+    /**
+     * A listener that throws must not take the subscription down with it.
+     *
+     * <p>{@code Error} matters more than it looks here. One thread now serves the whole
+     * subscription, so an {@code Error} escaping the listener would kill delivery for
+     * every later entry — where the previous thread-per-entry design lost only its own.
+     * And it would fail quietly: {@code isActive()} would keep reporting true while
+     * entries piled up in a queue nobody drains.
+     */
+    @Test
+    void aListenerThrowingAnErrorDoesNotStopTheSubscription() {
+        List<String> received = new CopyOnWriteArrayList<>();
+        SharedLog.Subscription sub = service.subscribe(ORDERS, LogPosition.BEGINNING, e -> {
+            String data = new String(e.data());
+            received.add(data);
+            if (data.equals("boom")) throw new AssertionError("listener blew up");
+        });
+        try {
+            append("first");
+            append("boom");
+            append("third");
+            append("fourth");
+
+            await().atMost(10, TimeUnit.SECONDS).until(() -> received.size() == 4);
+            assertThat(received).containsExactly("first", "boom", "third", "fourth");
+            assertThat(sub.isActive()).isTrue();
+        } finally {
+            sub.close();
+        }
+    }
+
+    /**
+     * Once {@code close()} returns, the listener is not running and will not run again.
+     * Callers release what the listener closes over on the very next line, so a delivery
+     * still in flight — or one already dequeued — is a use-after-free waiting to happen.
+     */
+    @Test
+    void closeWaitsForAnInFlightDeliveryAndDeliversNothingAfter() throws Exception {
+        List<String> received = new CopyOnWriteArrayList<>();
+        CountDownLatch inListener = new CountDownLatch(1);
+        CountDownLatch releaseListener = new CountDownLatch(1);
+        AtomicInteger completedCalls = new AtomicInteger();
+
+        SharedLog.Subscription sub = service.subscribe(ORDERS, LogPosition.BEGINNING, e -> {
+            received.add(new String(e.data()));
+            inListener.countDown();
+            awaitQuietly(releaseListener);
+            completedCalls.incrementAndGet();
+        });
+
+        append("in-flight");
+        assertThat(inListener.await(5, TimeUnit.SECONDS)).isTrue();
+        append("queued-behind-it");     // waiting in the queue while the listener blocks
+
+        Thread closer = Thread.ofVirtual().start(sub::close);
+        Thread.sleep(200);
+        assertThat(closer.isAlive())
+                .as("close() must wait for the in-flight listener call, not race past it")
+                .isTrue();
+
+        releaseListener.countDown();
+        closer.join(10_000);
+        assertThat(closer.isAlive()).isFalse();
+
+        // close() returned only after the in-flight call finished, and the entry queued
+        // behind it was never delivered.
+        assertThat(completedCalls.get()).isEqualTo(1);
+        assertThat(received).containsExactly("in-flight");
+
+        append("after-close");
+        Thread.sleep(300);
+        assertThat(received).containsExactly("in-flight");
+    }
+
+    /** Closing from inside the listener must not wait for the thread doing the closing. */
+    @Test
+    void aListenerMayCloseItsOwnSubscriptionWithoutDeadlocking() {
+        List<String> received = new CopyOnWriteArrayList<>();
+        AtomicReference<SharedLog.Subscription> self = new AtomicReference<>();
+
+        SharedLog.Subscription sub = service.subscribe(ORDERS, LogPosition.BEGINNING, e -> {
+            received.add(new String(e.data()));
+            self.get().close();          // unsubscribe on first entry
+        });
+        self.set(sub);
+        try {
+            append("first");
+            await().atMost(5, TimeUnit.SECONDS).until(() -> received.size() == 1);
+            await().atMost(5, TimeUnit.SECONDS).until(() -> !sub.isActive());
+
+            append("second");
+            Thread.sleep(300);
+            assertThat(received).containsExactly("first");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            sub.close();
+        }
     }
 
     // -------------------------------------------------------------------------

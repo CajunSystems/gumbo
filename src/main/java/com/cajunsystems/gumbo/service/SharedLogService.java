@@ -368,6 +368,20 @@ public class SharedLogService implements SharedLog {
      * consuming a thread per pending entry.
      */
     private static final class SubscriptionImpl implements Subscription {
+
+        /** How long {@link #close()} waits for an in-flight listener call to return. */
+        private static final long CLOSE_TIMEOUT_MS = 5_000;
+
+        /**
+         * Queued by {@link #close()} to wake a pump blocked on {@code take()}.
+         *
+         * <p>An interrupt would do it too, but only by landing wherever the pump happens
+         * to be — including inside {@code listener.accept}, where it aborts whatever the
+         * listener was waiting on. Matched by identity, so no real entry can collide.
+         */
+        private static final LogEntry POISON = new LogEntry(
+                0, 0, Set.of(LogTag.of("gumbo", "close")), new byte[0], Instant.EPOCH);
+
         private final LogTag tag;
         private final Consumer<LogEntry> listener;
         private final BlockingQueue<LogEntry> queue = new LinkedBlockingQueue<>();
@@ -392,41 +406,89 @@ public class SharedLogService implements SharedLog {
         /** Starts the delivery thread: {@code backlog} is read on it, then the queue is drained. */
         void start(Supplier<List<LogEntry>> backlog) {
             pump = Thread.ofVirtual().name("sharedlog-deliver-" + tag).start(() -> {
-                for (LogEntry e : backlog.get()) {
-                    if (!active) return;
-                    deliver(e);
-                }
-                while (active) {
-                    LogEntry e;
-                    try {
-                        e = queue.take();
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        return;
+                try {
+                    for (LogEntry e : backlog.get()) {
+                        if (!active) return;
+                        deliver(e);
                     }
-                    // An entry appended between registration and the backlog read is in
-                    // both, so the seqnum decides. Without this the fix for losing
-                    // entries would trade it for delivering them twice.
-                    if (e.seqnum() > lastDelivered) deliver(e);
+                    while (active) {
+                        LogEntry e;
+                        try {
+                            e = queue.take();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        if (e == POISON) return;
+                        // An entry appended between registration and the backlog read is
+                        // in both, so the seqnum decides. Without this the fix for losing
+                        // entries would trade it for delivering them twice.
+                        if (e.seqnum() > lastDelivered) deliver(e);
+                    }
+                } finally {
+                    // However this thread ends, the subscription is over. Without this a
+                    // pump killed by an unexpected throwable would leave isActive()
+                    // reporting true while entries piled up in a queue nobody drains —
+                    // the same silent loss this class exists to remove, one level up.
+                    active = false;
+                    queue.clear();
                 }
             });
         }
 
         private void deliver(LogEntry entry) {
             lastDelivered = entry.seqnum();
+            // Re-checked here, not only at the top of the loop: close() can land while
+            // this entry is being dequeued, and a listener must not be called after the
+            // caller has torn down whatever it closes over.
+            if (!active) return;
             try {
                 listener.accept(entry);
-            } catch (Exception e) {
+            } catch (Throwable t) {
+                // Throwable, not Exception. One thread now serves the whole subscription,
+                // so an Error escaping a listener would kill delivery for every later
+                // entry — where the previous thread-per-entry design lost only its own.
+                // A broken listener must not become a broken subscription.
                 LoggerFactory.getLogger(SubscriptionImpl.class)
-                        .warn("Listener threw for tag={}: {}", tag, e.getMessage(), e);
+                        .warn("Listener threw for tag={} seqnum={}: {}",
+                                tag, entry.seqnum(), t.toString(), t);
             }
         }
 
+        /**
+         * Stops delivery, and does not return until it has actually stopped.
+         *
+         * <p>Waits for an in-flight {@code listener.accept} to return, so once this
+         * returns the listener is not running and will not run again — callers routinely
+         * release resources the listener closes over on the next line.
+         *
+         * <p>The pump is woken with a queued sentinel rather than an interrupt, so a
+         * listener mid-call is left alone to finish. Only if it has not finished within
+         * {@link #CLOSE_TIMEOUT_MS} is it interrupted, and the wait then gives up with a
+         * warning rather than leaving an unclosable subscription.
+         *
+         * <p>Closing from inside the listener does nothing beyond deactivating: waiting
+         * for the pump from the pump would deadlock.
+         */
         @Override
         public void close() {
             active = false;
             Thread t = pump;
-            if (t != null) t.interrupt();   // unblock queue.take()
+            if (t == null || t == Thread.currentThread()) return;
+
+            queue.add(POISON);   // wakes take() without touching a running listener
+            try {
+                t.join(CLOSE_TIMEOUT_MS);
+                if (t.isAlive()) {
+                    LoggerFactory.getLogger(SubscriptionImpl.class)
+                            .warn("Listener for tag={} still running {} ms after close;"
+                                    + " interrupting and abandoning the wait", tag, CLOSE_TIMEOUT_MS);
+                    t.interrupt();
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            queue.clear();
         }
 
         @Override
