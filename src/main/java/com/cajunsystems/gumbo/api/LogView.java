@@ -4,6 +4,7 @@ import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.StreamVersions;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -90,7 +91,7 @@ public interface LogView {
      * whole stream.
      */
     default CompletableFuture<List<LogEntry>> readAfterVersion(long afterVersion) {
-        return readFromVersion(afterVersion < 0 ? 0L : afterVersion + 1);
+        return readFromVersion(StreamVersions.afterToInclusive(afterVersion));
     }
 
     /** Returns the latest seqnum visible in this view, or {@code -1} if empty. */
