@@ -248,8 +248,9 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public void append(LogEntry entry) throws IOException {
-        writeNoSync(entry);
+        long offset = writeNoSync(entry);
         syncChannels();
+        publish(entry, offset);
     }
 
     /**
@@ -259,15 +260,21 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public void appendBatch(List<LogEntry> entries) throws IOException {
-        for (LogEntry entry : entries) {
-            writeNoSync(entry);
+        long[] offsets = new long[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            offsets[i] = writeNoSync(entries.get(i));
         }
         syncChannels();
+        for (int i = 0; i < entries.size(); i++) {
+            publish(entries.get(i), offsets[i]);
+        }
     }
 
-    // Writes bytes to both channels and updates in-memory indices without
-    // calling force() — the caller is responsible for the fdatasync.
-    private void writeNoSync(LogEntry entry) throws IOException {
+    /**
+     * Writes an entry's bytes to both channels and returns its offset. Does <em>not</em>
+     * fsync, and does <em>not</em> make the entry visible — see {@link #publish}.
+     */
+    private long writeNoSync(LogEntry entry) throws IOException {
         ensureOpen();
         byte[] encoded = encode(entry);
 
@@ -288,7 +295,20 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
             indexChannel.write(idxBuf);
         }
 
-        // Update in-memory indices immediately so concurrent reads see the entry
+        return offset;
+    }
+
+    /**
+     * Makes a written entry visible, after its bytes are durable.
+     *
+     * <p>Deliberately separate from {@link #writeNoSync}. Publishing at write time made
+     * {@link #getLatestSeqnum()} report entries whose fsync had not yet succeeded — and
+     * that value is what a caller uses to work out how much of a failed batch actually
+     * landed. A failed sync would therefore look like a successful write, and the entries
+     * would be dropped from the retry that was their last chance. Visibility now follows
+     * durability rather than preceding it.
+     */
+    private void publish(LogEntry entry, long offset) {
         globalIndex.put(entry.seqnum(), offset);
         for (LogTag tag : entry.tags()) {
             tagSeqnums
@@ -300,8 +320,14 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         }
     }
 
-    // fdatasync on both WAL files; metadata update not required.
-    private void syncChannels() throws IOException {
+    /**
+     * fdatasync on both WAL files; metadata update not required.
+     *
+     * <p>Package-private rather than private so a test can make it fail. A sync failure is
+     * the one durability boundary that cannot be provoked from outside this class, and it
+     * is precisely where visibility and durability can diverge.
+     */
+    void syncChannels() throws IOException {
         logChannel.force(false);
         indexChannel.force(false);
     }
@@ -319,8 +345,9 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
             throws IOException {
         LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
-        writeNoSync(entry);
+        long offset = writeNoSync(entry);
         syncChannels();
+        publish(entry, offset);
         return entry;
     }
 
@@ -331,8 +358,10 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         for (PendingAppend p : pendings) {
             entries.add(p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION)));
         }
-        for (LogEntry e : entries) writeNoSync(e);
+        long[] offsets = new long[entries.size()];
+        for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
         syncChannels();   // one fdatasync for the batch, as before
+        for (int i = 0; i < entries.size(); i++) publish(entries.get(i), offsets[i]);
         return entries;
     }
 

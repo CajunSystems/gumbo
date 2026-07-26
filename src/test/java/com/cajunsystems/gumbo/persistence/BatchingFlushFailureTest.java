@@ -187,6 +187,60 @@ class BatchingFlushFailureTest {
         @Override public long getNextStreamVersion(LogTag t) { return inner.getNextStreamVersion(t); }
     }
 
+    /**
+     * A batch whose bytes are written but whose fsync fails must stay pending.
+     *
+     * <p>This is where the reconciliation could turn back into data loss. It drops the
+     * prefix the delegate reports holding, and the file adapter used to make entries
+     * visible at write time — so a failed sync looked exactly like a successful write.
+     * The entries would be dropped from the retry that was their last chance, and a crash
+     * after that loses records the caller was already handed versions for.
+     *
+     * <p>Visibility now follows durability: nothing is published until the sync returns.
+     */
+    @Test
+    void aBatchWhoseSyncFailsStaysPendingForRetry() throws IOException {
+        SyncFailingFileAdapter file = new SyncFailingFileAdapter(tempDir);
+        BatchingPersistenceAdapter adapter = new BatchingPersistenceAdapter(file, 3, 600_000);
+        adapter.open();
+        try {
+            file.failSync = true;
+            adapter.append(entry(0));
+            adapter.append(entry(1));
+            assertThatThrownBy(() -> adapter.append(entry(2)))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("fsync");
+
+            // The bytes may be on disk, but nothing is durable, so nothing may be
+            // reported as landed — and nothing may be dropped from the retry.
+            assertThat(file.getLatestSeqnum())
+                    .as("an unsynced entry must not be reported as the durable tip")
+                    .isEqualTo(-1L);
+
+            file.failSync = false;
+            adapter.flushNow();
+
+            assertThat(adapter.readAll().stream().map(LogEntry::seqnum))
+                    .as("entries whose sync failed must survive to the next flush")
+                    .containsExactly(0L, 1L, 2L);
+        } finally {
+            adapter.close();
+        }
+    }
+
+    /** A file adapter whose fsync can be made to fail on demand. */
+    private static final class SyncFailingFileAdapter extends FileBasedPersistenceAdapter {
+        volatile boolean failSync = false;
+
+        SyncFailingFileAdapter(Path dir) { super(dir); }
+
+        @Override
+        void syncChannels() throws IOException {
+            if (failSync) throw new IOException("fsync failed");
+            super.syncChannels();
+        }
+    }
+
     private static LogEntry entry(long n) {
         return new LogEntry(n, n, Set.of(TAG), ("e" + n).getBytes(), Instant.now());
     }

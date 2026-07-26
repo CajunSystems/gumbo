@@ -45,11 +45,25 @@ that had already landed.
 | `open()` | `NOTHING` | Unwinds fully: channels closed, directory lock released. A failed open leaves nothing to clean up and the directory reopenable. |
 | `close()` | — | Idempotent. Releases what it holds even if flushing fails. |
 | `append(LogEntry)` | `NOTHING` \| `PREFIX` | File: a torn record may reach the tail of `log.dat`; the recovery scan stops at it, so it is invisible to readers but occupies space. FDB: `NOTHING` — the transaction either commits or does not. |
-| `appendBatch(List<LogEntry>)` | **`PREFIX`** | File writes entry by entry with no rollback. FDB chunks large batches and can commit an earlier chunk before a later one fails. **Callers must not assume all-or-nothing.** The boundary is `getLatestSeqnum()`: at or below it is durable. |
+| `appendBatch(List<LogEntry>)` | **`PREFIX`** | File writes entry by entry with no rollback. FDB chunks large batches and can commit an earlier chunk before a later one fails. **Callers must not assume all-or-nothing.** The boundary is `getLatestSeqnum()`: at or below it is durable. A failed *sync* on the file adapter is `NOTHING` — none of the batch is published, so the whole batch is retried. |
 | `append(PendingAppend, expectedVersion)` | `NOTHING` | The version is assigned in the same operation as the write, so a failure consumes no version — except on the batching adapter, where see below. |
 | `appendBatchAssigningVersions(...)` | `PREFIX` | As `appendBatch`. Versions are assigned in list order. |
 | `trim(upToSeqnum)` | `NOTHING` | The trim point is written to a temp file and atomically renamed, so a crash mid-trim leaves the old point intact. |
 | `setTagValue` / `deleteTagValue` | `NOTHING` \| `PREFIX` | Appended to a sidecar; a torn record is skipped on replay, so the key keeps its previous value. |
+
+### `getLatestSeqnum()` is a durability boundary
+
+Not a visibility one. It reports the highest seqnum that is **durable**, and an adapter
+must not advance it for an entry whose write has not been made durable yet.
+
+This is load-bearing rather than pedantic: it is how a caller works out how much of a
+failed batch actually landed. The file adapter used to publish entries to its in-memory
+index at write time, before the fsync — so a failed sync was indistinguishable from a
+successful write, and the entries were dropped from the retry that was their last chance.
+Visibility now follows durability there.
+
+A third-party adapter that advertises written-but-not-durable entries here will silently
+lose data on the retry path, and nothing will report it.
 
 ## `BatchingPersistenceAdapter`
 
