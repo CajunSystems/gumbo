@@ -120,6 +120,16 @@ nobody wastes effort on them:
   page cache whether or not it was fsynced, so no in-process test can distinguish them.
   Catching this needs real crash injection — kill `-9` between write and read — which is
   the fault-injection harness, not a unit test.
-- **`trim`'s in-memory index purge.** Reads already clamp to `max(fromSeqnum, trimSeqnum)`,
-  so removing the purge changes no observable result. That mutant survives because the
-  code is redundant, not because the test is weak. Worth simplifying rather than pinning.
+- **`trim`'s in-memory index purge in `FileBasedPersistenceAdapter`** (`removed call to
+  ConcurrentNavigableMap::clear`). That adapter clamps reads to
+  `max(fromSeqnum, trimSeqnum)`, so the purge is unobservable *through reads* and no
+  read-based test can kill the mutant.
+
+  It is **not** dead code, though, and should not be deleted: it bounds the in-memory
+  index, which is a listed cross-cutting concern. The mutant survives because it guards an
+  invariant the tests do not assert — memory — rather than because the code does nothing.
+
+  This does **not** generalise to `InMemoryPersistenceAdapter`, which has no trim point at
+  all (no `trimSeqnum`, no read-time clamp): there the removal *is* the enforcement, and
+  deleting it would make reads return trimmed entries. Its own surviving mutant on `trim`
+  is a different one (a negated conditional).

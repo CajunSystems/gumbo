@@ -238,10 +238,21 @@ review, arrived at independently. Still uncovered:
   remain.
 
 Two classes are **deliberately not worth killing** and are documented in
-`FAILURE_SEMANTICS.md` so nobody burns time on them: the `force` mutants above, and `trim`'s
-in-memory index purge, which survives because the code is *redundant* (reads already clamp
-to `max(fromSeqnum, trimSeqnum)`) rather than because the test is weak. That one is worth
-**deleting**, not pinning.
+`FAILURE_SEMANTICS.md` so nobody burns time on them — the `force` mutants above, and:
+
+- **`trim`'s in-memory index purge in `FileBasedPersistenceAdapter`** (`removed call to
+  ConcurrentNavigableMap::clear`). That adapter clamps reads to
+  `max(fromSeqnum, trimSeqnum)`, so the purge is unobservable *through reads* and no
+  read-based test can kill the mutant.
+
+  It is **not** dead code, though, and should not be deleted: it bounds the in-memory
+  index, which is a listed cross-cutting concern. The mutant survives because it guards an
+  invariant the tests do not assert — memory — rather than because the code does nothing.
+
+  This does **not** generalise to `InMemoryPersistenceAdapter`, which has no trim point at
+  all (no `trimSeqnum`, no read-time clamp): there the removal *is* the enforcement, and
+  deleting it would make reads return trimmed entries. Its own surviving mutant on `trim`
+  is a different one (a negated conditional).
 
 **When raising the threshold, recompute the floor** — it moves with the denominator. At 553
 mutations and a threshold of 76 the floor is 418 (418 → 76 passes, 417 → 75 fails). Stale
