@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+**Version-keyed reads** — read a tag's stream by its own position instead of the global seqnum
+- `SharedLog.readFromVersion(LogTag, long)` / `readAfterVersion(LogTag, long)`
+- `LogView.readFromVersion(long)` / `readAfterVersion(long)` / `getLatestVersion()`
+- `TypedLogView.readFromVersion(long)` / `readAfterVersion(long)` / `getLatestVersion()`
+- `PersistenceAdapter.readFromVersion(LogTag, long)` / `readAfterVersion(LogTag, long)`, with a
+  correct filtering default for third-party adapters and an efficient override in all four
+  shipped adapters
+- Every existing read is keyed on the global `seqnum`, which coincides with a tag's own
+  numbering only while the log holds a single tag. A consumer resuming from a cursor into
+  one stream — an executor from a checkpoint, a workflow replaying its history — previously
+  had to pass its version into a seqnum-keyed API, silently re-reading entries it had already
+  processed as soon as a second tag shared the log
+
+### Fixed
+
+- `BatchingPersistenceAdapter.getLocalIdCountForTag` ignored the pending buffer, on the
+  assumption that its only caller asked once per brand-new tag. It now counts pending entries,
+  so a tag's version tip is correct between flushes
+
+### Known limitation
+
+- An entry carries one `localId`, drawn from its primary tag, so a tag carried only as a
+  *secondary* tag on an atomic multi-tag append inherits the primary's numbering instead of
+  counting its own — and which tag is primary is `tags.iterator().next()` over a
+  `Set.copyOf`, whose order Java salts per JVM run. Version-keyed reads are therefore defined
+  for a tag's own primary stream; use the seqnum-keyed reads for a shared fan-out tag.
+  Resolving it needs a version per tag per entry (storage-owned per-tag versions), and
+  `VersionKeyedReadTest.anAtomicMultiTagAppendLeavesOneStreamMisNumbered` pins the current
+  behaviour until then
+
+---
+
 ## [0.2.0] — 2026-04-17
 
 ### Added

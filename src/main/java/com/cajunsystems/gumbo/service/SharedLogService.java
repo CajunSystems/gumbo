@@ -220,6 +220,18 @@ public class SharedLogService implements SharedLog {
         }, asyncPool);
     }
 
+    @Override
+    public CompletableFuture<List<LogEntry>> readFromVersion(LogTag tag, long fromVersion) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return adapter.readFromVersion(tag, fromVersion);
+            } catch (IOException e) {
+                throw new LogReadException(
+                        "Failed to read log entries for tag=" + tag + " fromVersion=" + fromVersion, e);
+            }
+        }, asyncPool);
+    }
+
     // -------------------------------------------------------------------------
     // Subscribe
     // -------------------------------------------------------------------------

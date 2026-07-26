@@ -198,6 +198,29 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         return merged;
     }
 
+    /**
+     * Same merge as {@link #readByTag}, keyed on the tag's own version instead of the
+     * global seqnum. Delegating rather than inheriting the interface default matters
+     * here: the default filters {@link #readByTag}, which would read the delegate's
+     * whole stream from storage and then discard most of it.
+     */
+    @Override
+    public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
+        List<LogEntry> snapshot = pendingSnapshot();
+        List<LogEntry> fromDelegate = delegate.readFromVersion(tag, fromVersion);
+        if (snapshot.isEmpty()) return fromDelegate;
+
+        List<LogEntry> fromPending = snapshot.stream()
+                .filter(e -> e.tags().contains(tag) && e.localId() >= fromVersion)
+                .toList();
+        if (fromPending.isEmpty()) return fromDelegate;
+
+        List<LogEntry> merged = new ArrayList<>(fromDelegate.size() + fromPending.size());
+        merged.addAll(fromDelegate);
+        merged.addAll(fromPending);
+        return merged;
+    }
+
     // -------------------------------------------------------------------------
     // Housekeeping
     // -------------------------------------------------------------------------
@@ -224,9 +247,15 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public long getLocalIdCountForTag(LogTag tag) {
-        // Called by SharedLogService only on first use per tag (computeIfAbsent).
-        // At that point the tag is brand-new — no pending entries exist for it yet.
-        return delegate.getLocalIdCountForTag(tag);
+        // The pending buffer has to be counted too. SharedLogService only asks on first
+        // use of a tag, when nothing is pending — but a caller reading a tag's version
+        // tip (LogView.getLatestVersion) asks at any time, and would otherwise see a
+        // count that stops at the last flush.
+        long count = delegate.getLocalIdCountForTag(tag);
+        for (LogEntry e : pendingSnapshot()) {
+            if (e.tags().contains(tag)) count = Math.max(count, e.localId() + 1);
+        }
+        return count;
     }
 
     @Override

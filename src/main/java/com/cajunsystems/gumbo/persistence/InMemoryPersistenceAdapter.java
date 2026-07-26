@@ -110,6 +110,25 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         return Collections.unmodifiableList(result);
     }
 
+    /**
+     * Walks the per-tag index in seqnum order and keeps the entries at or past
+     * {@code fromVersion}. The version is read off the entry rather than the index: this
+     * adapter stores the seqnum as the index value (see {@link #append}), so the index
+     * cannot answer the version question by itself.
+     */
+    @Override
+    public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) {
+        ConcurrentSkipListMap<Long, Long> idx = tagIndex.get(tag);
+        if (idx == null || idx.isEmpty()) return Collections.emptyList();
+
+        List<LogEntry> result = new ArrayList<>();
+        for (long seqnum : idx.keySet()) {
+            LogEntry entry = log.get(seqnum);
+            if (entry != null && entry.localId() >= fromVersion) result.add(entry);
+        }
+        return Collections.unmodifiableList(result);
+    }
+
     // -------------------------------------------------------------------------
     // Housekeeping
     // -------------------------------------------------------------------------

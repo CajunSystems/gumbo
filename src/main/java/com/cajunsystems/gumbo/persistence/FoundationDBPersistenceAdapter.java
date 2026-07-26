@@ -421,6 +421,50 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         }
     }
 
+    /**
+     * Same two round-trips as {@link #readByTag}, filtered on the tag's own version.
+     *
+     * <p>The tag index is keyed {@code (namespace, key, seqnum) → localId}, so the
+     * version is the value rather than part of the key and the scan cannot start at it
+     * directly. The scan therefore covers the tag's key range but reads only 8-byte
+     * values; the expensive part — the point reads into the log subspace — is still
+     * proportional to the result. A {@code (namespace, key, localId)} index would make
+     * the scan seekable too, at the cost of a second index and a migration for logs
+     * already written.
+     */
+    @Override
+    public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
+        ensureOpen();
+        try {
+            return db.run(tr -> {
+                byte[] startKey = tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), trimSeqnum));
+                byte[] endKey   = tagSubspace.subspace(Tuple.from(tag.namespace(), tag.key())).range().end;
+
+                List<Long> seqnums = new ArrayList<>();
+                for (KeyValue kv : tr.getRange(startKey, endKey)) {
+                    if (ByteBuffer.wrap(kv.getValue()).getLong() < fromVersion) continue;
+                    seqnums.add(tagSubspace.unpack(kv.getKey()).getLong(2));
+                }
+
+                if (seqnums.isEmpty()) return Collections.<LogEntry>emptyList();
+
+                List<CompletableFuture<byte[]>> futures = new ArrayList<>(seqnums.size());
+                for (long seqnum : seqnums) {
+                    futures.add(tr.get(logSubspace.pack(Tuple.from(seqnum))));
+                }
+
+                List<LogEntry> result = new ArrayList<>(seqnums.size());
+                for (CompletableFuture<byte[]> f : futures) {
+                    byte[] val = f.join();
+                    if (val != null) result.add(decodeEntry(val));
+                }
+                return Collections.unmodifiableList(result);
+            });
+        } catch (Exception e) {
+            throw new IOException("FDB read failed in readFromVersion(" + tag + ", " + fromVersion + ")", e);
+        }
+    }
+
     // =========================================================================
     // Housekeeping
     // =========================================================================
