@@ -5,10 +5,12 @@ import com.cajunsystems.gumbo.api.SharedLog;
 import com.cajunsystems.gumbo.api.TypedLogView;
 import com.cajunsystems.gumbo.serialization.LogSerializer;
 import com.cajunsystems.gumbo.core.AppendRequest;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.AppendResult;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.persistence.PersistenceAdapter;
 import com.cajunsystems.gumbo.sequencer.Sequencer;
 import org.slf4j.Logger;
@@ -65,9 +67,6 @@ public class SharedLogService implements SharedLog {
     /** Serialises seqnum assignment + persistence write. */
     private final ReentrantLock writeLock = new ReentrantLock();
 
-    /** Per-tag local-id counters, initialised from persisted state on open. */
-    private final ConcurrentHashMap<LogTag, AtomicLong> versionCounters = new ConcurrentHashMap<>();
-
     /** Active subscriptions keyed by tag. */
     private final ConcurrentHashMap<LogTag, CopyOnWriteArrayList<SubscriptionImpl>> subscriptions =
             new ConcurrentHashMap<>();
@@ -106,7 +105,34 @@ public class SharedLogService implements SharedLog {
 
     @Override
     public CompletableFuture<AppendResult> append(AppendRequest request) {
-        return CompletableFuture.supplyAsync(() -> doAppend(request), asyncPool);
+        return CompletableFuture.supplyAsync(
+                () -> doAppend(request, request.tags().iterator().next(),
+                        PersistenceAdapter.ANY_VERSION),
+                asyncPool);
+    }
+
+    @Override
+    public CompletableFuture<AppendResult> append(AppendRequest request, long expectedVersion) {
+        if (request.tags().size() != 1) {
+            throw new IllegalArgumentException(
+                    "Conditional append on a multi-tag request must name the tag to fence:"
+                    + " use append(request, fencedTag, expectedVersion). Tags were "
+                    + request.tags());
+        }
+        LogTag only = request.tags().iterator().next();
+        return CompletableFuture.supplyAsync(
+                () -> doAppend(request, only, expectedVersion), asyncPool);
+    }
+
+    @Override
+    public CompletableFuture<AppendResult> append(
+            AppendRequest request, LogTag fencedTag, long expectedVersion) {
+        if (!request.tags().contains(fencedTag)) {
+            throw new IllegalArgumentException(
+                    "fencedTag " + fencedTag + " is not among the request's tags " + request.tags());
+        }
+        return CompletableFuture.supplyAsync(
+                () -> doAppend(request, fencedTag, expectedVersion), asyncPool);
     }
 
     /**
@@ -132,22 +158,25 @@ public class SharedLogService implements SharedLog {
             // Claim all seqnums in a single sequencer call (1 FDB RTT for FoundationDBSequencer)
             long[] seqnums = sequencer.nextBatch(requests.size());
 
-            List<LogEntry>     entries = new ArrayList<>(requests.size());
-            List<AppendResult> results = new ArrayList<>(requests.size());
-            Instant            now     = Instant.now();
+            List<PendingAppend> pendings = new ArrayList<>(requests.size());
+            Instant             now      = Instant.now();
 
             for (int i = 0; i < requests.size(); i++) {
-                AppendRequest req      = requests.get(i);
-                long          seqnum   = seqnums[i];
-                LogTag        primary  = req.tags().iterator().next();
-                long          version  = nextVersionFor(primary);
-                LogEntry      entry    = new LogEntry(seqnum, version, req.tags(), req.dataUnsafe(), now);
-                entries.add(entry);
-                results.add(new AppendResult(seqnum, version, primary, now));
+                AppendRequest req     = requests.get(i);
+                LogTag        primary = req.tags().iterator().next();
+                pendings.add(new PendingAppend(
+                        seqnums[i], primary, req.tags(), req.dataUnsafe(), now));
             }
 
-            // Single persistence call — 1 FDB transaction for entire batch when using FDB adapter
-            adapter.appendBatch(entries);
+            // Single persistence call — 1 FDB transaction for the whole batch on FDB — and
+            // the versions come back assigned, so this layer never invents one.
+            List<LogEntry> entries = adapter.appendBatchAssigningVersions(pendings);
+
+            List<AppendResult> results = new ArrayList<>(entries.size());
+            for (LogEntry entry : entries) {
+                results.add(new AppendResult(entry.seqnum(), entry.streamVersion(),
+                        entry.primaryTag(), entry.timestamp()));
+            }
 
             // Queue for delivery; each subscription drains its own queue.
             for (LogEntry entry : entries) notifySubscribers(entry);
@@ -160,23 +189,25 @@ public class SharedLogService implements SharedLog {
         }
     }
 
-    private AppendResult doAppend(AppendRequest request) {
+    private AppendResult doAppend(AppendRequest request, LogTag primaryTag, long expectedVersion) {
         ensureNotClosed();
         writeLock.lock();
         try {
-            long seqnum    = sequencer.next();
             Set<LogTag> tags = request.tags();
-            LogTag primaryTag = tags.iterator().next();
-            long version   = nextVersionFor(primaryTag);
-            Instant now    = Instant.now();
+            PendingAppend pending = new PendingAppend(
+                    sequencer.next(), primaryTag, tags, request.dataUnsafe(), Instant.now());
 
-            LogEntry entry = new LogEntry(seqnum, version, tags, request.dataUnsafe(), now);
-            adapter.append(entry);
+            // The adapter assigns the version, not this layer. A counter here would be one
+            // process's opinion of where the stream is, which is the whole defect.
+            LogEntry entry = adapter.append(pending, expectedVersion);
 
             // Queue for delivery; each subscription drains its own queue.
             notifySubscribers(entry);
 
-            return new AppendResult(seqnum, version, primaryTag, now);
+            return new AppendResult(
+                    entry.seqnum(), entry.streamVersion(), primaryTag, entry.timestamp());
+        } catch (VersionConflictException e) {
+            throw new LogWriteException("Conditional append rejected", e);
         } catch (IOException e) {
             throw new LogWriteException("Failed to persist log entry", e);
         } finally {
@@ -322,12 +353,6 @@ public class SharedLogService implements SharedLog {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
-
-    private long nextVersionFor(LogTag primaryTag) {
-        return versionCounters
-                .computeIfAbsent(primaryTag, k -> new AtomicLong(adapter.getNextStreamVersion(k)))
-                .getAndIncrement();
-    }
 
     /**
      * Hands {@code entry} to every live subscription on its tags.

@@ -7,6 +7,8 @@ import com.apple.foundationdb.Range;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -296,35 +298,130 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         }
     }
 
+    /**
+     * Reads the tag's current version, checks it, and writes — all inside <em>one FDB
+     * transaction</em>. This is the adapter where storage-owned versioning is fully
+     * realised: FDB serialises conflicting transactions, so two processes appending to the
+     * same tag cannot both be assigned the same version, and a conditional append is
+     * rejected by the store rather than by anything a client believes about the store.
+     *
+     * <p>The version is read from the transaction rather than from {@link #tagVersionCount},
+     * which is a local cache and therefore exactly the kind of per-process opinion this is
+     * meant to stop trusting.
+     */
+    @Override
+    public LogEntry append(PendingAppend pending, long expectedVersion) throws IOException {
+        ensureOpen();
+        LogTag primary = pending.primaryTag();
+        byte[] countKey = tagCountSubspace.pack(Tuple.from(primary.namespace(), primary.key()));
+        try {
+            LogEntry entry = db.run(tr -> {
+                byte[] raw = tr.get(countKey).join();
+                long next = raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
+                if (expectedVersion != ANY_VERSION && expectedVersion != next) {
+                    throw new ConflictSignal(new VersionConflictException(primary, expectedVersion, next));
+                }
+                LogEntry e = pending.withVersion(next);
+                writeEntry(tr, e);
+                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)),
+                       longBytes(Math.max(latestSeqnum, e.seqnum())));
+                return e;
+            });
+            cacheAfterCommit(entry);
+            return entry;
+        } catch (ConflictSignal cs) {
+            throw cs.conflict;
+        } catch (Exception e) {
+            throw new IOException("FDB append failed for tag=" + primary, e);
+        }
+    }
+
+    @Override
+    public List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        ensureOpen();
+        try {
+            List<LogEntry> entries = db.run(tr -> {
+                java.util.Map<LogTag, Long> next = new java.util.HashMap<>();
+                List<LogEntry> out = new ArrayList<>(pendings.size());
+                long maxSeqnum = latestSeqnum;
+                for (PendingAppend p : pendings) {
+                    LogTag primary = p.primaryTag();
+                    long v = next.computeIfAbsent(primary, t -> {
+                        byte[] raw = tr.get(tagCountSubspace.pack(
+                                Tuple.from(t.namespace(), t.key()))).join();
+                        return raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
+                    });
+                    next.put(primary, v + 1);
+                    LogEntry e = p.withVersion(v);
+                    writeEntry(tr, e);
+                    out.add(e);
+                    if (e.seqnum() > maxSeqnum) maxSeqnum = e.seqnum();
+                }
+                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)), longBytes(maxSeqnum));
+                return out;
+            });
+            for (LogEntry e : entries) cacheAfterCommit(e);
+            return entries;
+        } catch (Exception e) {
+            throw new IOException("FDB batch append failed", e);
+        }
+    }
+
+    /** Writes one entry's log record, tag index, per-tag count and per-tag latest seqnum. */
+    private void writeEntry(com.apple.foundationdb.Transaction tr, LogEntry entry) {
+        tr.set(logSubspace.pack(Tuple.from(entry.seqnum())), encodeEntry(entry));
+        for (LogTag tag : entry.tags()) {
+            tr.set(tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
+                   longBytes(entry.streamVersion()));
+
+            // Raise the tag's count, never lower it. An entry carries one version — its
+            // primary tag's — so on a multi-tag append a secondary tag may already be
+            // further along its own sequence. Overwriting its count with this entry's
+            // version + 1 would hand out versions that already exist on that tag, and,
+            // now that the conditional append reads this key as its fence, would let a
+            // stale writer pass a check it should have failed.
+            byte[] countKey = tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
+            byte[] rawCount = tr.get(countKey).join();
+            long currentCount = rawCount == null ? 0L : ByteBuffer.wrap(rawCount).getLong();
+            long candidate = entry.streamVersion() + 1;
+            if (candidate > currentCount) tr.set(countKey, longBytes(candidate));
+
+            // Same reasoning for the tag's latest seqnum. Seqnums only grow, so this
+            // rarely differs — but "rarely" is not a reason to write a lower value.
+            byte[] latestKey = tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
+            byte[] rawLatest = tr.get(latestKey).join();
+            long currentLatest = rawLatest == null ? -1L : ByteBuffer.wrap(rawLatest).getLong();
+            if (entry.seqnum() > currentLatest) tr.set(latestKey, longBytes(entry.seqnum()));
+        }
+    }
+
+    /** Refreshes the local caches once a commit is durable. */
+    private void cacheAfterCommit(LogEntry entry) {
+        if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
+        for (LogTag tag : entry.tags()) {
+            tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0))
+                    .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
+            tagLatestSeqnum.computeIfAbsent(tag, k -> new AtomicLong(-1L))
+                    .updateAndGet(c -> Math.max(c, entry.seqnum()));
+        }
+    }
+
+    /** Carries a conflict out of the FDB retry loop, which only propagates RuntimeExceptions. */
+    private static final class ConflictSignal extends RuntimeException {
+        final VersionConflictException conflict;
+        ConflictSignal(VersionConflictException conflict) { super(conflict); this.conflict = conflict; }
+    }
+
     private void commitChunk(List<LogEntry> entries) throws IOException {
         try {
             db.run(tr -> {
                 long maxSeqnum = latestSeqnum;
 
                 for (LogEntry entry : entries) {
-                    // Primary log record
-                    tr.set(logSubspace.pack(Tuple.from(entry.seqnum())), encodeEntry(entry));
-
-                    for (LogTag tag : entry.tags()) {
-                        // Tag index: (namespace, key, seqnum) → streamVersion
-                        tr.set(
-                            tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
-                            longBytes(entry.streamVersion())
-                        );
-                        // Compact per-tag count (last streamVersion + 1)
-                        long newCount = entry.streamVersion() + 1;
-                        tr.set(
-                            tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
-                            longBytes(newCount)
-                        );
-                        // Track latest seqnum for this tag
-                        long newLatest = entry.seqnum();
-                        tr.set(
-                            tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key())),
-                            longBytes(newLatest)
-                        );
-                    }
-
+                    // Shared with the version-assigning append so both raise per-tag
+                    // metadata rather than overwriting it — one copy of that rule, not two.
+                    writeEntry(tr, entry);
                     if (entry.seqnum() > maxSeqnum) maxSeqnum = entry.seqnum();
                 }
 

@@ -46,6 +46,61 @@ public interface SharedLog extends AutoCloseable {
     CompletableFuture<AppendResult> append(AppendRequest request);
 
     /**
+     * Appends only if the primary tag is still at {@code expectedVersion}, failing with
+     * {@link com.cajunsystems.gumbo.core.VersionConflictException} otherwise.
+     *
+     * <p>This is optimistic concurrency on a stream, and the fence is in storage rather
+     * than in whatever decided this writer should be the one writing. A lock service can
+     * say a node <em>holds</em> a lock; it cannot say the node still holds it at the
+     * instant the write lands, and a pause between those two moments is enough for two
+     * writers to both believe they own the stream. Conditioning the write on the version
+     * this writer last saw removes that gap: the loser is rejected by the store.
+     *
+     * <pre>{@code
+     * List<LogEntry> history = log.readAll(tag).join();
+     * long at = history.isEmpty() ? 0 : history.getLast().streamVersion() + 1;
+     * State state = fold(history);
+     * log.append(AppendRequest.to(tag, decide(state)), at).join();   // rejected if overtaken
+     * }</pre>
+     *
+     * <p>This form requires a <strong>single-tag</strong> request, so the stream being
+     * fenced is unambiguous. For a multi-tag append use
+     * {@link #append(AppendRequest, LogTag, long)} and name the tag: the primary tag of a
+     * multi-tag request is {@code tags.iterator().next()} over an immutable {@code Set},
+     * whose iteration order Java salts per JVM run, so which stream a fence applied to
+     * would otherwise vary between runs of the same program — accepting a stale entity
+     * update in one and rejecting a valid one in the next.
+     *
+     * <p>Not every adapter can do this: it requires comparing and incrementing the version
+     * in one atomic storage operation. An adapter that cannot throws
+     * {@link UnsupportedOperationException} rather than writing unconditionally, since a
+     * log that looked like it was fencing while doing nothing of the sort would surface as
+     * corruption rather than as an error.
+     *
+     * @param request         the payload and target tags
+     * @param expectedVersion the version the primary tag must still be at
+     */
+    CompletableFuture<AppendResult> append(AppendRequest request, long expectedVersion);
+
+    /**
+     * Appends only if {@code fencedTag} is still at {@code expectedVersion}.
+     *
+     * <p>The explicit form of {@link #append(AppendRequest, long)}, for a multi-tag append
+     * where one stream needs a fence and the others do not — a workflow recording history
+     * while enqueueing work, say. {@code fencedTag} must be among the request's tags, and
+     * is also the tag whose version the entry takes, so both the fence and the numbering
+     * follow the caller's choice rather than a set's iteration order.
+     *
+     * <p>Only that one tag is conditioned. Requiring every tag to be at an expected
+     * version would fail appends for reasons unrelated to the entity being written.
+     *
+     * @param request         the payload and target tags
+     * @param fencedTag       the tag to condition on; must be among {@code request.tags()}
+     * @param expectedVersion the version {@code fencedTag} must still be at
+     */
+    CompletableFuture<AppendResult> append(AppendRequest request, LogTag fencedTag, long expectedVersion);
+
+    /**
      * Appends multiple entries to the log, claiming all seqnums in a single
      * sequencer operation where supported.  Results are returned in the same
      * order as the input list.

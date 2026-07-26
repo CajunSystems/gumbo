@@ -1,6 +1,8 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -151,6 +153,63 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     }
 
     /**
+     * Assigns the version at append time rather than at flush time, because the caller
+     * needs it in the {@code AppendResult} now — the batching here defers durability, not
+     * identity.
+     *
+     * <p>The tag's next version is the delegate's, advanced past anything still pending
+     * for that tag. Held under the flush lock so a concurrent flush cannot land between
+     * counting the pending entries and adding this one.
+     */
+    @Override
+    public LogEntry append(PendingAppend pending, long expectedVersion) throws IOException {
+        flushLock.lock();
+        try {
+            LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
+            pendingBatch.add(entry);
+            if (pendingBatch.size() >= maxBatchSize) flushUnderLock();
+            return entry;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    @Override
+    public List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        flushLock.lock();
+        try {
+            List<LogEntry> entries = new ArrayList<>(pendings.size());
+            for (PendingAppend p : pendings) {
+                LogEntry e = p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION));
+                entries.add(e);
+                pendingBatch.add(e);
+            }
+            if (pendingBatch.size() >= maxBatchSize) flushUnderLock();
+            return entries;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    /** Next version for {@code tag}: the delegate's, plus anything pending for it. */
+    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
+        long next = getNextStreamVersionUnderLock(tag);
+        if (expectedVersion != ANY_VERSION && expectedVersion != next) {
+            throw new VersionConflictException(tag, expectedVersion, next);
+        }
+        return next;
+    }
+
+    private long getNextStreamVersionUnderLock(LogTag tag) {
+        long next = delegate.getNextStreamVersion(tag);
+        for (LogEntry e : pendingBatch) {
+            if (e.tags().contains(tag)) next = Math.max(next, e.streamVersion() + 1);
+        }
+        return next;
+    }
+
+    /**
      * Forces all pending entries to the delegate immediately, regardless of
      * batch size or delay.  Useful for testing and controlled shutdown.
      */
@@ -274,11 +333,66 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     // -------------------------------------------------------------------------
 
     /** Flushes the pending batch to the delegate; caller must hold flushLock. */
+    /**
+     * Writes the pending entries to the delegate, and drops them only once that has
+     * succeeded.
+     *
+     * <p>Clearing first loses them outright if the delegate throws: the background flush
+     * logs the failure after the data is already gone, and a caller that received an
+     * {@code AppendResult} — with a version assigned and consumed — has no way to learn
+     * its entry was discarded. Leaving them pending means the next flush retries.
+     *
+     * <p>Always called with {@link #flushLock} held, so nothing is appended between the
+     * write and the removal.
+     */
     private void flushUnderLock() throws IOException {
         if (pendingBatch.isEmpty()) return;
         List<LogEntry> batch = List.copyOf(pendingBatch);
-        pendingBatch.clear();
-        delegate.appendBatch(batch);
+        try {
+            delegate.appendBatch(batch);
+            pendingBatch.subList(0, batch.size()).clear();
+        } catch (IOException | RuntimeException ex) {
+            dropWhatTheDelegateKept(batch);
+            throw ex;
+        }
+    }
+
+    /**
+     * After a failed flush, drops exactly the entries the delegate acknowledges holding.
+     *
+     * <p>A failed {@code appendBatch} is not necessarily an empty one. The file adapter
+     * writes entry by entry, so a failure part-way leaves a persisted prefix; FoundationDB
+     * chunks large batches and can commit an earlier chunk before a later one fails.
+     * Keeping the whole batch for retry would rewrite that prefix — trading the data loss
+     * this replaced for duplicate records, which is no better in an append-only log that
+     * things are folded from.
+     *
+     * <p>Entries are flushed in seqnum order, so the delegate's latest seqnum names the
+     * boundary precisely: at or below it is durable, above it is not. Reconciling against
+     * that leaves the retry neither losing nor duplicating, without requiring delegates to
+     * make {@code appendBatch} all-or-nothing.
+     *
+     * <p>If the delegate cannot say, nothing is dropped: a duplicate is recoverable by
+     * inspection, whereas a discarded entry is not.
+     */
+    private void dropWhatTheDelegateKept(List<LogEntry> batch) {
+        long persistedThrough;
+        try {
+            persistedThrough = delegate.getLatestSeqnum();
+        } catch (RuntimeException probeFailed) {
+            logger.warn("Could not determine what the delegate persisted after a failed flush;"
+                    + " keeping all {} entries for retry", batch.size(), probeFailed);
+            return;
+        }
+        int persisted = 0;
+        while (persisted < batch.size() && batch.get(persisted).seqnum() <= persistedThrough) {
+            persisted++;
+        }
+        if (persisted > 0) {
+            logger.warn("Flush failed after the delegate persisted {} of {} entries;"
+                    + " retrying only the remainder", persisted, batch.size());
+            pendingBatch.subList(0, persisted).clear();
+        }
     }
 
     private void flushQuietly() {

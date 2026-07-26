@@ -7,6 +7,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**Storage-owned stream versions + conditional append** (D1 / A1)
+- `SharedLog.append(AppendRequest, long expectedVersion)` — appends only if the primary tag
+  is still at that version, else fails with the new `VersionConflictException`
+- `PersistenceAdapter.append(PendingAppend, long expectedVersion)` returns the persisted
+  `LogEntry`; the **adapter** assigns `streamVersion`, not the caller.
+  `PersistenceAdapter.ANY_VERSION` appends unconditionally
+- `PersistenceAdapter.appendBatchAssigningVersions(List<PendingAppend>)` — batch form;
+  versions are assigned in list order so repeated appends to one tag stay consecutive
+- New `PendingAppend` record: an append whose version has not been assigned yet, which
+  `LogEntry` cannot express since it requires one at construction
+- `SharedLogService` no longer keeps per-tag version counters. They were seeded once from
+  storage and then diverged silently from every other writer's copy — two processes on one
+  log both handing out `0, 1, 2` with nothing to reconcile them (D1)
+- The SPI default assigns from `getNextStreamVersion` and writes, which is what callers did
+  before and no weaker, but **rejects** a conditional append with
+  `UnsupportedOperationException` rather than performing a non-atomic check. An adapter that
+  appeared to fence while doing nothing of the sort would surface as corruption, not an error
+- On FoundationDB the read, compare and write happen in **one transaction**, so the fence is
+  enforced by the store and holds across processes. The file and in-memory adapters assign
+  under their own lock, which is atomic within the single-writer configuration they support
+  (enforced by the directory lock added earlier)
+
 ### Changed — breaking
 
 **`localId` renamed to `streamVersion`**

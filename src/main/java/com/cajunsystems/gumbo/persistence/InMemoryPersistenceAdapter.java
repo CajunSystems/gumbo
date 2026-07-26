@@ -1,6 +1,8 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 
 import java.util.ArrayList;
@@ -79,6 +81,41 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
                     .updateAndGet(current -> Math.max(current, entry.streamVersion() + 1));
         }
+    }
+
+    /**
+     * Assigns the version and writes under one lock, so the compare and the increment
+     * cannot be interleaved with another writer's.
+     */
+    @Override
+    public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
+            throws VersionConflictException {
+        LogEntry entry = pending.withVersion(
+                claimVersion(pending.primaryTag(), expectedVersion));
+        append(entry);
+        return entry;
+    }
+
+    @Override
+    public synchronized List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws VersionConflictException {
+        List<LogEntry> entries = new ArrayList<>(pendings.size());
+        for (PendingAppend p : pendings) {
+            entries.add(p.withVersion(claimVersion(p.primaryTag(), PersistenceAdapter.ANY_VERSION)));
+        }
+        for (LogEntry e : entries) append(e);
+        return entries;
+    }
+
+    /** Reserves the tag's next version, enforcing {@code expectedVersion} if given. */
+    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
+        AtomicLong counter = tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0));
+        long next = counter.get();
+        if (expectedVersion != PersistenceAdapter.ANY_VERSION && expectedVersion != next) {
+            throw new VersionConflictException(tag, expectedVersion, next);
+        }
+        counter.set(next + 1);
+        return next;
     }
 
     // -------------------------------------------------------------------------

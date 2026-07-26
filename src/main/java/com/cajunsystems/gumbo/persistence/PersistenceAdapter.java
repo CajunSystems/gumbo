@@ -1,6 +1,8 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import com.cajunsystems.gumbo.core.StreamVersions;
 
@@ -64,6 +66,78 @@ public interface PersistenceAdapter extends AutoCloseable {
      * @throws IOException if the write fails
      */
     void append(LogEntry entry) throws IOException;
+
+    /** Passed as {@code expectedVersion} to append unconditionally. */
+    long ANY_VERSION = -1L;
+
+    /**
+     * Persists an entry, assigning its primary tag's {@code streamVersion} <em>here</em>,
+     * and returns the entry as stored.
+     *
+     * <h2>Why the adapter assigns it</h2>
+     * <p>Because only storage can. A caller-side counter is seeded once from whatever the
+     * tag was at and then diverges from every other writer's copy silently: two processes
+     * on one log both hand out {@code 0, 1, 2}, and nothing ever reconciles them. Moving
+     * the assignment into the same operation as the write is what makes the version
+     * actually describe the stream rather than one process's opinion of it.
+     *
+     * <h2>Conditional append</h2>
+     * <p>With {@code expectedVersion} other than {@link #ANY_VERSION}, the append happens
+     * only if the tag is still at that version, and is otherwise rejected with
+     * {@link VersionConflictException}. The comparison and the increment must be one
+     * atomic operation in the same store — a client-side compare would race the
+     * assignment underneath it.
+     *
+     * <p>The default implementation assigns from {@link #getNextStreamVersion} and writes,
+     * which is exactly what callers did before and no weaker — but it <strong>rejects</strong>
+     * a non-{@link #ANY_VERSION} {@code expectedVersion} with
+     * {@link UnsupportedOperationException} rather than performing a non-atomic check. An
+     * adapter that appeared to participate in the fencing protocol while providing none of
+     * it would surface as corruption instead of as an error.
+     *
+     * @param pending         the append, minus the version
+     * @param expectedVersion {@link #ANY_VERSION}, or the version the tag must still be at
+     * @return the persisted entry, carrying the assigned version
+     * @throws VersionConflictException if the tag is not at {@code expectedVersion}
+     * @throws UnsupportedOperationException if conditional append is not supported
+     * @throws IOException if the write fails
+     */
+    default LogEntry append(PendingAppend pending, long expectedVersion) throws IOException {
+        if (expectedVersion != ANY_VERSION) {
+            throw new UnsupportedOperationException(
+                    getClass().getSimpleName() + " does not support conditional append;"
+                    + " it cannot compare and increment the version atomically");
+        }
+        LogEntry entry = pending.withVersion(getNextStreamVersion(pending.primaryTag()));
+        append(entry);
+        return entry;
+    }
+
+    /**
+     * Batch form of {@link #append(PendingAppend, long)}: assigns each entry's version and
+     * persists them with one durability flush, returning them as stored.
+     *
+     * <p>Versions are assigned in list order, so several appends to one tag within a batch
+     * take consecutive versions. Unconditional only — a batch conditioned per entry would
+     * need to define what happens to the rest when one is rejected, and no caller needs
+     * that yet.
+     *
+     * @param pendings appends in seqnum order; must not be empty
+     * @return the persisted entries, in the same order
+     * @throws IOException if the write fails
+     */
+    default List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        List<LogEntry> entries = new java.util.ArrayList<>(pendings.size());
+        java.util.Map<LogTag, Long> next = new java.util.HashMap<>();
+        for (PendingAppend p : pendings) {
+            long v = next.computeIfAbsent(p.primaryTag(), this::getNextStreamVersion);
+            next.put(p.primaryTag(), v + 1);
+            entries.add(p.withVersion(v));
+        }
+        appendBatch(entries);
+        return entries;
+    }
 
     /**
      * Persists multiple entries as a single batch with <em>one</em> durability

@@ -1,6 +1,8 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.PendingAppend;
+import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -246,8 +248,9 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     @Override
     public void append(LogEntry entry) throws IOException {
-        writeNoSync(entry);
+        long offset = writeNoSync(entry);
         syncChannels();
+        publish(entry, offset);
     }
 
     /**
@@ -257,15 +260,21 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public void appendBatch(List<LogEntry> entries) throws IOException {
-        for (LogEntry entry : entries) {
-            writeNoSync(entry);
+        long[] offsets = new long[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            offsets[i] = writeNoSync(entries.get(i));
         }
         syncChannels();
+        for (int i = 0; i < entries.size(); i++) {
+            publish(entries.get(i), offsets[i]);
+        }
     }
 
-    // Writes bytes to both channels and updates in-memory indices without
-    // calling force() — the caller is responsible for the fdatasync.
-    private void writeNoSync(LogEntry entry) throws IOException {
+    /**
+     * Writes an entry's bytes to both channels and returns its offset. Does <em>not</em>
+     * fsync, and does <em>not</em> make the entry visible — see {@link #publish}.
+     */
+    private long writeNoSync(LogEntry entry) throws IOException {
         ensureOpen();
         byte[] encoded = encode(entry);
 
@@ -286,7 +295,20 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
             indexChannel.write(idxBuf);
         }
 
-        // Update in-memory indices immediately so concurrent reads see the entry
+        return offset;
+    }
+
+    /**
+     * Makes a written entry visible, after its bytes are durable.
+     *
+     * <p>Deliberately separate from {@link #writeNoSync}. Publishing at write time made
+     * {@link #getLatestSeqnum()} report entries whose fsync had not yet succeeded — and
+     * that value is what a caller uses to work out how much of a failed batch actually
+     * landed. A failed sync would therefore look like a successful write, and the entries
+     * would be dropped from the retry that was their last chance. Visibility now follows
+     * durability rather than preceding it.
+     */
+    private void publish(LogEntry entry, long offset) {
         globalIndex.put(entry.seqnum(), offset);
         for (LogTag tag : entry.tags()) {
             tagSeqnums
@@ -298,10 +320,65 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         }
     }
 
-    // fdatasync on both WAL files; metadata update not required.
-    private void syncChannels() throws IOException {
+    /**
+     * fdatasync on both WAL files; metadata update not required.
+     *
+     * <p>Package-private rather than private so a test can make it fail. A sync failure is
+     * the one durability boundary that cannot be provoked from outside this class, and it
+     * is precisely where visibility and durability can diverge.
+     */
+    void syncChannels() throws IOException {
         logChannel.force(false);
         indexChannel.force(false);
+    }
+
+    /**
+     * Assigns the version from this adapter's own durable state and writes, both under one
+     * lock — so the version comes from the log rather than from a caller's counter, and
+     * the compare and increment of a conditional append cannot be split.
+     *
+     * <p>Within this process that makes the pair atomic. Across processes it is the
+     * directory lock taken in {@link #open()} that holds the line: this adapter is
+     * single-writer, and a second one is refused rather than allowed to race here.
+     */
+    @Override
+    public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
+            throws IOException {
+        LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
+        long offset = writeNoSync(entry);
+        syncChannels();
+        publish(entry, offset);
+        return entry;
+    }
+
+    @Override
+    public synchronized List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
+            throws IOException {
+        List<LogEntry> entries = new ArrayList<>(pendings.size());
+        for (PendingAppend p : pendings) {
+            entries.add(p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION)));
+        }
+        long[] offsets = new long[entries.size()];
+        for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
+        syncChannels();   // one fdatasync for the batch, as before
+        for (int i = 0; i < entries.size(); i++) publish(entries.get(i), offsets[i]);
+        return entries;
+    }
+
+    /**
+     * Reserves the tag's next version, enforcing {@code expectedVersion} if given.
+     *
+     * <p>Reads from {@code tagVersionCount}, which is rebuilt from the log on open, so a
+     * restart continues the sequence rather than restarting it.
+     */
+    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
+        AtomicLong counter = tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0));
+        long next = counter.get();
+        if (expectedVersion != ANY_VERSION && expectedVersion != next) {
+            throw new VersionConflictException(tag, expectedVersion, next);
+        }
+        counter.set(next + 1);
+        return next;
     }
 
     // -------------------------------------------------------------------------
