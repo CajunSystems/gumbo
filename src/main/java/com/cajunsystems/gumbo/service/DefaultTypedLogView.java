@@ -125,6 +125,16 @@ final class DefaultTypedLogView<T> implements TypedLogView<T> {
         return delegate.deleteValue(key);
     }
 
+    @Override
+    public CompletableFuture<Boolean> compareAndSetValue(String key, byte[] expected, byte[] value) {
+        return delegate.compareAndSetValue(key, expected, value);
+    }
+
+    @Override
+    public CompletableFuture<Long> incrementValue(String key, long delta) {
+        return delegate.incrementValue(key, delta);
+    }
+
     // -------------------------------------------------------------------------
     // Interoperability
     // -------------------------------------------------------------------------

@@ -313,6 +313,19 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         return Math.max(delegateLatest, pendingLatest);
     }
 
+    /*
+     * The KV is write-through: it is not batched, and never was. Worth stating now that the
+     * conditional forms exist, because it decides an ordering a caller can otherwise get
+     * wrong. A claim taken here is durable as soon as the delegate says so, while log
+     * entries appended after it may still be pending — so "claim, then append" leaves a
+     * window where the claim survives a crash and the work it authorised does not. That is
+     * the safe direction (the claim can be released or retried; a lost claim with committed
+     * work cannot be reconciled), but it is only safe if the caller knows which way it goes.
+     *
+     * Batching them would not help either: a deferred compare-and-set is a claim whose
+     * outcome is unknown at the moment the caller has to act on it.
+     */
+
     @Override
     public void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
         delegate.setTagValue(tag, key, value);
@@ -326,6 +339,32 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     @Override
     public void deleteTagValue(LogTag tag, String key) throws IOException {
         delegate.deleteTagValue(tag, key);
+    }
+
+    @Override
+    public boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value)
+            throws IOException {
+        return delegate.compareAndSetTagValue(tag, key, expected, value);
+    }
+
+    @Override
+    public boolean setTagValueIfAbsent(LogTag tag, String key, byte[] value) throws IOException {
+        return delegate.setTagValueIfAbsent(tag, key, value);
+    }
+
+    @Override
+    public boolean deleteTagValueIf(LogTag tag, String key, byte[] expected) throws IOException {
+        return delegate.deleteTagValueIf(tag, key, expected);
+    }
+
+    /**
+     * Forwarded whole rather than looped here: the delegate may satisfy it in one round trip
+     * (FoundationDB does), and a retry loop in the decorator would replace that with a
+     * sequence of separate transactions.
+     */
+    @Override
+    public long incrementTagValue(LogTag tag, String key, long delta) throws IOException {
+        return delegate.incrementTagValue(tag, key, delta);
     }
 
     // -------------------------------------------------------------------------

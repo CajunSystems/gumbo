@@ -156,6 +156,41 @@ public interface TypedLogView<T> {
     /** Removes the stored value for {@code key}. No-op if absent. */
     CompletableFuture<Void> deleteValue(String key);
 
+    // ── Key-Value: conditional mutation ──
+
+    /*
+     * The KV holds bytes, not T. A typed view serialises *entries*, and the KV is where a
+     * consumer keeps its own bookkeeping — cursors, claims, idempotency keys — whose
+     * encoding is its business and generally not the log's payload type. Comparing by
+     * content also has to compare the exact stored bytes, which a round trip through a
+     * serialiser is not guaranteed to preserve.
+     */
+
+    /**
+     * Sets {@code key} to {@code value} only if it currently holds {@code expected}.
+     * {@code expected == null} requires absence; {@code value == null} removes the key.
+     *
+     * @see LogView#compareAndSetValue(String, byte[], byte[])
+     */
+    CompletableFuture<Boolean> compareAndSetValue(String key, byte[] expected, byte[] value);
+
+    /** Sets {@code key} only if absent; exactly one of N contenders gets {@code true}. */
+    default CompletableFuture<Boolean> setValueIfAbsent(String key, byte[] value) {
+        return compareAndSetValue(key, null, value);
+    }
+
+    /** Removes {@code key} only if it currently holds {@code expected}. */
+    default CompletableFuture<Boolean> deleteValueIf(String key, byte[] expected) {
+        return compareAndSetValue(key, expected, null);
+    }
+
+    /**
+     * Adds {@code delta} to the counter at {@code key}, returning the new value. Absent
+     * counts as {@code 0}; the encoding is
+     * {@link com.cajunsystems.gumbo.core.CounterValues}.
+     */
+    CompletableFuture<Long> incrementValue(String key, long delta);
+
     // -------------------------------------------------------------------------
     // Interoperability
     // -------------------------------------------------------------------------

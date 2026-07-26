@@ -305,6 +305,10 @@ Subscription sub = view.subscribeTail(entry -> process(entry));
 // Durable KV storage (for checkpoints)
 view.setValue("checkpoint", bytes).join();
 byte[] saved = view.getValue("checkpoint").join();
+
+// ...and conditionally, for claims and counters (see "Claiming a stream" below)
+boolean claimed = view.setValueIfAbsent("owner", nodeId).join();
+long attempts = view.incrementValue("attempts", 1).join();
 ```
 
 ### 3. TypedLogView — Type-safe operations
@@ -836,6 +840,45 @@ The checkpoint seqnum is stored in the tag's per-actor KV store — durable in
 `InMemoryPersistenceAdapter`.
 
 See [`ActorCheckpointExample.java`](src/test/java/com/cajunsystems/gumbo/examples/ActorCheckpointExample.java) for a runnable version.
+
+### Claiming a stream: conditional KV
+
+The same KV also arbitrates *who* is allowed to write a stream. Each mutation below compares
+before it writes, and the comparison happens where the write lands rather than in the caller:
+
+| API | What it does |
+|-----|-------------|
+| `logView.setValueIfAbsent(key, value)` | Claim — of N contenders exactly one gets `true` |
+| `logView.compareAndSetValue(key, expected, value)` | Take over from a known holder; `expected == null` requires absence, `value == null` removes the key |
+| `logView.deleteValueIf(key, expected)` | Release, but only if still the holder |
+| `logView.incrementValue(key, delta)` | Counter; absent reads as `0`, encoded by [`CounterValues`](src/main/java/com/cajunsystems/gumbo/core/CounterValues.java) |
+
+```java
+LogView stream = service.getView(LogTag.of("execution", "exec-1"));
+byte[] mine = (nodeId + "@" + expiresAt).getBytes();
+
+if (!stream.setValueIfAbsent("owner", mine).join()) {
+    byte[] held = stream.getValue("owner").join();
+    if (!expired(held) || !stream.compareAndSetValue("owner", held, mine).join()) {
+        return;   // someone else owns this stream
+    }
+}
+
+// Owning the lease is not enough on its own: fence the write on the stream version too.
+// The lease says we owned it a moment ago; the fence says we still do where it matters.
+service.append(AppendRequest.to(tag, data), expectedVersion).join();
+```
+
+That second step is the point. Lease expiry needs a clock, and a clock is the part that can
+be wrong — but with the append fenced on the version, clock skew that lets two nodes both
+decide a lease is free costs duplicated work rather than a corrupted stream, because only one
+of them can commit.
+
+On `FoundationDBPersistenceAdapter` the read, comparison and write are a single transaction,
+so a claim holds across processes. `FileBasedPersistenceAdapter` decides it under the
+directory lock it already holds, which is atomic within the single writer it enforces. An
+adapter that cannot do it atomically throws `UnsupportedOperationException` rather than
+silently accepting every contender.
 
 ---
 
