@@ -135,8 +135,16 @@ and `TypedLogView`. Named `setTagValueIfAbsent` rather than the sketch's
 
 Two things it changed that were not on any list, both in the methods it had to touch:
 `kv.dat` was never fsynced, so an acknowledged checkpoint could be lost while the log entries
-around it survived; and `InMemoryPersistenceAdapter` aliased KV values to the caller's array
-in both directions, which a comparison protocol cannot survive.
+around it survived; and KV values were aliased to the caller's array in both directions on
+both adapters that answer reads from memory, which a comparison protocol cannot survive.
+
+The aliasing is worth remembering for its shape rather than its size. The fix was written for
+`InMemoryPersistenceAdapter` on the reasoning that *durable adapters serialise, so the caller
+cannot reach what they hold* — true of the bytes in `kv.dat`, and irrelevant, because
+`FileBasedPersistenceAdapter` also keeps a `kvStore` cache and **the cache is the read path**.
+So the durable adapter had the same bug with a worse failure mode (invisible until a reopen
+reverted the value), and the review caught it. A durable adapter is not immune to an in-memory
+defect just because it also writes to disk.
 
 It also adds one more `removed call to FileChannel::force` mutant — same deliberately-
 unkillable class as the others (§4), now covering `kv.dat` as well as the log.

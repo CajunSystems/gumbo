@@ -212,10 +212,13 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
     // -------------------------------------------------------------------------
 
     /*
-     * Values are copied in and out. The durable adapters serialise to storage, so a caller
-     * that reuses or mutates a buffer cannot reach what they hold; here the array *is* the
-     * stored state, and handing out a reference to it would let a caller change a value
-     * nobody wrote — including one another caller is comparing against.
+     * Values are copied in and out: here the array *is* the stored state, so handing out a
+     * reference to it would let a caller change a value nobody wrote — including one another
+     * caller is comparing against.
+     *
+     * The same rule applies to any adapter that answers reads from memory, which is both
+     * this one and FileBasedPersistenceAdapter's kvStore cache. Only FoundationDB is exempt,
+     * because the bytes leave the process when the transaction sets them.
      */
 
     @Override

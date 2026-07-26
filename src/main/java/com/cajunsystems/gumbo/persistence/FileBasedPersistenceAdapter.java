@@ -503,18 +503,28 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
      * a read-compare-write cannot interleave with another writer's. That is what makes
      * compareAndSetTagValue atomic; within the single writer this adapter enforces (the
      * directory lock taken in open()), it is sufficient.
+     *
+     * Values are copied in and out. Writing to kv.dat serialises a snapshot of the bytes,
+     * but kvStore is not that snapshot — it is the read path, and every comparison is made
+     * against it. Retaining the caller's array would let the two diverge with no write
+     * between them: a mutation after a successful swap changes what readers and the next
+     * compare see, while kv.dat still holds what was committed, so a reopen silently reverts
+     * the value. Same rule as InMemoryPersistenceAdapter, and it applies here for the extra
+     * reason that the divergence is invisible until a restart.
      */
 
     @Override
     public synchronized void setTagValue(LogTag tag, String key, byte[] value) throws IOException {
         writeKvRecord(tag, key, value);
-        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+        kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value.clone());
     }
 
     @Override
     public byte[] getTagValue(LogTag tag, String key) {
         ConcurrentHashMap<String, byte[]> tagKv = kvStore.get(tag);
-        return tagKv == null ? null : tagKv.get(key);
+        if (tagKv == null) return null;
+        byte[] stored = tagKv.get(key);
+        return stored == null ? null : stored.clone();
     }
 
     @Override
@@ -535,7 +545,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         if (value == null) {
             if (tagKv != null) tagKv.remove(key);
         } else {
-            kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value);
+            kvStore.computeIfAbsent(tag, k -> new ConcurrentHashMap<>()).put(key, value.clone());
         }
         return true;
     }

@@ -53,9 +53,14 @@ the swap, and only one passes the fence. `TagValueCoordinationTest` pins that pa
   survived — and the KV is what a consumer resumes *from*. `kv.dat` is now synced before the
   new value is published to the in-memory map, so visibility follows durability as it does for
   the log
-- **The in-memory adapter aliased KV values to the caller's array**, in and out. It is the one
-  adapter where the stored value is not serialised, so a caller reusing a buffer could change
-  a value nobody wrote — including one another caller was comparing against
+- **KV values were aliased to the caller's array**, in and out, on both adapters that answer
+  reads from memory. A caller reusing a buffer could change a value nobody wrote — including
+  one another caller was comparing against. Worse on `FileBasedPersistenceAdapter`, where
+  `kv.dat` holds the bytes as they were at write time but `kvStore` is the read path: a
+  mutation after a successful swap changed what every reader and the next compare saw while
+  the committed value stayed put, so the divergence was invisible until a reopen silently
+  reverted it. FoundationDB is exempt — the bytes leave the process when the transaction sets
+  them
 
 ---
 

@@ -354,26 +354,69 @@ class TagValueCompareAndSetTest {
     }
 
     /**
-     * The in-memory adapter's stored value is an array, so it is the one adapter where a
-     * caller could reach the stored state after writing it. Copying in and out is what stops
-     * a caller reusing a buffer from silently changing a value another caller is comparing
-     * against — a comparison protocol cannot be built on state its participants can edit.
+     * A stored value must not be aliased to the caller's array, in either direction.
+     *
+     * <p>A comparison protocol cannot be built on state its participants can edit: if a
+     * caller can mutate a value after storing it, the next compare is made against bytes
+     * nobody wrote, and one that mutates a value it read back corrupts the copy every other
+     * caller is comparing against.
+     *
+     * <p>Every adapter that answers reads from memory is exposed, which is more than the
+     * obvious one — the file adapter serialises a snapshot to {@code kv.dat} but keeps a
+     * cache, and the cache is the read path. Hence this runs against all three rather than
+     * only in-memory: it was written for in-memory alone, and the file adapter's cache is
+     * exactly what that missed.
      */
-    @Test
-    void anInMemoryValueIsNotAliasedToTheCallersArray() throws IOException {
-        open(dir -> new InMemoryPersistenceAdapter());
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void aStoredValueIsNotAliasedToTheCallersArray(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
+        open(factory);
 
         byte[] mutable = bytes("node-a");
         adapter.setTagValue(ORDERS, "owner", mutable);
         mutable[0] = 'X';
-
-        assertThat(adapter.getTagValue(ORDERS, "owner")).isEqualTo(bytes("node-a"));
+        assertThat(adapter.getTagValue(ORDERS, "owner"))
+                .as("mutating the array after the write must not change the stored value")
+                .isEqualTo(bytes("node-a"));
 
         byte[] readBack = adapter.getTagValue(ORDERS, "owner");
         readBack[0] = 'Y';
-        assertThat(adapter.compareAndSetTagValue(ORDERS, "owner", bytes("node-a"), bytes("node-b")))
-                .as("a mutated read-back must not have changed the stored value")
+        assertThat(adapter.getTagValue(ORDERS, "owner"))
+                .as("mutating a read-back must not change the stored value")
+                .isEqualTo(bytes("node-a"));
+
+        // ...and the same on the conditional path, which is the one that has to compare.
+        byte[] swapped = bytes("node-b");
+        assertThat(adapter.compareAndSetTagValue(ORDERS, "owner", bytes("node-a"), swapped)).isTrue();
+        swapped[0] = 'Z';
+        assertThat(adapter.getTagValue(ORDERS, "owner")).isEqualTo(bytes("node-b"));
+        assertThat(adapter.compareAndSetTagValue(ORDERS, "owner", bytes("node-b"), bytes("node-c")))
+                .as("the value a swap committed is the value the next swap must match")
                 .isTrue();
+    }
+
+    /**
+     * The consequence that makes the aliasing a durability bug rather than an annoyance: on a
+     * durable adapter the mutation is invisible until a restart, when the in-memory value the
+     * process has been serving silently reverts to whatever was actually committed.
+     */
+    @Test
+    void aMutatedArrayCannotMakeTheLiveValueDivergeFromTheDurableOne() throws IOException {
+        open(FileBasedPersistenceAdapter::new);
+
+        byte[] mine = bytes("node-a");
+        assertThat(adapter.setTagValueIfAbsent(ORDERS, "owner", mine)).isTrue();
+        mine[0] = 'X';   // "node-a" → "Xode-a"
+
+        byte[] live = adapter.getTagValue(ORDERS, "owner");
+        adapter.close();
+
+        open(FileBasedPersistenceAdapter::new);
+        assertThat(adapter.getTagValue(ORDERS, "owner"))
+                .as("what a reopen recovers must be what the live process was serving")
+                .isEqualTo(live)
+                .isEqualTo(bytes("node-a"));
     }
 
     // -------------------------------------------------------------------------
