@@ -128,22 +128,24 @@
                         Ratchet, not a target: set to the measured score, so a decline
                         fails the build rather than being absorbed by slack.
 
-                        Measured at 0.5.0: 473 of 599 killed on CI, 474 locally — 79% both
-                        ways, test strength 84%. Both halves of the fraction moved when A4
-                        landed (the capability declarations added mutable code, and the
-                        honesty tests kill it by asserting behaviour against the
-                        declaration), so the floor is recomputed here rather than carried
-                        over.
+                        Measured at 0.5.0: 473-474 of 599 killed, 79%, test strength 84%.
+                        Both halves of the fraction moved when A4 landed (the capability
+                        declarations added mutable code, and the honesty tests kill it by
+                        asserting behaviour against the declaration), so the floor is
+                        recomputed here rather than carried over.
+
+                        The range is not CI versus local: CI produced both numbers on
+                        identical code, one run either side. It is variance in what times
+                        out, and a timed-out mutant counts as killed.
 
                         PIT compares a rounded integer, so the floor is 462: that reports
                         77 and passes, while 461 reports 76 and fails.
 
                         Still 77, not the 79 these runs would justify, and the reasoning is
                         the same one that held it at 77 last time. The gate exists to catch
-                        a regression, not to sit one mutant above the observed low: at 79
-                        the floor is 474, which the CI run itself does not clear. 77 leaves
-                        eleven mutants of headroom. A slower machine tends to kill more,
-                        not fewer, since a timed-out mutant counts as killed.
+                        a regression, not to sit at the observed high: at 79 the floor is
+                        474, which half the runs on this very code would fail on nothing but
+                        timing. 77 leaves eleven mutants of headroom.
 
                         Raise this when the score rises durably — and recompute the floor
                         with it, since it moves with the denominator. Previously 77 against

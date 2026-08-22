@@ -105,13 +105,17 @@ safe at all.
 
 ### Build and CI
 
-- **Mutation score 473 of 599 killed (79%) on CI, 474 locally; threshold unchanged at 77.**
-  Test strength 84%. Both halves moved: the new mutants are the adapters' declarations and
-  the service's composition, and the capability tests kill them because they assert behaviour
-  *against* the declaration rather than against a fixed expectation per adapter. The floor
-  recomputes to 462 at the new denominator, leaving eleven mutants of headroom. Still not
-  raised to 78, for the reason this file gave last time rather than a new one: the number
-  worth ratcheting to is the low run, and the two runs here differ by one.
+- **Mutation score 473–474 of 599 killed (79%); threshold unchanged at 77.** Test strength
+  84%. Both halves moved: the new mutants are the adapters' declarations and the service's
+  composition, and the capability tests kill them because they assert behaviour *against* the
+  declaration rather than against a fixed expectation per adapter. The floor recomputes to
+  462 at the new denominator, leaving eleven mutants of headroom.
+
+  The range is not CI versus local — **CI produced both numbers on identical code**, one run
+  either side, which is worth recording because the last two releases described the spread as
+  a machine difference. It is run-to-run variance in what times out, and a timed-out mutant
+  counts as killed. That is precisely why the ratchet is not raised to 79: the floor there is
+  474, which half these runs would fail on nothing but timing.
 
 ---
 
