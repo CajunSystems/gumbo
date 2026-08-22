@@ -16,10 +16,13 @@ conditional append), plus a subscription-delivery rewrite and a mutation-testing
 were not on the report's list.
 
 **0.4.0 carries A3** (KV compare-and-set), the release-hygiene work listed in §0 and §4, and
-two KV defects found while implementing it — see the CHANGELOG.
+two KV defects found while implementing it — see the CHANGELOG. Tagged 22 August, four weeks
+after it merged; see §0.
 
-**A4** (declared capabilities) is next in `[Unreleased]`, promoted above its report rank
-because 0.3.0 and 0.4.0 created the adapter variation it exists to declare.
+**0.5.0 carries A4** (declared capabilities), promoted above its report rank because 0.3.0
+and 0.4.0 created the adapter variation it exists to declare — plus a defect found in review
+of it, where the service reported `multiWriter` from storage alone and ignored the sequencer
+it was configured behind.
 
 Report items now outstanding: **A6** (half), **D2**, and the multi-tag version defect —
 which has **moved to the front of the queue**, for a reason that came from the consumer
@@ -39,6 +42,13 @@ JitPack has built it: `jitpack.io/api/builds/com.github.CajunSystems/gumbo` repo
 `0.4.0` follows it, carrying A3 — see the CHANGELOG. It is a minor bump rather than a patch
 because `LogView` and `TypedLogView` each gained two abstract methods, which is source-
 breaking for implementors.
+
+**And then it sat untagged for four weeks.** 0.4.0 merged on 26 July; the tag was pushed on
+22 August. In between, everything in it was unreachable from any build resolving through
+JitPack, which builds from tags — including the conditional KV that the whole lease and claim
+story rests on. Catalyst stayed pinned to 0.3.0 for that reason alone, and nothing in either
+repository looked wrong. **Cutting a release is merging plus tagging; the second half is the
+half that publishes it.** `0.5.0` carries A4 and needs the same treatment.
 
 ### ~~Coordinates need checking~~ — settled, and measured
 
@@ -65,15 +75,23 @@ So the earlier note in Catalyst's pom — that jitpack.io is blocked and gumbo m
 local `mvn install` — was true of one sandboxed environment, not of the delivery mechanism.
 The README now documents which coordinate to use and why there are two.
 
-**Still to do on this:** Catalyst's pom change (groupId + the `jitpack.io` repository) is
-written but not committed. It is what unblocks §1 on CI rather than only on a machine where
-someone ran the install.
+~~**Still to do on this:** Catalyst's pom change (groupId + the `jitpack.io` repository) is
+written but not committed.~~ Committed as Catalyst `590c197`, and Catalyst is now on 0.4.0
+with its CI resolving the JitPack coordinate.
 
 ---
 
-## 1. Catalyst: D4 is still live
+## 1. ~~Catalyst: D4 is still live~~ — fixed
 
-The bug that prompted the whole report, still unfixed, now unblocked by 0.3.0.
+The bug that prompted the whole report. Closed on the Catalyst side by `75b8cc6`, which
+adopted `readAfterVersion` — 0.3.0 only *added* the version-keyed read, so the upgrade alone
+changed nothing and the whole suite stayed green while the old call kept being wrong. Kept
+here because the shape of it is the argument for A4: a client cannot ask what a read is keyed
+on, so it assumes. Regression coverage is
+`SnapshotAcceptanceTest.warmInspectMatchesColdWhenAnotherExecutionSharesTheLog`, which fails
+if the seqnum-keyed read is restored.
+
+What it was:
 
 `catalyst-gumbo/GumboEventLog` passes a per-execution cursor into a seqnum-keyed read. The
 two number spaces coincide only when the log holds one stream — true in every test, false
@@ -87,16 +105,16 @@ PROBE SHARED log (2 executions)  cold steps=43  warm steps=51  *** CORRUPTED ***
 The reducer re-applies events already folded into the snapshot, so timeline steps, token
 counts, cost and attempt counters all double-count.
 
-**Fix:** bump Catalyst to gumbo 0.3.0, switch the tail read to `readFromVersion` /
+**Fix, as applied:** bump Catalyst to gumbo 0.3.0, switch the tail read to `readFromVersion` /
 `readAfterVersion`, and add a regression test with two executions in one log — the
 configuration that exposes it. Catalyst's `seq` is gumbo's `streamVersion`, so the rename
-also applies (`localId()` still works, deprecated for removal).
+also applied (`localId()` still works, deprecated for removal).
 
 ---
 
 ## 2. Report items not started
 
-### ~~A4 — declared capabilities~~ — done, unreleased
+### ~~A4 — declared capabilities~~ — shipped in 0.5.0
 
 Promoted above its report rank (7th, as polish) on the grounds that 0.3.0 and 0.4.0 had
 since created the variation it exists to declare: the same `append(request,
@@ -108,7 +126,7 @@ happened. See the CHANGELOG's `[Unreleased]`.
 `PersistenceAdapter.capabilities()` and `SharedLog.capabilities()`, with the report's
 test #5 as `LogCapabilityHonestyTest`.
 
-Three things it settled that the sketch did not raise:
+Four things it settled that the sketch did not raise:
 
 - **The reach of a fence is the pair `conditionalAppend` + `multiWriter`**, not a third
   "scope" field. The first says the compare and the increment are indivisible; the second
@@ -121,6 +139,15 @@ Three things it settled that the sketch did not raise:
   and lands the entry at flush, so across processes the compare no longer guards the write.
   It forces `multiWriter` off however capable the delegate is. Nobody had written that down;
   wrapping the FDB adapter silently downgrades it.
+
+- **`multiWriter` is not a storage property.** It needs storage that assigns per-tag versions
+  across processes *and* a `Sequencer` whose global `seqnum` spans them, and the service owns
+  the second — defaulting to a per-process `AtomicLong`. The first cut passed the adapter's
+  answer straight through, so an FDB adapter behind the default sequencer reported
+  `multiWriter: true` while two processes would collide on seqnums, overwriting seqnum-keyed
+  index entries. Caught in review on #28. `Sequencer.distributed()` now carries the second
+  half. The lesson generalises: a capability composed from layers has to be *composed*, not
+  forwarded, or the topmost layer's answer describes only the bottom one.
 
 The defaults are conservative in the direction that fails safe: under-reporting costs a
 caller functionality, over-reporting costs it correctness, silently.
@@ -361,12 +388,15 @@ Untouched, and all still true.
 
 ## Suggested order
 
-1. **Tag 0.4.0** — merged as `ceb0e0e` and still untagged, so JitPack cannot build it and
-   Catalyst cannot move off 0.3.0. Everything A3 shipped is unreachable downstream until
-   this one-line act happens; it is the cheapest item on this list by a wide margin
-2. ~~**Commit Catalyst's coordinate change**~~ and ~~**fix its D4**~~ — both done
-   (Catalyst `590c197`, `75b8cc6`)
-3. ~~**A4 capabilities**~~ — done, unreleased (§2)
+1. **Tag 0.5.0** — the version is cut in `pom.xml` and the CHANGELOG is dated, so the release
+   is one `git push origin 0.5.0` from being reachable. Until then A4 is merged and invisible
+   downstream, which is exactly where 0.4.0 sat for four weeks (§0). Catalyst is waiting on it
+   specifically: `GumboEventLog.supportsConditionalAppend()` returns a hardcoded `true` that
+   becomes a delegation to `capabilities()` once this is resolvable, and `multiWriter()` — the
+   flag a distributed runtime must check before starting — is not askable at all until then
+2. ~~**Tag 0.4.0**~~, ~~**commit Catalyst's coordinate change**~~ and ~~**fix its D4**~~ — all
+   done (tag `0.4.0` → `ceb0e0e`; Catalyst `590c197`, `75b8cc6`, and Catalyst is on 0.4.0)
+3. ~~**A4 capabilities**~~ — shipped in 0.5.0 (§2)
 4. **Multi-tag versions** — moved up from last. Not because it got cheaper (it is still the
    only item with a log-migration cost) but because Catalyst's v1 claimable-work design
    depends on the pattern it breaks. See §3
