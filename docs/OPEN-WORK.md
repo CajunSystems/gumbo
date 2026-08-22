@@ -24,9 +24,9 @@ and 0.4.0 created the adapter variation it exists to declare — plus a defect f
 of it, where the service reported `multiWriter` from storage alone and ignored the sequencer
 it was configured behind.
 
-Report items now outstanding: **A6** (half), **D2**, and the multi-tag version defect —
-which has **moved to the front of the queue**, for a reason that came from the consumer
-rather than from here. See below.
+The multi-tag version defect is **fixed** and awaiting release — see §3 and the CHANGELOG.
+
+Report items now outstanding: **A6** (half) and **D2**.
 
 See [`FAILURE_SEMANTICS.md`](FAILURE_SEMANTICS.md) for the write-path contracts, which
 several items below depend on.
@@ -215,7 +215,30 @@ selection for a multi-tag append, which is the only way to get it.
 These were discovered while implementing the report, are not in it, and are all documented
 in code and pinned by tests where possible.
 
-### Multi-tag entries carry one version — needs a log migration
+### ~~Multi-tag entries carry one version — needs a log migration~~ — fixed, unreleased
+
+Each tag an entry carries now gets its own position. See the CHANGELOG's `[Unreleased]`.
+
+**The migration cost turned out to be avoidable, and that is the reusable part.** This was
+filed as the one item with a data-format cost, and the record layout did change — but the
+marker on each record says which layout it is, so nothing already written is rewritten and a
+log simply carries both from the upgrade onwards. Worth remembering the next time a change
+looks like it forces a migration: a per-record discriminator converts "migrate everything"
+into "read both", and the old records keep their exact previous meaning.
+
+**What did not work, and why it is worth writing down.** Deriving each tag's position as its
+rank in the per-tag index would have needed no format change whatsoever. It fails on `trim`:
+`trim()` purges the in-memory index and `rebuildTagIndices()` skips everything below the trim
+point, so a trim renumbers every surviving entry and silently invalidates every cursor a
+consumer holds. The version is stored precisely because it has to survive a trim — which is
+not obvious from reading the append path, only from reading the trim path.
+
+**A test that asserted the bug.** The property test here (*both streams cannot be dense from
+0*) was correct and well-written, and inverting it was part of the fix. Worth noticing that a
+defect pinned this precisely is one someone can fix confidently years later; the cost is
+remembering to invert it rather than delete it.
+
+The original diagnosis follows.
 
 **Re-ranked.** It was filed last, on cost, and that reading of the cost still holds — it is
 the only item here that changes the on-disk record. What changed is the *demand* for it,
@@ -388,18 +411,15 @@ Untouched, and all still true.
 
 ## Suggested order
 
-1. **Tag 0.5.0** — the version is cut in `pom.xml` and the CHANGELOG is dated, so the release
-   is one `git push origin 0.5.0` from being reachable. Until then A4 is merged and invisible
-   downstream, which is exactly where 0.4.0 sat for four weeks (§0). Catalyst is waiting on it
-   specifically: `GumboEventLog.supportsConditionalAppend()` returns a hardcoded `true` that
-   becomes a delegation to `capabilities()` once this is resolvable, and `multiWriter()` — the
-   flag a distributed runtime must check before starting — is not askable at all until then
+1. ~~**Tag 0.5.0**~~ — tagged (`0.5.0` → `8230289`) and adopted: Catalyst is on it and its
+   capability answers now delegate rather than assert. **Cut and tag 0.6.0** for the multi-tag
+   version fix, which is the next thing a consumer is waiting on — Catalyst's claimable-work
+   design cannot cursor a queue tag until it is released
 2. ~~**Tag 0.4.0**~~, ~~**commit Catalyst's coordinate change**~~ and ~~**fix its D4**~~ — all
    done (tag `0.4.0` → `ceb0e0e`; Catalyst `590c197`, `75b8cc6`, and Catalyst is on 0.4.0)
 3. ~~**A4 capabilities**~~ — shipped in 0.5.0 (§2)
-4. **Multi-tag versions** — moved up from last. Not because it got cheaper (it is still the
-   only item with a log-migration cost) but because Catalyst's v1 claimable-work design
-   depends on the pattern it breaks. See §3
+4. ~~**Multi-tag versions**~~ — done, unreleased. It cost a record-layout change but no
+   migration: a per-record marker lets both layouts coexist. See §3
 5. **Fault-injection harness** (§4) — before D2, which is its first customer
 6. **D2** non-clobbering index
 7. **Batching decision** (§3) and/or the decorator spike (§4) — same subject, take together

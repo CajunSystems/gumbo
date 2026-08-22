@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -79,9 +80,12 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
             tagIndex
                     .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
                     .put(entry.seqnum(), entry.seqnum());
+            // That tag's own position, not the entry's primary one. Raising every tag's
+            // counter to the primary's version is what used to drag a shared queue tag's
+            // numbering along behind whichever stream happened to be appended with it.
             tagVersionCount
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
-                    .updateAndGet(current -> Math.max(current, entry.streamVersion() + 1));
+                    .updateAndGet(current -> Math.max(current, entry.streamVersion(tag) + 1));
         }
     }
 
@@ -92,8 +96,7 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
     @Override
     public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
             throws VersionConflictException {
-        LogEntry entry = pending.withVersion(
-                claimVersion(pending.primaryTag(), expectedVersion));
+        LogEntry entry = pending.withVersions(claimVersions(pending, expectedVersion));
         append(entry);
         return entry;
     }
@@ -103,21 +106,35 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
             throws VersionConflictException {
         List<LogEntry> entries = new ArrayList<>(pendings.size());
         for (PendingAppend p : pendings) {
-            entries.add(p.withVersion(claimVersion(p.primaryTag(), PersistenceAdapter.ANY_VERSION)));
+            entries.add(p.withVersions(claimVersions(p, PersistenceAdapter.ANY_VERSION)));
         }
         for (LogEntry e : entries) append(e);
         return entries;
     }
 
-    /** Reserves the tag's next version, enforcing {@code expectedVersion} if given. */
-    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
-        AtomicLong counter = tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0));
-        long next = counter.get();
-        if (expectedVersion != PersistenceAdapter.ANY_VERSION && expectedVersion != next) {
-            throw new VersionConflictException(tag, expectedVersion, next);
+    /**
+     * Reserves the next version in <em>every</em> tag the append touches, enforcing
+     * {@code expectedVersion} on the fenced tag if one is given.
+     *
+     * <p>The fence is checked before anything is consumed, so a rejected append leaves no
+     * tag's counter advanced — otherwise a stale writer would burn a position in each of
+     * the other streams on its way to being refused.
+     */
+    private Map<LogTag, Long> claimVersions(PendingAppend pending, long expectedVersion)
+            throws VersionConflictException {
+        LogTag fenced = pending.primaryTag();
+        if (expectedVersion != PersistenceAdapter.ANY_VERSION) {
+            long next = tagVersionCount.computeIfAbsent(fenced, k -> new AtomicLong(0)).get();
+            if (expectedVersion != next) {
+                throw new VersionConflictException(fenced, expectedVersion, next);
+            }
         }
-        counter.set(next + 1);
-        return next;
+        Map<LogTag, Long> versions = new LinkedHashMap<>();
+        for (LogTag tag : pending.tags()) {
+            versions.put(tag, tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0))
+                    .getAndIncrement());
+        }
+        return versions;
     }
 
     // -------------------------------------------------------------------------
@@ -151,9 +168,9 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
 
     /**
      * Walks the per-tag index in seqnum order and keeps the entries at or past
-     * {@code fromVersion}. The version is read off the entry rather than the index: this
-     * adapter stores the seqnum as the index value (see {@link #append}), so the index
-     * cannot answer the version question by itself.
+     * {@code fromVersion} <em>in this tag's own stream</em>. The version is read off the
+     * entry rather than the index: this adapter stores the seqnum as the index value (see
+     * {@link #append}), so the index cannot answer the version question by itself.
      */
     @Override
     public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) {
@@ -163,7 +180,7 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         List<LogEntry> result = new ArrayList<>();
         for (long seqnum : idx.keySet()) {
             LogEntry entry = log.get(seqnum);
-            if (entry != null && entry.streamVersion() >= fromVersion) result.add(entry);
+            if (entry != null && entry.streamVersion(tag) >= fromVersion) result.add(entry);
         }
         return Collections.unmodifiableList(result);
     }

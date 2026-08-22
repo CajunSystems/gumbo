@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -166,7 +167,7 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
     public LogEntry append(PendingAppend pending, long expectedVersion) throws IOException {
         flushLock.lock();
         try {
-            LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
+            LogEntry entry = pending.withVersions(claimVersions(pending, expectedVersion));
             pendingBatch.add(entry);
             if (pendingBatch.size() >= maxBatchSize) flushUnderLock();
             return entry;
@@ -182,7 +183,7 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         try {
             List<LogEntry> entries = new ArrayList<>(pendings.size());
             for (PendingAppend p : pendings) {
-                LogEntry e = p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION));
+                LogEntry e = p.withVersions(claimVersions(p, ANY_VERSION));
                 entries.add(e);
                 pendingBatch.add(e);
             }
@@ -193,19 +194,35 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         }
     }
 
-    /** Next version for {@code tag}: the delegate's, plus anything pending for it. */
-    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
-        long next = getNextStreamVersionUnderLock(tag);
-        if (expectedVersion != ANY_VERSION && expectedVersion != next) {
-            throw new VersionConflictException(tag, expectedVersion, next);
+    /**
+     * Next version in every tag the append touches: the delegate's, plus anything pending
+     * for that tag. The fence, when given, applies to the named tag only.
+     */
+    private Map<LogTag, Long> claimVersions(PendingAppend pending, long expectedVersion)
+            throws VersionConflictException {
+        LogTag fenced = pending.primaryTag();
+        if (expectedVersion != ANY_VERSION) {
+            long next = getNextStreamVersionUnderLock(fenced);
+            if (expectedVersion != next) {
+                throw new VersionConflictException(fenced, expectedVersion, next);
+            }
         }
-        return next;
+        Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
+        for (LogTag tag : pending.tags()) versions.put(tag, getNextStreamVersionUnderLock(tag));
+        return versions;
     }
 
+    /**
+     * The delegate's next version for {@code tag}, advanced past anything buffered here.
+     *
+     * <p>Reads each buffered entry's position <em>in this tag</em> rather than its primary
+     * one — a pending entry that carries the tag as a secondary occupies a position in this
+     * stream too, and skipping it would hand the same number out twice.
+     */
     private long getNextStreamVersionUnderLock(LogTag tag) {
         long next = delegate.getNextStreamVersion(tag);
         for (LogEntry e : pendingBatch) {
-            if (e.tags().contains(tag)) next = Math.max(next, e.streamVersion() + 1);
+            if (e.tags().contains(tag)) next = Math.max(next, e.streamVersion(tag) + 1);
         }
         return next;
     }
@@ -260,7 +277,7 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         List<LogEntry> snapshot = pendingSnapshot();
         List<LogEntry> fromDelegate = delegate.readFromVersion(tag, fromVersion);
         return merge(fromDelegate, snapshot,
-                e -> e.tags().contains(tag) && e.streamVersion() >= fromVersion);
+                e -> e.tags().contains(tag) && e.streamVersion(tag) >= fromVersion);
     }
 
     // -------------------------------------------------------------------------
@@ -295,7 +312,7 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
         // count that stops at the last flush.
         long count = delegate.getNextStreamVersion(tag);
         for (LogEntry e : pendingSnapshot()) {
-            if (e.tags().contains(tag)) count = Math.max(count, e.streamVersion() + 1);
+            if (e.tags().contains(tag)) count = Math.max(count, e.streamVersion(tag) + 1);
         }
         return count;
     }

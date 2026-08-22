@@ -324,7 +324,19 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 if (expectedVersion != ANY_VERSION && expectedVersion != next) {
                     throw new ConflictSignal(new VersionConflictException(primary, expectedVersion, next));
                 }
-                LogEntry e = pending.withVersion(next);
+                // Every tag the append touches gets its own next position, read in the same
+                // transaction as the fence so the pair stays indivisible.
+                java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
+                for (LogTag tag : pending.tags()) {
+                    if (tag.equals(primary)) {
+                        versions.put(tag, next);
+                        continue;
+                    }
+                    byte[] r = tr.get(tagCountSubspace.pack(
+                            Tuple.from(tag.namespace(), tag.key()))).join();
+                    versions.put(tag, r == null ? 0L : ByteBuffer.wrap(r).getLong());
+                }
+                LogEntry e = pending.withVersions(versions);
                 writeEntry(tr, e);
                 tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)),
                        longBytes(Math.max(latestSeqnum, e.seqnum())));
@@ -349,14 +361,17 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 List<LogEntry> out = new ArrayList<>(pendings.size());
                 long maxSeqnum = latestSeqnum;
                 for (PendingAppend p : pendings) {
-                    LogTag primary = p.primaryTag();
-                    long v = next.computeIfAbsent(primary, t -> {
-                        byte[] raw = tr.get(tagCountSubspace.pack(
-                                Tuple.from(t.namespace(), t.key()))).join();
-                        return raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
-                    });
-                    next.put(primary, v + 1);
-                    LogEntry e = p.withVersion(v);
+                    java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
+                    for (LogTag tag : p.tags()) {
+                        long v = next.computeIfAbsent(tag, t -> {
+                            byte[] raw = tr.get(tagCountSubspace.pack(
+                                    Tuple.from(t.namespace(), t.key()))).join();
+                            return raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
+                        });
+                        next.put(tag, v + 1);
+                        versions.put(tag, v);
+                    }
+                    LogEntry e = p.withVersions(versions);
                     writeEntry(tr, e);
                     out.add(e);
                     if (e.seqnum() > maxSeqnum) maxSeqnum = e.seqnum();
@@ -375,19 +390,19 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private void writeEntry(com.apple.foundationdb.Transaction tr, LogEntry entry) {
         tr.set(logSubspace.pack(Tuple.from(entry.seqnum())), encodeEntry(entry));
         for (LogTag tag : entry.tags()) {
+            long version = entry.streamVersion(tag);
             tr.set(tagSubspace.pack(Tuple.from(tag.namespace(), tag.key(), entry.seqnum())),
-                   longBytes(entry.streamVersion()));
+                   longBytes(version));
 
-            // Raise the tag's count, never lower it. An entry carries one version — its
-            // primary tag's — so on a multi-tag append a secondary tag may already be
-            // further along its own sequence. Overwriting its count with this entry's
-            // version + 1 would hand out versions that already exist on that tag, and,
-            // now that the conditional append reads this key as its fence, would let a
-            // stale writer pass a check it should have failed.
+            // Raise the tag's count, never lower it. Each tag now carries its own position,
+            // so this is normally exactly current + 1; the guard remains because a lower
+            // write would hand out versions that already exist on the tag and, since the
+            // conditional append reads this key as its fence, would let a stale writer pass
+            // a check it should have failed.
             byte[] countKey = tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
             byte[] rawCount = tr.get(countKey).join();
             long currentCount = rawCount == null ? 0L : ByteBuffer.wrap(rawCount).getLong();
-            long candidate = entry.streamVersion() + 1;
+            long candidate = version + 1;
             if (candidate > currentCount) tr.set(countKey, longBytes(candidate));
 
             // Same reasoning for the tag's latest seqnum. Seqnums only grow, so this
@@ -403,8 +418,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private void cacheAfterCommit(LogEntry entry) {
         if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
         for (LogTag tag : entry.tags()) {
+            long version = entry.streamVersion(tag);
             tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0))
-                    .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
+                    .updateAndGet(c -> Math.max(c, version + 1));
             tagLatestSeqnum.computeIfAbsent(tag, k -> new AtomicLong(-1L))
                     .updateAndGet(c -> Math.max(c, entry.seqnum()));
         }
@@ -436,9 +452,10 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             for (LogEntry entry : entries) {
                 if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
                 for (LogTag tag : entry.tags()) {
+                    long v = entry.streamVersion(tag);
                     tagVersionCount
                         .computeIfAbsent(tag, k -> new AtomicLong(0))
-                        .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
+                        .updateAndGet(c -> Math.max(c, v + 1));
                     tagLatestSeqnum
                         .computeIfAbsent(tag, k -> new AtomicLong(-1L))
                         .updateAndGet(c -> Math.max(c, entry.seqnum()));
@@ -722,6 +739,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     static byte[] encodeEntry(LogEntry entry) {
         List<byte[]> nsBufs  = new ArrayList<>();
         List<byte[]> keyBufs = new ArrayList<>();
+        List<Long>   tagVers = new ArrayList<>();
         int tagsLen = 0;
 
         for (LogTag tag : entry.tags()) {
@@ -729,13 +747,15 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             byte[] key = tag.key().getBytes(StandardCharsets.UTF_8);
             nsBufs.add(ns);
             keyBufs.add(key);
-            tagsLen += 2 + ns.length + 2 + key.length;
+            tagVers.add(entry.streamVersion(tag));
+            tagsLen += 2 + ns.length + 2 + key.length + 8;   // + this tag's own version
         }
 
         byte[] data     = entry.dataUnsafe();
-        int    totalLen = 8 + 8 + 8 + 4 + tagsLen + 4 + data.length;
+        int    totalLen = 8 + 8 + 8 + 8 + 4 + tagsLen + 4 + data.length;
 
         ByteBuffer buf = ByteBuffer.allocate(totalLen);
+        buf.putLong(PER_TAG_VERSION_MARKER);
         buf.putLong(entry.seqnum());
         buf.putLong(entry.timestamp().toEpochMilli());
         buf.putLong(entry.streamVersion());
@@ -746,6 +766,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             buf.put(nsBufs.get(i));
             buf.putShort((short) keyBufs.get(i).length);
             buf.put(keyBufs.get(i));
+            buf.putLong(tagVers.get(i));
         }
 
         buf.putInt(data.length);
@@ -753,14 +774,29 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         return buf.array();
     }
 
-    static LogEntry decodeEntry(byte[] bytes) {
-        ByteBuffer buf    = ByteBuffer.wrap(bytes);
-        long       seqnum = buf.getLong();
-        long       tsMs   = buf.getLong();
-        long       version= buf.getLong();
-        int        nTags  = buf.getInt();
+    /**
+     * Leading sentinel marking a value that carries a version per tag.
+     *
+     * <p>FDB values have no magic header — integrity is the storage layer's job — so the
+     * discriminator has to come from a field that could not otherwise hold this value. The
+     * old layout began with the seqnum, which is always {@code >= 0}, so a negative first
+     * long cannot be one. Values written before this are read exactly as before, which is
+     * what lets an existing log carry both layouts without a migration.
+     */
+    private static final long PER_TAG_VERSION_MARKER = -1L;
 
-        Set<LogTag> tags = new HashSet<>(nTags);
+    static LogEntry decodeEntry(byte[] bytes) {
+        ByteBuffer buf   = ByteBuffer.wrap(bytes);
+        long       first = buf.getLong();
+        boolean    perTag = first == PER_TAG_VERSION_MARKER;
+
+        long seqnum = perTag ? buf.getLong() : first;
+        long tsMs   = buf.getLong();
+        long version= buf.getLong();
+        int  nTags  = buf.getInt();
+
+        Set<LogTag> tags = new java.util.LinkedHashSet<>(nTags);
+        java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
         for (int i = 0; i < nTags; i++) {
             int    nsLen = Short.toUnsignedInt(buf.getShort());
             byte[] ns    = new byte[nsLen];
@@ -768,15 +804,21 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             int    keyLen = Short.toUnsignedInt(buf.getShort());
             byte[] key    = new byte[keyLen];
             buf.get(key);
-            tags.add(LogTag.of(new String(ns, StandardCharsets.UTF_8),
-                               new String(key, StandardCharsets.UTF_8)));
+            LogTag tag = LogTag.of(new String(ns, StandardCharsets.UTF_8),
+                                   new String(key, StandardCharsets.UTF_8));
+            tags.add(tag);
+            if (perTag) versions.put(tag, buf.getLong());
         }
 
         int    dataLen = buf.getInt();
         byte[] data    = new byte[dataLen];
         if (dataLen > 0) buf.get(data);
 
-        return new LogEntry(seqnum, version, tags, data, Instant.ofEpochMilli(tsMs));
+        // A value written before per-tag versions holds one number and cannot say which
+        // tag it counted, so it keeps answering every tag with it — exactly as before.
+        return perTag
+                ? new LogEntry(seqnum, versions, tags, data, Instant.ofEpochMilli(tsMs))
+                : new LogEntry(seqnum, version, tags, data, Instant.ofEpochMilli(tsMs));
     }
 
     /** Estimates encoded byte size for chunking decisions. */
@@ -785,8 +827,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         for (LogTag tag : entry.tags()) {
             tagsLen += 2 + tag.namespace().getBytes(StandardCharsets.UTF_8).length;
             tagsLen += 2 + tag.key().getBytes(StandardCharsets.UTF_8).length;
+            tagsLen += 8;
         }
-        return 8 + 8 + 8 + 4 + tagsLen + 4 + entry.dataUnsafe().length;
+        return 8 + 8 + 8 + 8 + 4 + tagsLen + 4 + entry.dataUnsafe().length;
     }
 
     // =========================================================================
