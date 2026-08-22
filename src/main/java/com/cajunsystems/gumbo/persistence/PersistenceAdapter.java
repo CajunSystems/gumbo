@@ -1,6 +1,7 @@
 package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.CounterValues;
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -290,6 +291,40 @@ public interface PersistenceAdapter extends AutoCloseable {
     default long getLatestSeqnumForTag(LogTag tag) throws IOException {
         List<LogEntry> entries = readByTag(tag, 0L);
         return entries.isEmpty() ? -1L : entries.get(entries.size() - 1).seqnum();
+    }
+
+    // -------------------------------------------------------------------------
+    // Capabilities
+    // -------------------------------------------------------------------------
+
+    /**
+     * What this adapter can actually do, so a client can ask instead of assuming.
+     *
+     * <p>Several methods on this interface are optional and several more differ in
+     * <em>reach</em> rather than in presence — a conditional append arbitrated across
+     * processes on FoundationDB is the same call that is arbitrated within a single writer
+     * on the file adapter. Until now that difference existed only in prose, which is how a
+     * downstream consumer came to use a seqnum-keyed read as a version-keyed one.
+     *
+     * <p>The default answers for the defaults <em>this interface</em> provides, and no
+     * more: {@link #readFromVersion} has a working (if unoptimised) default, so
+     * {@code versionedReads} is true; conditional append and the conditional KV both throw
+     * unless overridden, so they are false. An adapter that overrides them must override
+     * this too — an inherited answer describes the interface, not the implementation.
+     *
+     * <p>{@code pushSubscriptions} is never set here. Delivery is implemented above
+     * storage by {@link com.cajunsystems.gumbo.service.SharedLogService}, which adds it
+     * when it answers for the log as a whole.
+     *
+     * <p>Under-reporting is the safe direction: a client that believes a capability is
+     * missing declines to use it, where one that believes a missing capability is present
+     * corrupts state. Declaring less than is true is a bug worth fixing; declaring more is
+     * the failure this method exists to prevent.
+     */
+    default LogCapabilities capabilities() {
+        return LogCapabilities.builder()
+                .versionedReads(true)
+                .build();
     }
 
     // ── Key-Value ──

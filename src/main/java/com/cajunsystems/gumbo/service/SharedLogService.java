@@ -7,6 +7,7 @@ import com.cajunsystems.gumbo.serialization.LogSerializer;
 import com.cajunsystems.gumbo.core.AppendRequest;
 import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.AppendResult;
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
@@ -317,6 +318,25 @@ public class SharedLogService implements SharedLog {
     @Override
     public long getLatestSeqnum() {
         return adapter.getLatestSeqnum();
+    }
+
+    /**
+     * The adapter's capabilities, with {@code pushSubscriptions} added.
+     *
+     * <p>Delivery is this layer's, not storage's: {@link #subscribe} is served by
+     * {@code notifySubscribers} after a successful append, over any adapter at all. So the
+     * adapter is not asked about it — it would have to answer for code it does not contain,
+     * and the honest answer would be a constant either way.
+     *
+     * <p>Everything else is passed through untouched. This layer adds no fencing and
+     * weakens none, so restating an adapter's answer in terms of its own opinion could only
+     * introduce a place for the two to disagree.
+     */
+    @Override
+    public LogCapabilities capabilities() {
+        return LogCapabilities.builder(adapter.capabilities())
+                .pushSubscriptions(true)
+                .build();
     }
 
     // -------------------------------------------------------------------------

@@ -5,6 +5,77 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)
+at its item **A4**, promoted well above its original rank. The report put capabilities
+seventh, as polish, reasoning that there was no real variation between adapters to
+declare. 0.3.0 and 0.4.0 created that variation: `append(request, expectedVersion)` and
+`compareAndSetTagValue` are arbitrated *across processes* on FoundationDB and *within a
+single writer* on the file adapter. Both implement the method. They do not make the same
+promise, and until now the difference existed only in prose — which is exactly how D4
+happened, a client assuming a guarantee its adapter did not provide.
+
+### Added
+
+**Declared capabilities, per adapter**
+- New `LogCapabilities` record — `conditionalAppend`, `compareAndSet`, `versionedReads`,
+  `pushSubscriptions`, `atomicMultiTagAppend`, `multiWriter` — built by name rather than
+  from six positional booleans, and composable from another log's answer via
+  `LogCapabilities.builder(from)`
+- `PersistenceAdapter.capabilities()` and `SharedLog.capabilities()`. Both have defaults,
+  both conservative: the adapter default declares only what *the interface itself*
+  provides (`versionedReads`, which has a working filtering default) and nothing else, and
+  `SharedLog`'s declares nothing at all
+- The reach of a fence is carried by the **pair** `conditionalAppend` + `multiWriter`
+  rather than by a third "scope" concept: the first says the compare and the increment are
+  indivisible, the second says that holds against writers in other processes. A runtime
+  that distributes execution needs both and can now refuse to start without them
+- `pushSubscriptions` is never set by an adapter. Delivery is implemented above storage, so
+  `SharedLogService` adds it when it answers for the log as a whole — an adapter asked
+  about it would be answering for code it does not contain
+
+**What each shipped adapter declares**
+
+| | conditional append | compare-and-set | versioned reads | atomic multi-tag | multi-writer |
+|---|---|---|---|---|---|
+| `InMemoryPersistenceAdapter` | ✓ | ✓ | ✓ | ✓ | — |
+| `FileBasedPersistenceAdapter` | ✓ | ✓ | ✓ | ✓ | — |
+| `FoundationDBPersistenceAdapter` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `BatchingPersistenceAdapter` | delegate's | delegate's | delegate's | delegate's | — |
+
+- The file adapter's `multiWriter: false` is false by **enforcement**, not omission — the
+  exclusive directory lock from 0.3.0 refuses a second process — which is what makes its
+  single-writer fence sufficient rather than merely convenient
+- **`BatchingPersistenceAdapter` narrows its delegate**, and this is the declaration worth
+  knowing: it passes everything through except `multiWriter`, which it forces off however
+  capable the delegate is. A version is claimed when `append` returns but the entry lands
+  at flush time, and across two processes those two moments admit a third party between
+  them. Wrapping a FoundationDB adapter therefore downgrades it, silently, unless someone
+  asks
+
+**Honesty is tested, not documented** — `LogCapabilityHonestyTest` is the report's test #5:
+for every adapter, each capability it declares is exercised, and each one it disclaims is
+asserted to *throw* rather than silently no-op. Every test branches on the declaration
+rather than on a hard-coded expectation per adapter, so flipping a flag without changing
+behaviour fails the build — which is the mutation that matters and the one a fixed
+expectation would miss. Verified by injecting the lies and watching it fail (a file adapter
+claiming `multiWriter`, an in-memory adapter disclaiming its own fence: four failures,
+including the decorator case). One test covers the inherited default itself, via an adapter
+implementing only the abstract methods — the case that decides whether having a default is
+safe at all.
+
+### Build and CI
+
+- **Mutation score 468 of 597 killed (78%), threshold unchanged at 77.** Both halves moved:
+  the five new mutants are the adapters' declarations, and the honesty test kills them
+  because it asserts behaviour *against* the declaration rather than against a fixed
+  expectation per adapter. The floor recomputes to 460 at the new denominator, leaving
+  eight mutants of headroom — the same reasoning as last time says do not raise to 78 on
+  the strength of one run when the score varies by about two between them.
+
+---
+
 ## [0.4.0] — 2026-07-26
 
 Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)

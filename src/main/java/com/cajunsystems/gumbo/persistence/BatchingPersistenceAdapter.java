@@ -1,5 +1,6 @@
 package com.cajunsystems.gumbo.persistence;
 
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -311,6 +312,32 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
             }
         }
         return Math.max(delegateLatest, pendingLatest);
+    }
+
+    // -------------------------------------------------------------------------
+    // Capabilities
+    // -------------------------------------------------------------------------
+
+    /**
+     * The delegate's, narrowed to this process.
+     *
+     * <p>{@code multiWriter} is forced off however capable the delegate is, and it is the
+     * one declaration here that is not a pass-through. A version is claimed when
+     * {@link #append(PendingAppend, long)} returns, against the delegate's count plus this
+     * decorator's own pending buffer — but the entry lands at flush time, later. Across two
+     * processes those two moments admit a third party between them: the compare no longer
+     * guards the write it was meant to guard. Within one process the flush lock closes that
+     * gap, so the fence is real and {@code conditionalAppend} stays true; the pair
+     * (fenced, not multi-writer) is exactly how that reach is stated.
+     *
+     * <p>Wrapping a FoundationDB adapter therefore <em>downgrades</em> it, quietly, unless
+     * someone asks. This method is how they ask.
+     */
+    @Override
+    public LogCapabilities capabilities() {
+        return LogCapabilities.builder(delegate.capabilities())
+                .multiWriter(false)
+                .build();
     }
 
     /*

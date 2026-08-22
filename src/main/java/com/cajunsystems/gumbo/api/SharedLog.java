@@ -2,6 +2,7 @@ package com.cajunsystems.gumbo.api;
 
 import com.cajunsystems.gumbo.core.AppendRequest;
 import com.cajunsystems.gumbo.core.AppendResult;
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
@@ -204,6 +205,28 @@ public interface SharedLog extends AutoCloseable {
 
     /** Returns the highest seqnum that has been committed, or {@code -1} if empty. */
     long getLatestSeqnum();
+
+    /**
+     * What this log can actually do — the storage adapter's answer, plus what the service
+     * layer adds on top of it.
+     *
+     * <p>Ask before relying on an optional guarantee rather than after. Several operations
+     * here are optional, and several more differ in reach rather than in presence: a
+     * conditional {@link #append(AppendRequest, long)} is arbitrated across processes on
+     * one adapter and within a single writer on another, and both implement the method.
+     * A caller that needs the stronger promise — anything distributing work over a shared
+     * log — should check {@link LogCapabilities#multiWriter()} and refuse to start, which
+     * is a great deal cheaper than inferring it later from a corrupted stream.
+     *
+     * <p>The default is deliberately conservative rather than absent, and it under-reports:
+     * an implementation that has not overridden this declares nothing, so a caller declines
+     * capabilities it could have used. That is the failure worth having. The opposite one —
+     * inheriting a cheerful default and being believed — is the failure this method exists
+     * to prevent.
+     */
+    default LogCapabilities capabilities() {
+        return LogCapabilities.NONE;
+    }
 
     @Override
     void close();
