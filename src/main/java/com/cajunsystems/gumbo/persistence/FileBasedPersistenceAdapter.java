@@ -373,25 +373,70 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     @Override
     public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
             throws IOException {
-        LogEntry entry = pending.withVersions(claimVersions(pending, expectedVersion));
-        long offset = writeNoSync(entry);
-        syncChannels();
-        publish(entry, offset);
-        return entry;
+        Map<LogTag, Long> claimed = claimVersions(pending, expectedVersion);
+        boolean landed = false;
+        try {
+            LogEntry entry = pending.withVersions(claimed);
+            long offset = writeNoSync(entry);
+            syncChannels();
+            publish(entry, offset);
+            landed = true;
+            return entry;
+        } finally {
+            if (!landed) release(List.of(claimed));
+        }
     }
 
     @Override
     public synchronized List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
             throws IOException {
         List<LogEntry> entries = new ArrayList<>(pendings.size());
-        for (PendingAppend p : pendings) {
-            entries.add(p.withVersions(claimVersions(p, ANY_VERSION)));
+        List<Map<LogTag, Long>> claimed = new ArrayList<>(pendings.size());
+        boolean landed = false;
+        try {
+            for (PendingAppend p : pendings) {
+                Map<LogTag, Long> versions = claimVersions(p, ANY_VERSION);
+                claimed.add(versions);
+                entries.add(p.withVersions(versions));
+            }
+            long[] offsets = new long[entries.size()];
+            for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
+            syncChannels();   // one fdatasync for the batch, as before
+            for (int i = 0; i < entries.size(); i++) publish(entries.get(i), offsets[i]);
+            landed = true;
+            return entries;
+        } finally {
+            if (!landed) release(claimed);
         }
-        long[] offsets = new long[entries.size()];
-        for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
-        syncChannels();   // one fdatasync for the batch, as before
-        for (int i = 0; i < entries.size(); i++) publish(entries.get(i), offsets[i]);
-        return entries;
+    }
+
+    /**
+     * Hands back positions claimed for an entry that did not land.
+     *
+     * <p>A version is claimed before the write, because the entry has to carry it. If the
+     * write or the fsync then fails, those positions were consumed by nothing: the stream
+     * gets a permanent hole, which breaks the density every persisted cursor depends on,
+     * and the counter sits ahead of what is durable — so a conditional append at the
+     * position the log actually ends on is rejected as stale, by a fence guarding an entry
+     * that was never written.
+     *
+     * <p>This adapter already draws that line for reads: {@code publish} is deliberately
+     * separate from {@code writeNoSync} so an entry becomes visible only once its bytes are
+     * durable. A counter that advanced on a failed write is the same divergence in the
+     * other direction, and it widened when a multi-tag append began consuming a position in
+     * every tag rather than one.
+     *
+     * <p>Restores by compare-and-set, per tag, lowest claim last, so a position is given
+     * back only if nothing has taken it since. Under this adapter's lock and single-writer
+     * guarantee nothing can have — the CAS states the assumption rather than trusting it.
+     */
+    private void release(List<Map<LogTag, Long>> claimed) {
+        for (int i = claimed.size() - 1; i >= 0; i--) {
+            for (Map.Entry<LogTag, Long> e : claimed.get(i).entrySet()) {
+                AtomicLong counter = tagVersionCount.get(e.getKey());
+                if (counter != null) counter.compareAndSet(e.getValue() + 1, e.getValue());
+            }
+        }
     }
 
     /**

@@ -58,6 +58,22 @@ index and `rebuildTagIndices` skips entries below the trim point, so a trim woul
 every survivor and silently invalidate every cursor a consumer had stored. Surviving a trim
 is the whole reason the number is written down.
 
+**A failed write no longer consumes positions**
+
+A version is claimed before the entry is written, because the entry has to carry it. If the
+write or the fsync then failed, that position was consumed by nothing: the stream got a
+permanent hole — breaking the density every persisted cursor relies on — and the counter sat
+ahead of what was durable, so a conditional append at the position the log actually ends on
+was rejected as stale, by a fence guarding an entry that was never written.
+
+The file adapter already draws that line for reads: `publish` is deliberately separate from
+`writeNoSync` so an entry becomes visible only once its bytes are durable. The counter is the
+same divergence in the other direction. It existed before this release for one tag; a
+multi-tag append widened it to every tag it names, which is what made it worth fixing here.
+Claims are now handed back by compare-and-set when the entry does not land. Found in review
+on #30; covered by `FailedWriteReleasesVersionsTest`, verified by removing the rollback (four
+of its five cases fail).
+
 ### Tests
 
 - `VersionKeyedReadTest.anAtomicMultiTagAppendLeavesOneStreamMisNumbered` **asserted this
