@@ -24,6 +24,7 @@ import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Every capability an adapter declares is exercised against the adapter, in both
@@ -34,6 +35,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * is that prose is what a downstream consumer had to rely on when it used a seqnum-keyed
  * read as a version-keyed one, and the resulting fold double-counted with no error
  * anywhere. Capabilities only help if a wrong one fails a build.
+ *
+ * <p><strong>"Fails loudly when disclaimed" applies to two of the six</strong>, and it is worth
+ * being exact about which, because the earlier version of this comment claimed it of all of them.
+ * {@code conditionalAppend} and {@code compareAndSet} each have an optional <em>method</em>, so
+ * disclaiming one means calling it throws. The rest name a <em>property</em> of methods that exist
+ * either way: there is no separate call to refuse for a non-atomic multi-tag append, and no
+ * exception a single-writer log can raise at the moment a second process in another JVM writes.
+ * Those are asserted by behaviour instead — and where an adapter disclaims one, the test says so
+ * rather than passing silently, so a skipped branch cannot read as a checked one.
  *
  * <p>Note the shape of each test: it branches on the declaration and asserts the matching
  * behaviour, rather than asserting a fixed expected value per adapter. So an adapter that
@@ -162,7 +172,12 @@ class LogCapabilityHonestyTest {
     void atomicMultiTagAppendWorksExactlyWhenDeclared(
             String name, Function<Path, PersistenceAdapter> factory) throws IOException {
         open(factory);
-        if (!adapter.capabilities().atomicMultiTagAppend()) return;
+        // Unlike the fence and the KV swap, this capability has no method to refuse: an adapter
+        // that cannot write several tags indivisibly still accepts the same append and simply does
+        // not promise the property. So a disclaimer is recorded as a skip with its reason, never as
+        // a silent pass — every adapter here declares it, and if one stops, this says which.
+        assumeTrue(adapter.capabilities().atomicMultiTagAppend(),
+                name + " disclaims atomicMultiTagAppend; there is no throwing surface to assert on");
 
         LogEntry stored = adapter.append(
                 pending(ORDERS, new LinkedHashSet<>(List.of(ORDERS, INVENTORY))),
@@ -248,7 +263,13 @@ class LogCapabilityHonestyTest {
                 .isInstanceOf(UnsupportedOperationException.class);
 
         assertThat(declared.multiWriter()).isFalse();
+        // The interface cannot promise an arbitrary adapter writes several tags indivisibly, so the
+        // inherited answer withholds it. Nothing throws — the append still works — which is exactly
+        // why this one is asserted as a declaration rather than as a refusal.
         assertThat(declared.atomicMultiTagAppend()).isFalse();
+        assertThat(minimal.readByTag(INVENTORY, 0L))
+                .as("a disclaimed guarantee does not disable the method")
+                .isEmpty();
         assertThat(declared.pushSubscriptions())
                 .as("delivery is the service's, and an adapter never answers for it")
                 .isFalse();

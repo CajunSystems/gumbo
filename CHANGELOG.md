@@ -65,14 +65,40 @@ including the decorator case). One test covers the inherited default itself, via
 implementing only the abstract methods — the case that decides whether having a default is
 safe at all.
 
+### Fixed
+
+- **`SharedLogService` reported `multiWriter` from storage alone**, ignoring the sequencer it
+  is configured with. The first cut of `capabilities()` passed everything but subscriptions
+  through, reasoning that the service adds no fencing and weakens none. The second half was
+  wrong. `multiWriter` is a property of the whole log and needs *two* independent things:
+  storage that assigns per-tag versions across processes, and a `Sequencer` whose global
+  `seqnum` spans them. This layer owns the second, and its default is `LocalSequencer` — a
+  per-process `AtomicLong`.
+
+  So a FoundationDB adapter behind the default sequencer was a configuration where every
+  stream version is arbitrated correctly by storage and two processes still hand out the same
+  seqnums. Nothing downstream catches that: the seqnum never passes through the adapter's
+  fence, and both durable adapters index *by* seqnum (`globalIndex`, `tagSeqnums`), so a
+  collision overwrites an index entry and the earlier record stops being readable while its
+  bytes stay on disk — the view lost rather than the data, which is this layer's signature
+  failure. A distributed caller checking the flag before starting would have been told yes.
+
+  `Sequencer.distributed()` now states whether a sequencer's uniqueness guarantee survives
+  leaving the process (default `false`, `FoundationDBSequencer` overrides it), and the service
+  requires both halves. Pinned by `LogCapabilityCompositionTest`, including that a distributed
+  sequencer does not rescue single-writer storage either. Caught in review on #28 — the
+  over-report this interface exists to prevent, in the interface itself.
+
 ### Build and CI
 
-- **Mutation score 468 of 597 killed (78%), threshold unchanged at 77.** Both halves moved:
-  the five new mutants are the adapters' declarations, and the honesty test kills them
-  because it asserts behaviour *against* the declaration rather than against a fixed
-  expectation per adapter. The floor recomputes to 460 at the new denominator, leaving
-  eight mutants of headroom — the same reasoning as last time says do not raise to 78 on
-  the strength of one run when the score varies by about two between them.
+- **Mutation score 474 of 599 killed (79%), threshold unchanged at 77.** Both halves moved:
+  the new mutants are the adapters' declarations and the service's composition, and the
+  capability tests kill them because they assert behaviour *against* the declaration rather
+  than against a fixed expectation per adapter. The floor recomputes to 462 at the new
+  denominator, leaving twelve mutants of headroom. Still not raised to 78, and for the reason
+  this file gave last time rather than a new one: that would be setting the ratchet from a
+  single local run on a score that varies by about two, and the number worth ratcheting to is
+  the low one, measured on CI.
 
 ---
 

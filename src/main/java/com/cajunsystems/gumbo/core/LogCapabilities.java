@@ -46,10 +46,19 @@ package com.cajunsystems.gumbo.core;
  *                             entry still carries a single {@code streamVersion}, from its
  *                             primary tag, so a secondary tag's numbering is not its own —
  *                             see {@code readFromVersion}
- * @param multiWriter          several processes may write one log concurrently and have
- *                             their versions assigned consistently. When {@code false} the
- *                             log is single-writer, and a second writer is refused rather
- *                             than silently accepted
+ * @param multiWriter          several processes may write one log concurrently and have both
+ *                             their per-tag versions and the global {@code seqnum} assigned
+ *                             consistently. When {@code false} the log is single-writer, and a
+ *                             second writer is refused or is writing a different log rather than
+ *                             silently accepted.
+ *                             <p><strong>Two independent things are required</strong> and an
+ *                             adapter answers for only one of them: storage that assigns per-tag
+ *                             versions across processes, and a
+ *                             {@link com.cajunsystems.gumbo.sequencer.Sequencer} whose numbering
+ *                             spans them. The service composes both, so an adapter's {@code true}
+ *                             may be narrowed by the sequencer it is configured behind — a
+ *                             cross-process fence cannot rescue a colliding seqnum, because the
+ *                             seqnum never passes through it
  */
 public record LogCapabilities(
         boolean conditionalAppend,
