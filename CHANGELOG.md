@@ -58,21 +58,35 @@ index and `rebuildTagIndices` skips entries below the trim point, so a trim woul
 every survivor and silently invalidate every cursor a consumer had stored. Surviving a trim
 is the whole reason the number is written down.
 
-**A failed write no longer consumes positions**
+**A failed append keeps the positions it claimed — deliberately, and now with the reasoning
+written down**
 
-A version is claimed before the entry is written, because the entry has to carry it. If the
-write or the fsync then failed, that position was consumed by nothing: the stream got a
-permanent hole — breaking the density every persisted cursor relies on — and the counter sat
-ahead of what was durable, so a conditional append at the position the log actually ends on
-was rejected as stale, by a fence guarding an entry that was never written.
+Raised in review on #30 as a leak: a version is claimed before the entry is written, and
+nothing hands it back when the write or the fsync fails, so the stream can carry a hole and
+the counter can sit ahead of what is durable. Both true.
 
-The file adapter already draws that line for reads: `publish` is deliberately separate from
-`writeNoSync` so an entry becomes visible only once its bytes are durable. The counter is the
-same divergence in the other direction. It existed before this release for one tag; a
-multi-tag append widened it to every tag it names, which is what made it worth fixing here.
-Claims are now handed back by compare-and-set when the entry does not land. Found in review
-on #30; covered by `FailedWriteReleasesVersionsTest`, verified by removing the rollback (four
-of its five cases fail).
+Releasing them was implemented, and then reverted, because **a failed fsync does not mean the
+record is gone.** `writeNoSync` has already put complete bytes into both channels by then;
+whether they reach the platter is exactly what the failed call leaves undecided, and on many
+kernels they do. `FailedWriteKeepsItsPositionTest` measures this rather than assuming it: after
+an injected sync failure, the record is still in the log on reopen.
+
+So the choice is a hole against a duplicate, and they are not equal:
+
+- **Keep the position** — the stream may carry a hole. Density breaks, which is a documented
+  invariant, but a cursor still advances monotonically and nothing is delivered twice
+- **Release it** — a retry reuses the position, and if the first record landed, two entries
+  share one position in one stream. A version-keyed consumer delivers that slot twice,
+  silently, and the entry that ought to be there is indistinguishable from the one that
+  replaced it
+
+A hole is the smaller loss, and unlike a duplicate it **heals**: counters are rebuilt from the
+log on `open()`, so a reopen resolves the ambiguity by reading what is there rather than
+guessing. The residual cost is that a conditional append at the position the log may really
+end on is rejected once, and the caller re-reads `getNextStreamVersion` and continues.
+
+The reasoning now lives on `claimVersions`, where the claim happens, so the next person to
+notice the leak finds the argument rather than repeating the fix.
 
 ### Tests
 

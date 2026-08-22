@@ -373,71 +373,27 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     @Override
     public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
             throws IOException {
-        Map<LogTag, Long> claimed = claimVersions(pending, expectedVersion);
-        boolean landed = false;
-        try {
-            LogEntry entry = pending.withVersions(claimed);
-            long offset = writeNoSync(entry);
-            syncChannels();
-            publish(entry, offset);
-            landed = true;
-            return entry;
-        } finally {
-            if (!landed) release(List.of(claimed));
-        }
+        LogEntry entry = pending.withVersions(claimVersions(pending, expectedVersion));
+        long offset = writeNoSync(entry);
+        syncChannels();
+        publish(entry, offset);
+        return entry;
     }
 
     @Override
     public synchronized List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
             throws IOException {
         List<LogEntry> entries = new ArrayList<>(pendings.size());
-        List<Map<LogTag, Long>> claimed = new ArrayList<>(pendings.size());
-        boolean landed = false;
-        try {
-            for (PendingAppend p : pendings) {
-                Map<LogTag, Long> versions = claimVersions(p, ANY_VERSION);
-                claimed.add(versions);
-                entries.add(p.withVersions(versions));
-            }
-            long[] offsets = new long[entries.size()];
-            for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
-            syncChannels();   // one fdatasync for the batch, as before
-            for (int i = 0; i < entries.size(); i++) publish(entries.get(i), offsets[i]);
-            landed = true;
-            return entries;
-        } finally {
-            if (!landed) release(claimed);
+        for (PendingAppend p : pendings) {
+            entries.add(p.withVersions(claimVersions(p, ANY_VERSION)));
         }
+        long[] offsets = new long[entries.size()];
+        for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
+        syncChannels();   // one fdatasync for the batch, as before
+        for (int i = 0; i < entries.size(); i++) publish(entries.get(i), offsets[i]);
+        return entries;
     }
 
-    /**
-     * Hands back positions claimed for an entry that did not land.
-     *
-     * <p>A version is claimed before the write, because the entry has to carry it. If the
-     * write or the fsync then fails, those positions were consumed by nothing: the stream
-     * gets a permanent hole, which breaks the density every persisted cursor depends on,
-     * and the counter sits ahead of what is durable — so a conditional append at the
-     * position the log actually ends on is rejected as stale, by a fence guarding an entry
-     * that was never written.
-     *
-     * <p>This adapter already draws that line for reads: {@code publish} is deliberately
-     * separate from {@code writeNoSync} so an entry becomes visible only once its bytes are
-     * durable. A counter that advanced on a failed write is the same divergence in the
-     * other direction, and it widened when a multi-tag append began consuming a position in
-     * every tag rather than one.
-     *
-     * <p>Restores by compare-and-set, per tag, lowest claim last, so a position is given
-     * back only if nothing has taken it since. Under this adapter's lock and single-writer
-     * guarantee nothing can have — the CAS states the assumption rather than trusting it.
-     */
-    private void release(List<Map<LogTag, Long>> claimed) {
-        for (int i = claimed.size() - 1; i >= 0; i--) {
-            for (Map.Entry<LogTag, Long> e : claimed.get(i).entrySet()) {
-                AtomicLong counter = tagVersionCount.get(e.getKey());
-                if (counter != null) counter.compareAndSet(e.getValue() + 1, e.getValue());
-            }
-        }
-    }
 
     /**
      * Reserves the next version in <em>every</em> tag the append touches, enforcing
@@ -449,6 +405,39 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
      * <p>The fence is checked before any counter moves, so a rejected append leaves every
      * stream where it was. Otherwise a stale writer would consume a position in each of
      * the other tags on its way to being refused, and those gaps would be permanent.
+     *
+     * <h2>A failed write keeps what it claimed</h2>
+     * <p>Positions are claimed here, before the entry is written, because the entry has to
+     * carry them. If the write or the fsync then fails the claim looks wasted, and handing
+     * it back looks like the tidy thing to do — it keeps the stream dense and stops the
+     * counter sitting ahead of what is durable.
+     *
+     * <p>It is not safe, because <strong>a failed fsync does not mean the record is
+     * gone.</strong> {@link #writeNoSync} has already put complete bytes into both channels
+     * by then; whether they reach the platter is exactly what the failed call leaves
+     * undecided, and on many kernels they do. Releasing the position lets a retry reuse it,
+     * and if the first record did land the log ends up holding two entries at the same
+     * position in the same stream.
+     *
+     * <p>Both choices lose something, and not the same amount:
+     * <ul>
+     *   <li><strong>Keep the position</strong> — the stream may carry a hole. Density breaks,
+     *       which is a documented invariant, but a cursor still advances monotonically and
+     *       no entry is delivered twice.</li>
+     *   <li><strong>Release it</strong> — two entries may share a position. A version-keyed
+     *       consumer delivers that slot twice, and the entry which ought to be there is
+     *       indistinguishable from the one that replaced it. Silent, and not recoverable by
+     *       re-reading.</li>
+     * </ul>
+     *
+     * <p>A hole is the smaller loss, and unlike a duplicate it <em>heals</em>: counters are
+     * rebuilt from the log on {@link #open()}, so a reopen resolves the ambiguity by reading
+     * what is actually there rather than guessing. The cost while the process runs is that a
+     * conditional append at the position the log may really end on is rejected once; the
+     * caller re-reads {@link #getNextStreamVersion} and continues.
+     *
+     * <p>Not a hypothetical trade — the release-on-failure version was written, and
+     * reverted, on review of #30.
      */
     private Map<LogTag, Long> claimVersions(PendingAppend pending, long expectedVersion)
             throws VersionConflictException {
