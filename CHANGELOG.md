@@ -88,6 +88,15 @@ end on is rejected once, and the caller re-reads `getNextStreamVersion` and cont
 The reasoning now lives on `claimVersions`, where the claim happens, so the next person to
 notice the leak finds the argument rather than repeating the fix.
 
+### Build and CI
+
+- **Mutation score 484–486 of 606 killed (80%), test strength 85%; threshold unchanged at
+  77.** 486 on CI, 484 locally — the spread is run-to-run variance in what times out, as
+  recorded under 0.5.0, not a machine difference. The floor recomputes to 467 at this
+  denominator, leaving nineteen mutants of headroom. Both halves of the fraction moved: the
+  per-tag assignment and the two record layouts added mutable code, and the compatibility
+  and cursoring tests kill it.
+
 ### Tests
 
 - `VersionKeyedReadTest.anAtomicMultiTagAppendLeavesOneStreamMisNumbered` **asserted this

@@ -128,8 +128,9 @@
                         Ratchet, not a target: set to the measured score, so a decline
                         fails the build rather than being absorbed by slack.
 
-                        Measured after the per-tag version fix: 484 of 606 killed, 80%,
-                        test strength 85% (locally; 0.5.0 measured 473-474 of 599 at 79%).
+                        Measured after the per-tag version fix: 484-486 of 606 killed, 80%,
+                        test strength 85% — 486 on CI, 484 locally, the same run-to-run
+                        spread noted below (0.5.0 measured 473-474 of 599 at 79%).
                         Both halves of the fraction moved when A4 landed (the capability
                         declarations added mutable code, and the honesty tests kill it by
                         asserting behaviour against the declaration), so the floor is
