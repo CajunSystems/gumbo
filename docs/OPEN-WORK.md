@@ -18,8 +18,12 @@ were not on the report's list.
 **0.4.0 carries A3** (KV compare-and-set), the release-hygiene work listed in §0 and §4, and
 two KV defects found while implementing it — see the CHANGELOG.
 
-Report items now outstanding: **A4**, **A6** (half), **D2**, and the multi-tag version
-defect. Everything else below is testing, process or cross-cutting.
+**A4** (declared capabilities) is next in `[Unreleased]`, promoted above its report rank
+because 0.3.0 and 0.4.0 created the adapter variation it exists to declare.
+
+Report items now outstanding: **A6** (half), **D2**, and the multi-tag version defect —
+which has **moved to the front of the queue**, for a reason that came from the consumer
+rather than from here. See below.
 
 See [`FAILURE_SEMANTICS.md`](FAILURE_SEMANTICS.md) for the write-path contracts, which
 several items below depend on.
@@ -92,29 +96,34 @@ also applies (`localId()` still works, deprecated for removal).
 
 ## 2. Report items not started
 
-### A4 — declared capabilities
+### ~~A4 — declared capabilities~~ — done, unreleased
 
-**Promote this above its original rank.** The report put it 7th as polish, on the grounds
-that there was no real variation between adapters to declare. **0.3.0 created that
-variation**: the same `append(request, expectedVersion)` call is *fenced across processes*
-on FoundationDB and *fenced within a single writer* on the file adapter. That difference
-currently exists only in prose, which is exactly how D4 happened — a client assuming a
-guarantee the adapter did not provide.
+Promoted above its report rank (7th, as polish) on the grounds that 0.3.0 and 0.4.0 had
+since created the variation it exists to declare: the same `append(request,
+expectedVersion)` is *fenced across processes* on FoundationDB and *fenced within a single
+writer* on the file adapter, and that difference existed only in prose — which is how D4
+happened. See the CHANGELOG's `[Unreleased]`.
 
-```java
-interface LogCapabilities {
-    boolean conditionalAppend();
-    boolean compareAndSet();
-    boolean versionedReads();
-    boolean pushSubscriptions();
-    boolean atomicMultiTagAppend();
-    boolean multiWriter();
-}
-```
+`LogCapabilities` as a record rather than the sketch's interface, answered by
+`PersistenceAdapter.capabilities()` and `SharedLog.capabilities()`, with the report's
+test #5 as `LogCapabilityHonestyTest`.
 
-Per-adapter, not per-Gumbo. The report's test #5 goes with it: for each adapter, assert
-every capability reported `true` actually works and every `false` throws rather than
-silently no-ops.
+Three things it settled that the sketch did not raise:
+
+- **The reach of a fence is the pair `conditionalAppend` + `multiWriter`**, not a third
+  "scope" field. The first says the compare and the increment are indivisible; the second
+  says that holds against another process. Two booleans already in the sketch turned out to
+  express the distinction the whole item was about.
+- **`pushSubscriptions` cannot be answered by an adapter.** Delivery is implemented above
+  storage, so the adapter would be answering for code it does not contain. The service adds
+  it when it answers for the log as a whole.
+- **`BatchingPersistenceAdapter` narrows its delegate** — it claims a version on `append`
+  and lands the entry at flush, so across processes the compare no longer guards the write.
+  It forces `multiWriter` off however capable the delegate is. Nobody had written that down;
+  wrapping the FDB adapter silently downgrades it.
+
+The defaults are conservative in the direction that fails safe: under-reporting costs a
+caller functionality, over-reporting costs it correctness, silently.
 
 ### D2 — non-clobbering index
 
@@ -180,6 +189,26 @@ These were discovered while implementing the report, are not in it, and are all 
 in code and pinned by tests where possible.
 
 ### Multi-tag entries carry one version — needs a log migration
+
+**Re-ranked.** It was filed last, on cost, and that reading of the cost still holds — it is
+the only item here that changes the on-disk record. What changed is the *demand* for it,
+and the change came from the consumer rather than from here.
+
+Catalyst's [distributed-execution design](https://github.com/CajunSystems/catalyst/blob/main/docs/distribution.md)
+resolved its "no way to ask the log what needs running" gap by adopting exactly this
+pattern: tag the execution's first event into a shared `catalyst-tasks/<queue>` alongside
+its own `catalyst-exec/<id>`, one atomic append, no secondary index to keep consistent —
+the Boudin shape. That design records the gap as **already possible**, and on the strength
+of atomic multi-tag append alone it is. But a worker cursoring the queue tag holds a
+version, and on the queue tag a version is not the queue's: it is whatever the primary tag
+was at. So the ergonomics item and the correctness item met, and the meeting point is a
+work queue that silently mis-delivers.
+
+Until this lands, a fan-out tag must be read with the seqnum-keyed `readByTag`, which is
+correct and which `readFromVersion`'s javadoc states explicitly. That is a workable
+constraint, not a blocker — but it is a constraint a downstream design has to *know about*,
+and the one thing this codebase has learned twice is that a constraint living only in prose
+gets assumed away.
 
 An entry has a single `streamVersion`, drawn from its primary tag, so a tag carried only as
 a *secondary* tag inherits another stream's numbering. Measured:
@@ -332,18 +361,27 @@ Untouched, and all still true.
 
 ## Suggested order
 
-1. **Tag 0.4.0** once it merges, and check JitPack builds it before pointing Catalyst at it
-2. **Commit Catalyst's coordinate change**, then **fix its D4** (§0, §1) — the live
-   corruption that started all of this, and the reason the coordinate had to be settled first
-3. **A4 capabilities** (§2) — cheap, and stops the next caller assuming the wrong guarantee
-4. **Fault-injection harness** (§4) — before D2, which is its first customer
-5. **D2** non-clobbering index
-6. **Batching decision** (§3) and/or the decorator spike (§4) — same subject, take together
-7. **A6** ergonomics (~~A3~~ shipped in 0.4.0, out of order — see §2)
-8. **Multi-tag versions** last — the only item with a log-migration cost
+1. **Tag 0.4.0** — merged as `ceb0e0e` and still untagged, so JitPack cannot build it and
+   Catalyst cannot move off 0.3.0. Everything A3 shipped is unreachable downstream until
+   this one-line act happens; it is the cheapest item on this list by a wide margin
+2. ~~**Commit Catalyst's coordinate change**~~ and ~~**fix its D4**~~ — both done
+   (Catalyst `590c197`, `75b8cc6`)
+3. ~~**A4 capabilities**~~ — done, unreleased (§2)
+4. **Multi-tag versions** — moved up from last. Not because it got cheaper (it is still the
+   only item with a log-migration cost) but because Catalyst's v1 claimable-work design
+   depends on the pattern it breaks. See §3
+5. **Fault-injection harness** (§4) — before D2, which is its first customer
+6. **D2** non-clobbering index
+7. **Batching decision** (§3) and/or the decorator spike (§4) — same subject, take together
+8. **A6** ergonomics (~~A3~~ shipped in 0.4.0, out of order — see §2)
 
 ~~Push the 0.3.0 tag~~ and ~~pin the GitHub Actions~~ are done; both were §0/§4 items that
 blocked or shadowed everything else.
+
+A note on the shape of this list, since it has now happened twice: both re-rankings (A4 up,
+multi-tag versions up) came from a consumer discovering that an item filed as *polish* was
+load-bearing for something it wanted to build. Ordering by cost is how the list is written;
+ordering by what is blocked is how it keeps being corrected.
 
 ---
 

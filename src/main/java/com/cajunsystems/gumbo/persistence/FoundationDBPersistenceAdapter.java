@@ -7,6 +7,7 @@ import com.apple.foundationdb.Range;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.cajunsystems.gumbo.core.CounterValues;
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -618,6 +619,31 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public long getLatestSeqnumForTag(LogTag tag) {
         AtomicLong c = tagLatestSeqnum.get(tag);
         return c == null ? -1L : c.get();
+    }
+
+    // -------------------------------------------------------------------------
+    // Capabilities
+    // -------------------------------------------------------------------------
+
+    /**
+     * The only adapter that declares {@code multiWriter}, and the reason the flag exists.
+     *
+     * <p>Here the fence is not a lock held around a compare — the read of the tag's version,
+     * the comparison and the write are one serialisable transaction, so a writer in another
+     * process that lost the race is rejected by storage rather than by anyone's agreement
+     * about who was supposed to be writing. The conditional KV is the same shape. That is
+     * the difference between a log that can be shared by a cluster and one that can be
+     * shared by threads.
+     */
+    @Override
+    public LogCapabilities capabilities() {
+        return LogCapabilities.builder()
+                .conditionalAppend(true)
+                .compareAndSet(true)
+                .versionedReads(true)
+                .atomicMultiTagAppend(true)
+                .multiWriter(true)
+                .build();
     }
 
     @Override

@@ -56,4 +56,30 @@ public interface Sequencer {
         for (int i = 0; i < count; i++) seqnums[i] = next();
         return seqnums;
     }
+
+    /**
+     * Whether this sequencer's uniqueness guarantee holds across <em>processes</em>, not merely
+     * across threads.
+     *
+     * <p>Both guarantees above are stated unconditionally, and for {@link LocalSequencer} the second
+     * one is only true within one JVM: its counter is an {@code AtomicLong} seeded per process, so
+     * two processes issue the same seqnums and neither is told. That is not a hypothetical — the
+     * adapters index entries <em>by</em> seqnum ({@code globalIndex}, {@code tagSeqnums}), so a
+     * collision overwrites an index entry and the earlier record stops being readable while its
+     * bytes sit on disk. Losing the view rather than the data is the signature failure of this whole
+     * layer.
+     *
+     * <p>This matters to a caller through {@link com.cajunsystems.gumbo.core.LogCapabilities#multiWriter()},
+     * which is a property of the whole log and therefore needs <em>both</em> halves: storage that
+     * assigns per-tag versions across processes, and a sequencer whose global numbering spans them
+     * too. A storage-side fence cannot rescue a seqnum collision, because nothing about the seqnum
+     * passes through it.
+     *
+     * <p>Defaults to {@code false}: an implementation that has not considered the question is
+     * assumed not to satisfy it, so a caller declines a capability it might have had rather than
+     * assuming one it does not.
+     */
+    default boolean distributed() {
+        return false;
+    }
 }

@@ -7,6 +7,7 @@ import com.cajunsystems.gumbo.serialization.LogSerializer;
 import com.cajunsystems.gumbo.core.AppendRequest;
 import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.AppendResult;
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
@@ -317,6 +318,44 @@ public class SharedLogService implements SharedLog {
     @Override
     public long getLatestSeqnum() {
         return adapter.getLatestSeqnum();
+    }
+
+    /**
+     * The adapter's capabilities, with {@code pushSubscriptions} added and {@code multiWriter}
+     * narrowed to what this service is actually configured to deliver.
+     *
+     * <p>Delivery is this layer's, not storage's: {@link #subscribe} is served by
+     * {@code notifySubscribers} after a successful append, over any adapter at all. So the
+     * adapter is not asked about it — it would have to answer for code it does not contain,
+     * and the honest answer would be a constant either way.
+     *
+     * <h2>Why multi-writer is not a pass-through</h2>
+     * <p>An earlier version of this method passed everything but subscriptions straight through, on
+     * the reasoning that this layer adds no fencing and weakens none. The second half is wrong.
+     * {@code multiWriter} is a property of the whole log and it needs <em>two</em> independent
+     * things: storage that assigns per-tag versions across processes, and a
+     * {@link com.cajunsystems.gumbo.sequencer.Sequencer} whose global {@code seqnum} spans them.
+     * This layer owns the second one, and its default — {@link
+     * com.cajunsystems.gumbo.sequencer.LocalSequencer} — is a per-process {@code AtomicLong}.
+     *
+     * <p>So a FoundationDB adapter behind the default sequencer is a configuration where storage
+     * arbitrates every stream version correctly and two processes still hand out the same seqnums.
+     * Nothing rescues that downstream: the seqnum never passes through the adapter's fence, and the
+     * adapters index <em>by</em> seqnum, so a collision overwrites an index entry and the earlier
+     * record stops being readable while its bytes remain on disk. Reporting {@code multiWriter} for
+     * that configuration would be exactly the over-report this whole interface exists to prevent —
+     * a distributed caller checking the flag before starting would be told yes and then lose
+     * records with no error anywhere.
+     *
+     * <p>Both halves are therefore required, and either one absent narrows the answer.
+     */
+    @Override
+    public LogCapabilities capabilities() {
+        LogCapabilities storage = adapter.capabilities();
+        return LogCapabilities.builder(storage)
+                .pushSubscriptions(true)
+                .multiWriter(storage.multiWriter() && sequencer.distributed())
+                .build();
     }
 
     // -------------------------------------------------------------------------

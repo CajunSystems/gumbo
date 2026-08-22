@@ -5,6 +5,103 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)
+at its item **A4**, promoted well above its original rank. The report put capabilities
+seventh, as polish, reasoning that there was no real variation between adapters to
+declare. 0.3.0 and 0.4.0 created that variation: `append(request, expectedVersion)` and
+`compareAndSetTagValue` are arbitrated *across processes* on FoundationDB and *within a
+single writer* on the file adapter. Both implement the method. They do not make the same
+promise, and until now the difference existed only in prose — which is exactly how D4
+happened, a client assuming a guarantee its adapter did not provide.
+
+### Added
+
+**Declared capabilities, per adapter**
+- New `LogCapabilities` record — `conditionalAppend`, `compareAndSet`, `versionedReads`,
+  `pushSubscriptions`, `atomicMultiTagAppend`, `multiWriter` — built by name rather than
+  from six positional booleans, and composable from another log's answer via
+  `LogCapabilities.builder(from)`
+- `PersistenceAdapter.capabilities()` and `SharedLog.capabilities()`. Both have defaults,
+  both conservative: the adapter default declares only what *the interface itself*
+  provides (`versionedReads`, which has a working filtering default) and nothing else, and
+  `SharedLog`'s declares nothing at all
+- The reach of a fence is carried by the **pair** `conditionalAppend` + `multiWriter`
+  rather than by a third "scope" concept: the first says the compare and the increment are
+  indivisible, the second says that holds against writers in other processes. A runtime
+  that distributes execution needs both and can now refuse to start without them
+- `pushSubscriptions` is never set by an adapter. Delivery is implemented above storage, so
+  `SharedLogService` adds it when it answers for the log as a whole — an adapter asked
+  about it would be answering for code it does not contain
+
+**What each shipped adapter declares**
+
+| | conditional append | compare-and-set | versioned reads | atomic multi-tag | multi-writer |
+|---|---|---|---|---|---|
+| `InMemoryPersistenceAdapter` | ✓ | ✓ | ✓ | ✓ | — |
+| `FileBasedPersistenceAdapter` | ✓ | ✓ | ✓ | ✓ | — |
+| `FoundationDBPersistenceAdapter` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `BatchingPersistenceAdapter` | delegate's | delegate's | delegate's | delegate's | — |
+
+- The file adapter's `multiWriter: false` is false by **enforcement**, not omission — the
+  exclusive directory lock from 0.3.0 refuses a second process — which is what makes its
+  single-writer fence sufficient rather than merely convenient
+- **`BatchingPersistenceAdapter` narrows its delegate**, and this is the declaration worth
+  knowing: it passes everything through except `multiWriter`, which it forces off however
+  capable the delegate is. A version is claimed when `append` returns but the entry lands
+  at flush time, and across two processes those two moments admit a third party between
+  them. Wrapping a FoundationDB adapter therefore downgrades it, silently, unless someone
+  asks
+
+**Honesty is tested, not documented** — `LogCapabilityHonestyTest` is the report's test #5:
+for every adapter, each capability it declares is exercised, and each one it disclaims is
+asserted to *throw* rather than silently no-op. Every test branches on the declaration
+rather than on a hard-coded expectation per adapter, so flipping a flag without changing
+behaviour fails the build — which is the mutation that matters and the one a fixed
+expectation would miss. Verified by injecting the lies and watching it fail (a file adapter
+claiming `multiWriter`, an in-memory adapter disclaiming its own fence: four failures,
+including the decorator case). One test covers the inherited default itself, via an adapter
+implementing only the abstract methods — the case that decides whether having a default is
+safe at all.
+
+### Fixed
+
+- **`SharedLogService` reported `multiWriter` from storage alone**, ignoring the sequencer it
+  is configured with. The first cut of `capabilities()` passed everything but subscriptions
+  through, reasoning that the service adds no fencing and weakens none. The second half was
+  wrong. `multiWriter` is a property of the whole log and needs *two* independent things:
+  storage that assigns per-tag versions across processes, and a `Sequencer` whose global
+  `seqnum` spans them. This layer owns the second, and its default is `LocalSequencer` — a
+  per-process `AtomicLong`.
+
+  So a FoundationDB adapter behind the default sequencer was a configuration where every
+  stream version is arbitrated correctly by storage and two processes still hand out the same
+  seqnums. Nothing downstream catches that: the seqnum never passes through the adapter's
+  fence, and both durable adapters index *by* seqnum (`globalIndex`, `tagSeqnums`), so a
+  collision overwrites an index entry and the earlier record stops being readable while its
+  bytes stay on disk — the view lost rather than the data, which is this layer's signature
+  failure. A distributed caller checking the flag before starting would have been told yes.
+
+  `Sequencer.distributed()` now states whether a sequencer's uniqueness guarantee survives
+  leaving the process (default `false`, `FoundationDBSequencer` overrides it), and the service
+  requires both halves. Pinned by `LogCapabilityCompositionTest`, including that a distributed
+  sequencer does not rescue single-writer storage either. Caught in review on #28 — the
+  over-report this interface exists to prevent, in the interface itself.
+
+### Build and CI
+
+- **Mutation score 474 of 599 killed (79%), threshold unchanged at 77.** Both halves moved:
+  the new mutants are the adapters' declarations and the service's composition, and the
+  capability tests kill them because they assert behaviour *against* the declaration rather
+  than against a fixed expectation per adapter. The floor recomputes to 462 at the new
+  denominator, leaving twelve mutants of headroom. Still not raised to 78, and for the reason
+  this file gave last time rather than a new one: that would be setting the ratchet from a
+  single local run on a score that varies by about two, and the number worth ratcheting to is
+  the low one, measured on CI.
+
+---
+
 ## [0.4.0] — 2026-07-26
 
 Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)

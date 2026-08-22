@@ -1,5 +1,6 @@
 package com.cajunsystems.gumbo.persistence;
 
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -488,6 +489,37 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         ConcurrentSkipListMap<Long, Long> idx = tagSeqnums.get(tag);
         if (idx == null || idx.isEmpty()) return -1L;
         return idx.lastKey();
+    }
+
+    // -------------------------------------------------------------------------
+    // Capabilities
+    // -------------------------------------------------------------------------
+
+    /**
+     * Fenced, but within one writer.
+     *
+     * <p>{@code conditionalAppend} and {@code compareAndSet} are true and mean it: both
+     * compare and write under this adapter's own monitor, so neither can be split by
+     * another thread. What they do <em>not</em> survive is another process, and this is the
+     * adapter where that distinction matters, because it is the one people run on a laptop
+     * and then deploy.
+     *
+     * <p>So {@code multiWriter} is false — and it is false by <em>enforcement</em>, not by
+     * omission: {@link #open()} takes an exclusive lock on the data directory and a second
+     * process is refused with {@link LogAlreadyOpenException}. That is what makes the
+     * single-writer fence sufficient here rather than merely convenient. A client that
+     * needs cross-process arbitration should read this field and refuse, which is cheaper
+     * than discovering it from a log that has two processes' idea of version 7 in it.
+     */
+    @Override
+    public LogCapabilities capabilities() {
+        return LogCapabilities.builder()
+                .conditionalAppend(true)
+                .compareAndSet(true)
+                .versionedReads(true)
+                .atomicMultiTagAppend(true)
+                .multiWriter(false)
+                .build();
     }
 
     // -------------------------------------------------------------------------

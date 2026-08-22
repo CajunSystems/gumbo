@@ -146,6 +146,16 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
      * <p>FDB's optimistic concurrency will transparently retry on conflict, so
      * the returned value is always unique and globally monotonic.
      */
+    /**
+     * True: the counter lives in FoundationDB under a single key, incremented in a transaction, so
+     * every process issuing seqnums is drawing from the same sequence. This is the half of
+     * multi-writer safety that storage cannot provide on its own.
+     */
+    @Override
+    public boolean distributed() {
+        return true;
+    }
+
     @Override
     public long next() {
         long claimed = db.run(tr -> {

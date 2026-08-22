@@ -1,5 +1,6 @@
 package com.cajunsystems.gumbo.persistence;
 
+import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
@@ -205,6 +206,30 @@ public class InMemoryPersistenceAdapter implements PersistenceAdapter {
         ConcurrentSkipListMap<Long, Long> idx = tagIndex.get(tag);
         if (idx == null || idx.isEmpty()) return -1L;
         return idx.lastKey();
+    }
+
+    // -------------------------------------------------------------------------
+    // Capabilities
+    // -------------------------------------------------------------------------
+
+    /**
+     * Everything except multi-writer, which is not a limitation of this adapter so much as
+     * a category error against it: the log <em>is</em> the heap of one process, so a second
+     * writer would be a second log rather than a competing writer of this one. There is
+     * nothing to refuse and nothing to arbitrate.
+     *
+     * <p>The rest hold because every mutating path is {@code synchronized} on this adapter,
+     * which is the whole store — a compare and the write it guards cannot be separated.
+     */
+    @Override
+    public LogCapabilities capabilities() {
+        return LogCapabilities.builder()
+                .conditionalAppend(true)
+                .compareAndSet(true)
+                .versionedReads(true)
+                .atomicMultiTagAppend(true)
+                .multiWriter(false)
+                .build();
     }
 
     // -------------------------------------------------------------------------
