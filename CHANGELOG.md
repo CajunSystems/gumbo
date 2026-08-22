@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.5.0] — 2026-08-22
 
 Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)
 at its item **A4**, promoted well above its original rank. The report put capabilities
@@ -15,6 +15,20 @@ declare. 0.3.0 and 0.4.0 created that variation: `append(request, expectedVersio
 single writer* on the file adapter. Both implement the method. They do not make the same
 promise, and until now the difference existed only in prose — which is exactly how D4
 happened, a client assuming a guarantee its adapter did not provide.
+
+**Why 0.5.0, and why for a different reason than last time.** 0.4.0 was a minor because it
+was *source-breaking for implementors* — `LogView` and `TypedLogView` each gained two
+abstract methods. Nothing here breaks: every method added in this release has a default
+(`PersistenceAdapter.capabilities()`, `SharedLog.capabilities()`, `Sequencer.distributed()`),
+so existing adapters, log implementations and sequencers all keep compiling untouched. It is
+a minor because it adds capability, not because it costs anyone a change. **Upgrading from
+0.4.0 requires nothing** — which is the point worth stating, since the value of this release
+is a question you can now ask rather than an answer you have to migrate to.
+
+**Release note for downstreams, learned the hard way.** 0.4.0 was cut and merged on 26 July
+and its tag was not pushed until 22 August, so everything in it — including the conditional
+KV that the lease and claim story rests on — was unreachable from any build resolving through
+JitPack for four weeks. A merged release is not a released one. Tag it.
 
 ### Added
 
@@ -91,14 +105,13 @@ safe at all.
 
 ### Build and CI
 
-- **Mutation score 474 of 599 killed (79%), threshold unchanged at 77.** Both halves moved:
-  the new mutants are the adapters' declarations and the service's composition, and the
-  capability tests kill them because they assert behaviour *against* the declaration rather
-  than against a fixed expectation per adapter. The floor recomputes to 462 at the new
-  denominator, leaving twelve mutants of headroom. Still not raised to 78, and for the reason
-  this file gave last time rather than a new one: that would be setting the ratchet from a
-  single local run on a score that varies by about two, and the number worth ratcheting to is
-  the low one, measured on CI.
+- **Mutation score 473 of 599 killed (79%) on CI, 474 locally; threshold unchanged at 77.**
+  Test strength 84%. Both halves moved: the new mutants are the adapters' declarations and
+  the service's composition, and the capability tests kill them because they assert behaviour
+  *against* the declaration rather than against a fixed expectation per adapter. The floor
+  recomputes to 462 at the new denominator, leaving eleven mutants of headroom. Still not
+  raised to 78, for the reason this file gave last time rather than a new one: the number
+  worth ratcheting to is the low run, and the two runs here differ by one.
 
 ---
 
