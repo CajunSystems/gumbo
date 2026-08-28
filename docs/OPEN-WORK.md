@@ -24,6 +24,10 @@ and 0.4.0 created the adapter variation it exists to declare — plus a defect f
 of it, where the service reported `multiWriter` from storage alone and ignored the sequencer
 it was configured behind.
 
+**0.6.0 carries the multi-tag version fix** — every tag an entry carries now gets its own
+position. The last report-adjacent item with a data-format cost, and the cost turned out to
+be a record marker rather than a migration.
+
 The multi-tag version defect is **fixed** and awaiting release — see §3 and the CHANGELOG.
 
 Report items now outstanding: **A6** (half) and **D2**.
@@ -215,9 +219,9 @@ selection for a multi-tag append, which is the only way to get it.
 These were discovered while implementing the report, are not in it, and are all documented
 in code and pinned by tests where possible.
 
-### ~~Multi-tag entries carry one version — needs a log migration~~ — fixed, unreleased
+### ~~Multi-tag entries carry one version — needs a log migration~~ — shipped in 0.6.0
 
-Each tag an entry carries now gets its own position. See the CHANGELOG's `[Unreleased]`.
+Each tag an entry carries now gets its own position. See the CHANGELOG's 0.6.0 entry.
 
 **The migration cost turned out to be avoidable, and that is the reusable part.** This was
 filed as the one item with a data-format cost, and the record layout did change — but the
@@ -411,14 +415,14 @@ Untouched, and all still true.
 
 ## Suggested order
 
-1. ~~**Tag 0.5.0**~~ — tagged (`0.5.0` → `8230289`) and adopted: Catalyst is on it and its
-   capability answers now delegate rather than assert. **Cut and tag 0.6.0** for the multi-tag
-   version fix, which is the next thing a consumer is waiting on — Catalyst's claimable-work
-   design cannot cursor a queue tag until it is released
+1. ~~**Tag 0.5.0**~~ — tagged (`0.5.0` → `8230289`) and adopted. **Tag 0.6.0** next: it is cut
+   here and carries the multi-tag version fix, which is what a consumer is waiting on —
+   Catalyst's claimable-work design cannot cursor a queue tag until it is published, and
+   `docs/distribution.md` still carries the caveat saying so
 2. ~~**Tag 0.4.0**~~, ~~**commit Catalyst's coordinate change**~~ and ~~**fix its D4**~~ — all
    done (tag `0.4.0` → `ceb0e0e`; Catalyst `590c197`, `75b8cc6`, and Catalyst is on 0.4.0)
 3. ~~**A4 capabilities**~~ — shipped in 0.5.0 (§2)
-4. ~~**Multi-tag versions**~~ — done, unreleased. It cost a record-layout change but no
+4. ~~**Multi-tag versions**~~ — shipped in 0.6.0. It cost a record-layout change but no
    migration: a per-record marker lets both layouts coexist. See §3
 5. **Fault-injection harness** (§4) — before D2, which is its first customer
 6. **D2** non-clobbering index
