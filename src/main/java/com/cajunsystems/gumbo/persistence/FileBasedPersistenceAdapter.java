@@ -43,20 +43,27 @@ import java.util.zip.CRC32;
  *
  * <h2>Log entry binary format</h2>
  * <pre>
- * [MAGIC    : 4 bytes  = 0xC0FFEE42  ]
+ * [MAGIC    : 4 bytes  = 0xC0FFEE43  ]
  * [seqnum   : 8 bytes, big-endian    ]
  * [timestamp: 8 bytes, millis epoch  ]
- * [version  : 8 bytes, big-endian    ]
+ * [version  : 8 bytes, big-endian    ]   primary tag's, kept for layout stability
  * [numTags  : 4 bytes, big-endian    ]
  *   per tag:
  *     [nsLen  : 2 bytes unsigned     ]
  *     [ns     : nsLen UTF-8 bytes    ]
  *     [keyLen : 2 bytes unsigned     ]
  *     [key    : keyLen UTF-8 bytes   ]
+ *     [version: 8 bytes, big-endian  ]   this tag's own position  (v2 only)
  * [dataLen  : 4 bytes, big-endian    ]
  * [data     : dataLen bytes          ]
  * [checksum : 4 bytes CRC32 of all above]
  * </pre>
+ *
+ * <p>Records marked {@code 0xC0FFEE42} are the earlier layout: identical except that a tag
+ * carries no version of its own, so the single {@code version} field is all there is. They
+ * are still read, which is what lets an existing log keep working untouched — the marker is
+ * per record, so a log written across an upgrade simply holds both. The fixed prefix did not
+ * move, so the offsets above are unchanged for both.
  *
  * <h2>Recovery</h2>
  * <p>On {@link #open()}, the adapter loads the global index into memory and rebuilds
@@ -78,7 +85,22 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(FileBasedPersistenceAdapter.class);
 
-    private static final int MAGIC = 0xC0FFEE42;
+    /**
+     * Record marker for the original layout: one {@code version} field, applying to
+     * whichever tag the writer considered primary. Still read, never written.
+     */
+    private static final int MAGIC_V1 = 0xC0FFEE42;
+
+    /**
+     * Record marker for the layout that carries a version per tag. A record's own magic
+     * says which layout it is, so a log may hold both — an existing log keeps reading
+     * exactly as before and needs no migration, and one written across an upgrade is
+     * simply a mix.
+     */
+    private static final int MAGIC_V2 = 0xC0FFEE43;
+
+    /** What new records are written as. */
+    private static final int MAGIC = MAGIC_V2;
     /** Fixed-size overhead per entry: magic(4)+seqnum(8)+ts(8)+version(8)+numTags(4)+dataLen(4)+crc(4) = 40 bytes */
     private static final int FIXED_OVERHEAD = 40;
 
@@ -313,12 +335,17 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     private void publish(LogEntry entry, long offset) {
         globalIndex.put(entry.seqnum(), offset);
         for (LogTag tag : entry.tags()) {
+            // That tag's own position, not the entry's primary one. Writing the primary's
+            // number into every tag's index — and raising every tag's counter to match —
+            // is what dragged a shared fan-out tag's numbering along behind whichever
+            // stream happened to be appended alongside it.
+            long version = entry.streamVersion(tag);
             tagSeqnums
                     .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
-                    .put(entry.seqnum(), entry.streamVersion());
+                    .put(entry.seqnum(), version);
             tagVersionCount
                     .computeIfAbsent(tag, k -> new AtomicLong(0))
-                    .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
+                    .updateAndGet(c -> Math.max(c, version + 1));
         }
     }
 
@@ -346,7 +373,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     @Override
     public synchronized LogEntry append(PendingAppend pending, long expectedVersion)
             throws IOException {
-        LogEntry entry = pending.withVersion(claimVersion(pending.primaryTag(), expectedVersion));
+        LogEntry entry = pending.withVersions(claimVersions(pending, expectedVersion));
         long offset = writeNoSync(entry);
         syncChannels();
         publish(entry, offset);
@@ -358,7 +385,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
             throws IOException {
         List<LogEntry> entries = new ArrayList<>(pendings.size());
         for (PendingAppend p : pendings) {
-            entries.add(p.withVersion(claimVersion(p.primaryTag(), ANY_VERSION)));
+            entries.add(p.withVersions(claimVersions(p, ANY_VERSION)));
         }
         long[] offsets = new long[entries.size()];
         for (int i = 0; i < entries.size(); i++) offsets[i] = writeNoSync(entries.get(i));
@@ -367,20 +394,67 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         return entries;
     }
 
+
     /**
-     * Reserves the tag's next version, enforcing {@code expectedVersion} if given.
+     * Reserves the next version in <em>every</em> tag the append touches, enforcing
+     * {@code expectedVersion} on the fenced tag if one is given.
      *
      * <p>Reads from {@code tagVersionCount}, which is rebuilt from the log on open, so a
-     * restart continues the sequence rather than restarting it.
+     * restart continues each sequence rather than restarting it.
+     *
+     * <p>The fence is checked before any counter moves, so a rejected append leaves every
+     * stream where it was. Otherwise a stale writer would consume a position in each of
+     * the other tags on its way to being refused, and those gaps would be permanent.
+     *
+     * <h2>A failed write keeps what it claimed</h2>
+     * <p>Positions are claimed here, before the entry is written, because the entry has to
+     * carry them. If the write or the fsync then fails the claim looks wasted, and handing
+     * it back looks like the tidy thing to do — it keeps the stream dense and stops the
+     * counter sitting ahead of what is durable.
+     *
+     * <p>It is not safe, because <strong>a failed fsync does not mean the record is
+     * gone.</strong> {@link #writeNoSync} has already put complete bytes into both channels
+     * by then; whether they reach the platter is exactly what the failed call leaves
+     * undecided, and on many kernels they do. Releasing the position lets a retry reuse it,
+     * and if the first record did land the log ends up holding two entries at the same
+     * position in the same stream.
+     *
+     * <p>Both choices lose something, and not the same amount:
+     * <ul>
+     *   <li><strong>Keep the position</strong> — the stream may carry a hole. Density breaks,
+     *       which is a documented invariant, but a cursor still advances monotonically and
+     *       no entry is delivered twice.</li>
+     *   <li><strong>Release it</strong> — two entries may share a position. A version-keyed
+     *       consumer delivers that slot twice, and the entry which ought to be there is
+     *       indistinguishable from the one that replaced it. Silent, and not recoverable by
+     *       re-reading.</li>
+     * </ul>
+     *
+     * <p>A hole is the smaller loss, and unlike a duplicate it <em>heals</em>: counters are
+     * rebuilt from the log on {@link #open()}, so a reopen resolves the ambiguity by reading
+     * what is actually there rather than guessing. The cost while the process runs is that a
+     * conditional append at the position the log may really end on is rejected once; the
+     * caller re-reads {@link #getNextStreamVersion} and continues.
+     *
+     * <p>Not a hypothetical trade — the release-on-failure version was written, and
+     * reverted, on review of #30.
      */
-    private long claimVersion(LogTag tag, long expectedVersion) throws VersionConflictException {
-        AtomicLong counter = tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0));
-        long next = counter.get();
-        if (expectedVersion != ANY_VERSION && expectedVersion != next) {
-            throw new VersionConflictException(tag, expectedVersion, next);
+    private Map<LogTag, Long> claimVersions(PendingAppend pending, long expectedVersion)
+            throws VersionConflictException {
+        LogTag fenced = pending.primaryTag();
+        if (expectedVersion != ANY_VERSION) {
+            long next = tagVersionCount.computeIfAbsent(fenced, k -> new AtomicLong(0)).get();
+            if (expectedVersion != next) {
+                throw new VersionConflictException(fenced, expectedVersion, next);
+            }
         }
-        counter.set(next + 1);
-        return next;
+        Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
+        for (LogTag tag : pending.tags()) {
+            versions.put(tag, tagVersionCount
+                    .computeIfAbsent(tag, k -> new AtomicLong(0))
+                    .getAndIncrement());
+        }
+        return versions;
     }
 
     // -------------------------------------------------------------------------
@@ -646,13 +720,15 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         // Pre-compute variable-length parts
         List<byte[]> nsBytes  = new ArrayList<>();
         List<byte[]> keyBytes = new ArrayList<>();
+        List<Long> tagVersions = new ArrayList<>();
         int tagsBytesLen = 0;
         for (LogTag tag : entry.tags()) {
             byte[] ns  = tag.namespace().getBytes(StandardCharsets.UTF_8);
             byte[] key = tag.key().getBytes(StandardCharsets.UTF_8);
             nsBytes.add(ns);
             keyBytes.add(key);
-            tagsBytesLen += 2 + ns.length + 2 + key.length;
+            tagVersions.add(entry.streamVersion(tag));
+            tagsBytesLen += 2 + ns.length + 2 + key.length + 8;   // + this tag's own version
         }
         byte[] data = entry.dataUnsafe();
         int totalLen = FIXED_OVERHEAD + tagsBytesLen + data.length;
@@ -670,6 +746,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
             buf.put(nsBytes.get(i));
             buf.putShort((short) keyBytes.get(i).length);
             buf.put(keyBytes.get(i));
+            buf.putLong(tagVersions.get(i));
         }
         buf.putInt(data.length);
         buf.put(data);
@@ -697,7 +774,9 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         header.flip();
 
         int magic = header.getInt();
-        if (magic != MAGIC) throw new IOException("Bad magic at offset " + offset);
+        if (magic != MAGIC_V1 && magic != MAGIC_V2) {
+            throw new IOException("Bad magic at offset " + offset);
+        }
 
         long seqnum        = header.getLong();
         long tsMillis      = header.getLong();
@@ -707,8 +786,9 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         // Variable-length tag section starts immediately after the 32-byte prefix
         long cursor = offset + PREFIX_SIZE;
 
-        // Read tags
-        Set<LogTag> tags = new java.util.HashSet<>(numTags);
+        // Read tags, and in a v2 record each tag's own position in its own stream.
+        Set<LogTag> tags = new java.util.LinkedHashSet<>(numTags);
+        java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
         for (int i = 0; i < numTags; i++) {
             ByteBuffer lenBuf = ByteBuffer.allocate(2);
             readFully(channel, lenBuf, cursor); cursor += 2;
@@ -722,9 +802,16 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
             byte[] keyBytes = new byte[keyLen];
             readFully(channel, ByteBuffer.wrap(keyBytes), cursor); cursor += keyLen;
 
-            tags.add(LogTag.of(
+            LogTag tag = LogTag.of(
                     new String(nsBytes, StandardCharsets.UTF_8),
-                    new String(keyBytes, StandardCharsets.UTF_8)));
+                    new String(keyBytes, StandardCharsets.UTF_8));
+            tags.add(tag);
+
+            if (magic == MAGIC_V2) {
+                ByteBuffer verBuf = ByteBuffer.allocate(8);
+                readFully(channel, verBuf, cursor); cursor += 8;
+                versions.put(tag, verBuf.flip().getLong());
+            }
         }
 
         // dataLen
@@ -742,7 +829,12 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
         // checksum (skip verification here for read performance; it's done on open/recovery)
         // cursor += 4;
 
-        return new LogEntry(seqnum, streamVersion, tags, data, Instant.ofEpochMilli(tsMillis));
+        // A v1 record holds one number and cannot say which tag it counted, so it keeps
+        // reporting that number for every tag — exactly what it did before this layout
+        // existed. Only v2 records carry a genuine position per stream.
+        return magic == MAGIC_V2
+                ? new LogEntry(seqnum, versions, tags, data, Instant.ofEpochMilli(tsMillis))
+                : new LogEntry(seqnum, streamVersion, tags, data, Instant.ofEpochMilli(tsMillis));
     }
 
     // -------------------------------------------------------------------------
@@ -800,7 +892,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
                 }
                 hdr.flip();
                 int magic = hdr.getInt();
-                if (magic != MAGIC) {
+                if (magic != MAGIC_V1 && magic != MAGIC_V2) {
                     log.warn("Bad magic at offset {}; stopping scan", cursor);
                     break;
                 }
@@ -810,7 +902,7 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
                 // Skip to next entry: decode to find length
                 try {
                     LogEntry entry = decodeAt(ch, entryOffset);
-                    cursor = entryOffset + entrySize(entry);
+                    cursor = entryOffset + entrySize(entry, magic);
                 } catch (IOException e) {
                     log.warn("Decode error at offset {}; stopping scan: {}", cursor, e.getMessage());
                     break;
@@ -831,12 +923,13 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
                 try {
                     LogEntry entry = decodeAt(ch, e.getValue());
                     for (LogTag tag : entry.tags()) {
+                        long version = entry.streamVersion(tag);
                         tagSeqnums
                                 .computeIfAbsent(tag, k -> new ConcurrentSkipListMap<>())
-                                .put(entry.seqnum(), entry.streamVersion());
+                                .put(entry.seqnum(), version);
                         tagVersionCount
                                 .computeIfAbsent(tag, k -> new AtomicLong(0))
-                                .updateAndGet(c -> Math.max(c, entry.streamVersion() + 1));
+                                .updateAndGet(c -> Math.max(c, version + 1));
                     }
                 } catch (IOException ex) {
                     log.warn("Could not decode entry at offset {}; skipping: {}", e.getValue(), ex.getMessage());
@@ -873,11 +966,20 @@ public class FileBasedPersistenceAdapter implements PersistenceAdapter {
     // Size calculation (for recovery cursor advance)
     // -------------------------------------------------------------------------
 
-    private int entrySize(LogEntry entry) {
+    /**
+     * On-disk size of a record, which depends on the layout it was written in — a v2
+     * record carries eight more bytes per tag. The scan reads the magic before it decodes,
+     * so it passes what it saw rather than guessing from the entry: a single-tag entry
+     * looks identical either way, and a cursor advanced by the wrong stride lands mid-record
+     * and stops the recovery scan at a bad magic.
+     */
+    private int entrySize(LogEntry entry, int magic) {
+        int perTagVersionBytes = magic == MAGIC_V2 ? 8 : 0;
         int tagsLen = 0;
         for (LogTag tag : entry.tags()) {
             tagsLen += 2 + tag.namespace().getBytes(StandardCharsets.UTF_8).length;
             tagsLen += 2 + tag.key().getBytes(StandardCharsets.UTF_8).length;
+            tagsLen += perTagVersionBytes;
         }
         return FIXED_OVERHEAD + tagsLen + entry.dataUnsafe().length;
     }

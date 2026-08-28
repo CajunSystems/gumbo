@@ -110,7 +110,9 @@ public interface PersistenceAdapter extends AutoCloseable {
                     getClass().getSimpleName() + " does not support conditional append;"
                     + " it cannot compare and increment the version atomically");
         }
-        LogEntry entry = pending.withVersion(getNextStreamVersion(pending.primaryTag()));
+        java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
+        for (LogTag tag : pending.tags()) versions.put(tag, getNextStreamVersion(tag));
+        LogEntry entry = pending.withVersions(versions);
         append(entry);
         return entry;
     }
@@ -119,8 +121,9 @@ public interface PersistenceAdapter extends AutoCloseable {
      * Batch form of {@link #append(PendingAppend, long)}: assigns each entry's version and
      * persists them with one durability flush, returning them as stored.
      *
-     * <p>Versions are assigned in list order, so several appends to one tag within a batch
-     * take consecutive versions. Unconditional only — a batch conditioned per entry would
+     * <p>Versions are assigned in list order and per tag, so several appends to one tag
+     * within a batch take consecutive versions in that tag regardless of what else each
+     * entry is tagged into. Unconditional only — a batch conditioned per entry would
      * need to define what happens to the rest when one is rejected, and no caller needs
      * that yet.
      *
@@ -133,9 +136,13 @@ public interface PersistenceAdapter extends AutoCloseable {
         List<LogEntry> entries = new java.util.ArrayList<>(pendings.size());
         java.util.Map<LogTag, Long> next = new java.util.HashMap<>();
         for (PendingAppend p : pendings) {
-            long v = next.computeIfAbsent(p.primaryTag(), this::getNextStreamVersion);
-            next.put(p.primaryTag(), v + 1);
-            entries.add(p.withVersion(v));
+            java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
+            for (LogTag tag : p.tags()) {
+                long v = next.computeIfAbsent(tag, this::getNextStreamVersion);
+                next.put(tag, v + 1);
+                versions.put(tag, v);
+            }
+            entries.add(p.withVersions(versions));
         }
         appendBatch(entries);
         return entries;
@@ -204,18 +211,20 @@ public interface PersistenceAdapter extends AutoCloseable {
      * this returns what remains rather than failing.
      *
      * <h2>Multi-tag entries</h2>
-     * <p>An entry carries <em>one</em> {@code streamVersion}, assigned from its primary tag's
-     * counter, so a version identifies a position in the primary tag's stream. For a tag
-     * that an entry carries only as a <em>secondary</em> tag, that number belongs to a
-     * different stream: it does not count that tag's entries and it need not start at
-     * zero. Version-keyed reads are therefore well-defined for a tag whose entries were
-     * all written with it as the primary tag — the normal case, and the only one for a
-     * per-entity stream — and are not meaningful for a tag used purely as a secondary
-     * fan-out tag, such as a shared work queue fed by atomic multi-tag appends.
+     * <p>Every tag an entry carries gets its own position, so this read is well-defined for
+     * any tag — including one used purely as a shared fan-out tag, such as a work queue fed
+     * by atomic multi-tag appends. A worker cursoring such a queue advances one position per
+     * queue entry, regardless of how far along the other stream each entry also belongs to
+     * happens to be.
      *
-     * <p>Fixing that requires a version per tag per entry, which means storage-owned
-     * per-tag versions rather than one field on the entry. Until then, seqnum-keyed
-     * {@link #readByTag} remains the correct read for a fan-out tag.
+     * <p>That was not always true. An entry used to carry one version, from its primary tag,
+     * and every tag it touched was told that number — so a fan-out tag's versions were not
+     * dense, did not start at zero, and could go backwards relative to entries already
+     * delivered, which silently skipped work. Entries written before the fix still report
+     * that single number for every tag they carry (see
+     * {@link com.cajunsystems.gumbo.core.LogEntry#hasPerTagVersions()}), so a log that
+     * predates it keeps reading exactly as it did; only entries written since are numbered
+     * per stream.
      *
      * <p>The default implementation reads the tag's whole stream and filters, which is
      * correct but reads storage it discards. Adapters that maintain a per-tag index
@@ -229,7 +238,7 @@ public interface PersistenceAdapter extends AutoCloseable {
     default List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
         if (fromVersion <= 0) return readByTag(tag, 0L);
         return readByTag(tag, 0L).stream()
-                .filter(e -> e.streamVersion() >= fromVersion)
+                .filter(e -> e.streamVersion(tag) >= fromVersion)
                 .toList();
     }
 

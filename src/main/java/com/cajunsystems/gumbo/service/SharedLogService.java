@@ -175,8 +175,11 @@ public class SharedLogService implements SharedLog {
 
             List<AppendResult> results = new ArrayList<>(entries.size());
             for (LogEntry entry : entries) {
-                results.add(new AppendResult(entry.seqnum(), entry.streamVersion(),
-                        entry.primaryTag(), entry.timestamp()));
+                // Report the tag this append was addressed to, not whichever the entry's
+                // Set happens to iterate first — that order is salted per JVM run.
+                LogTag reqPrimary = requests.get(results.size()).tags().iterator().next();
+                results.add(new AppendResult(entry.seqnum(), entry.streamVersion(reqPrimary),
+                        reqPrimary, entry.timestamp()));
             }
 
             // Queue for delivery; each subscription drains its own queue.
@@ -206,7 +209,7 @@ public class SharedLogService implements SharedLog {
             notifySubscribers(entry);
 
             return new AppendResult(
-                    entry.seqnum(), entry.streamVersion(), primaryTag, entry.timestamp());
+                    entry.seqnum(), entry.streamVersion(primaryTag), primaryTag, entry.timestamp());
         } catch (VersionConflictException e) {
             throw new LogWriteException("Conditional append rejected", e);
         } catch (IOException e) {

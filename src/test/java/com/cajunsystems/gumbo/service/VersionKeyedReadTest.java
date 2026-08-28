@@ -162,50 +162,112 @@ class VersionKeyedReadTest {
     }
 
     /**
-     * The boundary of what a version means today, pinned rather than papered over.
+     * One atomic append into two tags now takes a position in <em>each</em> stream, and
+     * both stay dense from zero.
      *
-     * <p>An entry carries <em>one</em> {@code streamVersion}, drawn from its primary tag's
-     * counter, so an atomic multi-tag append leaves one of the two streams mis-numbered:
-     * the fan-out tag's first entry is numbered 3 rather than 0 if the history tag is
-     * primary, and the history tag's stream reads {@code 0,1,2,0} — a repeated version —
-     * if the queue tag is. Which one happens is not the caller's choice: the primary is
-     * {@code tags.iterator().next()} over a {@code Set.copyOf}, whose iteration order
-     * Java salts per JVM run, so the same program numbers its streams differently across
-     * restarts. The assertion below is written on the property rather than on either
-     * outcome for exactly that reason.
+     * <p>This test used to assert the opposite, as a property: *both streams cannot be
+     * dense from 0*, because an entry carried one version and every tag it touched was told
+     * that number. A tag carried only as a secondary therefore inherited another stream's
+     * numbering — not dense, not starting at zero, and able to go backwards relative to
+     * entries already delivered, so a consumer cursoring a shared queue could silently skip
+     * work. It was written as a property rather than fixed expectations because which tag
+     * ends up primary is {@code tags.iterator().next()} over a {@code Set.copyOf}, whose
+     * iteration order Java salts per JVM run.
      *
-     * <p>Nothing in a read-side change can fix this — it needs a version per tag per
-     * entry, i.e. storage-owned per-tag versions. So the contract says version-keyed
-     * reads address a tag's own primary stream, and this test is what starts failing
-     * when that lands.
+     * <p>That salting is why the assertion can now be exact in a way it could not be
+     * before: with a position per tag, neither stream's numbering depends on which tag won
+     * the iteration order.
      */
-    @Test
-    void anAtomicMultiTagAppendLeavesOneStreamMisNumbered() throws IOException {
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void anAtomicMultiTagAppendNumbersBothStreamsFromZero(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
         LogTag history = LogTag.of("history", "wf-1");
         LogTag queue   = LogTag.of("queue");
-        open(dir -> new InMemoryPersistenceAdapter());
+        open(factory);
 
         for (int i = 0; i < 3; i++) append(history, "h" + i);
-        // One atomic append to both — the pattern a workflow engine uses to record
-        // history and enqueue work with no window where one is visible without the other.
+        // One atomic append to both — the pattern a workflow engine uses to record history
+        // and enqueue work with no window where one is visible without the other.
         AppendResult r = service.append(AppendRequest.to(
                 new LinkedHashSet<>(List.of(history, queue)), "work".getBytes())).join();
 
         assertThat(payloadsOf(service.getView(queue).readFromVersion(0).join()))
                 .containsExactly("work");
 
-        assertThat(isDenseFromZero(history) && isDenseFromZero(queue))
-                .as("both streams cannot be densely numbered from 0 — one entry, one version"
-                        + " (primary tag this run: %s)", r.primaryTag())
-                .isFalse();
+        assertThat(isDenseFromZero(history))
+                .as("history continues its own count: 0,1,2 then 3 (primary this run: %s)", r.primaryTag())
+                .isTrue();
+        assertThat(isDenseFromZero(queue))
+                .as("and the queue starts its own at 0 rather than inheriting history's 3")
+                .isTrue();
 
-        // The primary tag's own stream is the one that stays correct.
-        assertThat(isDenseFromZero(r.primaryTag())).isTrue();
+        assertThat(versionsIn(queue, service.getView(queue).readFromVersion(0).join()))
+                .containsExactly(0L);
+
+        // The next queue-only append continues the queue's count, not history's.
+        append(queue, "next");
+        assertThat(versionsIn(queue, service.getView(queue).readFromVersion(0).join()))
+                .as("a queue cursor advances by one per queue entry")
+                .containsExactly(0L, 1L);
+    }
+
+    /**
+     * The consumer-facing consequence, and the reason this was worth a format change: a
+     * worker cursoring a shared fan-out tag sees every item exactly once.
+     *
+     * <p>The worker consumes <em>between</em> enqueues, which is what makes the old defect
+     * visible. Under the old numbering the dual-tagged entry took its workflow's history
+     * position, so a worker that had advanced its cursor to 8 would be handed nothing when a
+     * second workflow — whose history sat at 4 — enqueued next: the item is numbered below
+     * where the cursor already is, and a version-keyed tail read skips it. Work silently
+     * never claimed, and nothing in the log looking wrong.
+     *
+     * <p>Draining everything first and only then advancing hides it, because the items are
+     * all above the initial cursor whatever their order.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("adapters")
+    void aWorkerCursoringAFanOutTagSeesEveryItemExactlyOnce(
+            String name, Function<Path, PersistenceAdapter> factory) throws IOException {
+        LogTag queue = LogTag.of("queue");
+        open(factory);
+
+        // History lengths descend, so the positions the queue would have inherited descend
+        // too: 8, then 4, then 0 — each below the cursor the worker already holds.
+        int[] historyLengths = {8, 4, 0};
+        List<String> claimed = new java.util.ArrayList<>();
+        long cursor = -1;
+
+        for (int w = 0; w < historyLengths.length; w++) {
+            LogTag history = LogTag.of("history", "wf-" + w);
+            for (int i = 0; i < historyLengths[w]; i++) append(history, "h" + w + "-" + i);
+
+            // Fence on the history tag explicitly, which also names the tag the entry is
+            // numbered by. Left implicit, that choice is tags.iterator().next() over a Set —
+            // salted per JVM run — so the old defect would land on whichever tag won.
+            service.append(
+                    AppendRequest.to(new LinkedHashSet<>(List.of(history, queue)),
+                            ("work-" + w).getBytes()),
+                    history, historyLengths[w]).join();
+
+            // The worker drains what it can see, then advances — before the next enqueue.
+            for (LogEntry e : service.getView(queue).readAfterVersion(cursor).join()) {
+                claimed.add(new String(e.dataUnsafe()));
+                cursor = Math.max(cursor, e.streamVersion(queue));
+            }
+        }
+
+        assertThat(claimed)
+                .as("every item claimed exactly once — none skipped by a cursor compared"
+                        + " against another stream's numbering, none redelivered")
+                .containsExactly("work-0", "work-1", "work-2");
+        assertThat(cursor).as("and the cursor is the queue's own last position").isEqualTo(2L);
     }
 
     /** True if the tag's entries carry versions 0, 1, 2, … with no gap or repeat. */
     private boolean isDenseFromZero(LogTag tag) {
-        List<Long> versions = versionsOf(service.getView(tag).readFromVersion(0).join());
+        List<Long> versions = versionsIn(tag, service.getView(tag).readFromVersion(0).join());
         for (int i = 0; i < versions.size(); i++) {
             if (versions.get(i) != i) return false;
         }
@@ -261,6 +323,16 @@ class VersionKeyedReadTest {
         service.append(AppendRequest.to(tag, data.getBytes())).join();
     }
 
+    /**
+     * Positions as seen from one stream. A read through a tag view has to ask for that
+     * tag's position: {@link LogEntry#streamVersion()} answers for the entry's primary tag,
+     * which for a multi-tag entry is whichever the Set iterated first this run.
+     */
+    private static List<Long> versionsIn(LogTag tag, List<LogEntry> entries) {
+        return entries.stream().map(e -> e.streamVersion(tag)).toList();
+    }
+
+    /** Positions as the entries themselves report them; exact for single-tag streams. */
     private static List<Long> versionsOf(List<LogEntry> entries) {
         return entries.stream().map(LogEntry::streamVersion).toList();
     }

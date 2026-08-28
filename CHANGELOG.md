@@ -5,6 +5,116 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+Closes the last item on the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)'s
+backlog that carried a data-format cost, and the one a consumer's design had come to depend
+on: **an entry now carries a position per tag, not one position borrowed from its primary
+tag.**
+
+### Fixed
+
+**Multi-tag entries mis-numbered every stream but one**
+
+An entry held a single `streamVersion`, drawn from its primary tag, and every tag it touched
+was told that number — written into that tag's index *and* used to drag that tag's counter
+forward. A tag carried only as a **secondary** tag therefore inherited another stream's
+numbering: not dense, not starting at zero, and — the part that actually loses data — able
+to go *backwards* relative to entries already delivered.
+
+That last property is the defect rather than an inelegance. A worker cursoring a shared work
+queue holds a position and asks for what came after it. Under the old numbering an item
+enqueued by a workflow whose history sat at version 4 was numbered 4, so a worker that had
+already advanced to 8 behind a busier workflow was handed nothing: the item is below where
+the cursor already is, a version-keyed tail read skips it, and **nothing in the log looks
+wrong**. This is exactly the shape a workflow engine uses when one atomic append records
+history and enqueues the work item.
+
+- `LogEntry` now carries `Map<LogTag, Long>` and answers `streamVersion(LogTag)`. Every
+  adapter claims the next position in *every* tag an append touches, and stores each tag's
+  own number in that tag's index
+- A multi-tag append therefore advances each of its tags by one. It always did belong to
+  both streams; only the numbering pretended otherwise
+- `AppendResult` reports the position of the tag the append was **addressed to**, rather
+  than whichever the entry's `Set` iterated first — that order is salted per JVM run
+
+**No migration, and no rewrite of anything already written.** The record's own marker says
+which layout it is:
+
+| Adapter | Marker |
+|---|---|
+| file | magic `0xC0FFEE43` (was `0xC0FFEE42`), with a version after each tag |
+| FoundationDB | a leading `-1L`, which the old layout's first field — a seqnum, always `>= 0` — could never be |
+
+So a log may hold both, which is what an upgrade actually produces: existing records stay
+put and new ones land on the end. An older record holds one number and **cannot** say which
+tag it counted — the primary was `tags.iterator().next()` over a `Set`, salted per run — so
+it answers every tag with that number, precisely as it always did, and reports
+`hasPerTagVersions() == false`. A consumer can ask instead of being quietly guessed at.
+
+**Why the version is stored rather than derived.** Deriving each tag's position as its rank
+in the per-tag index needs no format change at all, and is wrong: `trim` purges the in-memory
+index and `rebuildTagIndices` skips entries below the trim point, so a trim would renumber
+every survivor and silently invalidate every cursor a consumer had stored. Surviving a trim
+is the whole reason the number is written down.
+
+**A failed append keeps the positions it claimed — deliberately, and now with the reasoning
+written down**
+
+Raised in review on #30 as a leak: a version is claimed before the entry is written, and
+nothing hands it back when the write or the fsync fails, so the stream can carry a hole and
+the counter can sit ahead of what is durable. Both true.
+
+Releasing them was implemented, and then reverted, because **a failed fsync does not mean the
+record is gone.** `writeNoSync` has already put complete bytes into both channels by then;
+whether they reach the platter is exactly what the failed call leaves undecided, and on many
+kernels they do. `FailedWriteKeepsItsPositionTest` measures this rather than assuming it: after
+an injected sync failure, the record is still in the log on reopen.
+
+So the choice is a hole against a duplicate, and they are not equal:
+
+- **Keep the position** — the stream may carry a hole. Density breaks, which is a documented
+  invariant, but a cursor still advances monotonically and nothing is delivered twice
+- **Release it** — a retry reuses the position, and if the first record landed, two entries
+  share one position in one stream. A version-keyed consumer delivers that slot twice,
+  silently, and the entry that ought to be there is indistinguishable from the one that
+  replaced it
+
+A hole is the smaller loss, and unlike a duplicate it **heals**: counters are rebuilt from the
+log on `open()`, so a reopen resolves the ambiguity by reading what is there rather than
+guessing. The residual cost is that a conditional append at the position the log may really
+end on is rejected once, and the caller re-reads `getNextStreamVersion` and continues.
+
+The reasoning now lives on `claimVersions`, where the claim happens, so the next person to
+notice the leak finds the argument rather than repeating the fix.
+
+### Build and CI
+
+- **Mutation score 484–486 of 606 killed (80%), test strength 85%; threshold unchanged at
+  77.** 486 on CI, 484 locally — the spread is run-to-run variance in what times out, as
+  recorded under 0.5.0, not a machine difference. The floor recomputes to 467 at this
+  denominator, leaving nineteen mutants of headroom. Both halves of the fraction moved: the
+  per-tag assignment and the two record layouts added mutable code, and the compatibility
+  and cursoring tests kill it.
+
+### Tests
+
+- `VersionKeyedReadTest.anAtomicMultiTagAppendLeavesOneStreamMisNumbered` **asserted this
+  defect** as a property (*both streams cannot be dense from 0*). It is now
+  `anAtomicMultiTagAppendNumbersBothStreamsFromZero` and asserts both are — and it can be
+  exact where the old one could not, because neither stream's numbering depends any more on
+  which tag won the iteration order
+- `aWorkerCursoringAFanOutTagSeesEveryItemExactlyOnce` pins the consequence, with the worker
+  consuming *between* enqueues. Draining everything first and advancing once hides the bug
+  entirely — the first version of this test did exactly that and passed against a faithful
+  reproduction of the defect, which is the trap this repo has now walked into three times
+- `RecordFormatCompatibilityTest` hand-assembles records in the old layout, the only honest
+  way to test bytes the current code can no longer produce. Covers an old log, an old
+  multi-tag record's admitted ambiguity, a mixed log, and recovery by full scan across both
+  layouts — where a mis-sized cursor lands mid-record and truncates the log
+
+---
+
 ## [0.5.0] — 2026-08-22
 
 Continues the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)

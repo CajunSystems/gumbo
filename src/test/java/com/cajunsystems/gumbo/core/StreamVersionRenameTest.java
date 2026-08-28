@@ -40,13 +40,18 @@ class StreamVersionRenameTest {
     }
 
     /**
-     * The on-disk layout is unchanged: the version still occupies the same 8 bytes at the
-     * same offset it did when it was called {@code localId}. This is what makes the
-     * rename free — a log written by an earlier version reads back identically, with no
-     * migration and no version stamp.
+     * The fixed header is unchanged: the version still occupies the same 8 bytes at the
+     * same offset it did when it was called {@code localId}. This is what made the rename
+     * free.
+     *
+     * <p>The record marker has since moved to {@code 0xC0FFEE43}, which is how a record
+     * says it also carries a position per tag after each tag. The prefix did not move, and
+     * records written under the old marker are still read — see
+     * {@code RecordFormatCompatibilityTest}, which is where the no-migration guarantee is
+     * actually pinned now that this adapter no longer writes the old layout.
      */
     @Test
-    void theOnDiskLayoutIsUnchanged() throws IOException {
+    void theFixedHeaderLayoutIsUnchanged() throws IOException {
         FileBasedPersistenceAdapter adapter = new FileBasedPersistenceAdapter(tempDir);
         adapter.open();
         try {
@@ -56,11 +61,11 @@ class StreamVersionRenameTest {
             adapter.close();
         }
 
-        // Header layout, unchanged from 0.2.0:
+        // Header layout, unchanged from 0.2.0 apart from the marker:
         //   magic(4) | seqnum(8) | timestamp(8) | version(8) | numTags(4) | …
         byte[] raw = Files.readAllBytes(tempDir.resolve("log.dat"));
         ByteBuffer buf = ByteBuffer.wrap(raw);
-        assertThat(buf.getInt(0)).isEqualTo(0xC0FFEE42);
+        assertThat(buf.getInt(0)).isEqualTo(0xC0FFEE43);
         assertThat(buf.getLong(4)).isEqualTo(0L);   // seqnum
         assertThat(buf.getLong(20)).isEqualTo(0L);  // version, still the third field
 

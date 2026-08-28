@@ -34,7 +34,26 @@ public record PendingAppend(
         tags = Set.copyOf(tags);
     }
 
-    /** The entry this becomes once storage has assigned {@code streamVersion}. */
+    /**
+     * The entry this becomes once storage has assigned one position per tag.
+     *
+     * <p>Every tag needs its own: an entry appended to a per-instance history tag and a
+     * shared work queue occupies a different position in each, and giving both the same
+     * number is what made a version-keyed cursor over the queue unusable.
+     *
+     * @param streamVersions one position per tag in {@link #tags()}
+     */
+    public LogEntry withVersions(java.util.Map<LogTag, Long> streamVersions) {
+        return new LogEntry(seqnum, streamVersions, tags, data, timestamp);
+    }
+
+    /**
+     * The entry this becomes when only one position is known, applied to every tag.
+     *
+     * <p>Correct for a single-tag append, which is what almost every caller does. For a
+     * multi-tag append it reproduces the pre-per-tag behaviour — one number, no idea which
+     * tag it counts — so prefer {@link #withVersions}.
+     */
     public LogEntry withVersion(long streamVersion) {
         return new LogEntry(seqnum, streamVersion, tags, data, timestamp);
     }

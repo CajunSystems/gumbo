@@ -227,17 +227,17 @@ class ConditionalAppendTest {
     }
 
     /**
-     * A multi-tag append must never lower a secondary tag's version count.
+     * A multi-tag append advances every tag it touches by exactly one, and never rewinds
+     * any of them.
      *
-     * <p>An entry carries one version — its primary tag's — so on a multi-tag append a
-     * secondary tag may already be further along its own sequence. Writing
-     * {@code thisEntry.version + 1} as that tag's count rewinds it, which hands out
-     * versions that already exist and, now that the count is what a conditional append
-     * reads, lets a stale writer pass a fence it should have failed.
+     * <p>Each tag now carries its own position, so an entry appended to both streams takes
+     * the next place in <em>each</em> — it really is in both, and a stream whose entries
+     * did not all advance its count would leave the count describing something other than
+     * the number of entries in it.
      *
-     * <p>The in-memory and file adapters take a max and were always safe; FoundationDB
-     * overwrote. The invariant is asserted here for every adapter rather than only where
-     * it was broken, so it is checked wherever the suite runs.
+     * <p>The rewind half of the invariant still matters and is still checked: the count is
+     * what a conditional append fences on, so a lowered count lets a stale writer pass a
+     * check it should have failed.
      */
     @ParameterizedTest(name = "{0}")
     @MethodSource("adapters")
@@ -250,7 +250,8 @@ class ConditionalAppendTest {
             service.append(AppendRequest.to(INVENTORY, ("i" + i).getBytes())).join();
         }
 
-        // One entry on both, fenced on (and numbered by) ORDERS, whose version is 0.
+        // One entry on both, fenced on ORDERS. The result reports the fenced tag's
+        // position — ORDERS' first — while INVENTORY gets its own next place, 3.
         AppendResult r = service.append(
                 AppendRequest.to(Set.of(ORDERS, INVENTORY), "both".getBytes()),
                 ORDERS, 0).join();
@@ -261,7 +262,13 @@ class ConditionalAppendTest {
                 .as("a rewound count would let this stale writer through the fence")
                 .isInstanceOf(RuntimeException.class);
 
-        assertThat(append(INVENTORY, "i3", 3).streamVersion()).isEqualTo(3L);
+        // Nor may it have stood still: the shared entry occupies INVENTORY position 3, so
+        // the next INVENTORY-only append is 4. A fence at 3 is now stale for the same
+        // reason — that place is taken.
+        assertThatThrownBy(() -> append(INVENTORY, "taken", 3))
+                .as("the dual-tagged entry consumed INVENTORY's position 3")
+                .isInstanceOf(RuntimeException.class);
+        assertThat(append(INVENTORY, "i4", 4).streamVersion()).isEqualTo(4L);
     }
 
     // -------------------------------------------------------------------------
