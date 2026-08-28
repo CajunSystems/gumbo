@@ -5,12 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.6.0] — 2026-08-28
 
 Closes the last item on the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)'s
 backlog that carried a data-format cost, and the one a consumer's design had come to depend
 on: **an entry now carries a position per tag, not one position borrowed from its primary
 tag.**
+
+**Why 0.6.0.** The record layout changed, so this is not a patch — but it is not a breaking
+change either. `LogEntry` gained a constructor and two accessors without losing any, every
+adapter keeps compiling, and **logs written by 0.5.0 and earlier are read unchanged**: each
+record's own marker says which layout it is, so an existing log needs no migration and no
+rewrite. Upgrading is a version bump.
 
 ### Fixed
 
