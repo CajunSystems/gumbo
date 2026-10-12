@@ -263,20 +263,46 @@ class FoundationDBMultiInstanceTest {
         assertThat(b.getTagValue(ORDERS, "owner")).as("and b's takeover stands").isEqualTo(bytes("b"));
     }
 
-    /** The records are bounded by a horizon, cleared on every write with one range clear. */
+    /**
+     * The writer in between may be a plain delete, which has no token of its own. Raised in
+     * review: a delete that also cleared the key's records would take the retry's evidence
+     * with it. So it must not, and the retry must neither re-apply nor resurrect the key.
+     */
+    @Test
+    void aRetryStillRecognisesItsLandedWriteWhenTheKeyWasDeletedInBetween() throws IOException {
+        byte[] bump = OperationToken.fresh();
+        List<Long> bumpAttempts = new ArrayList<>();
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump, bumpAttempts)).isEqualTo(5L);
+        b.deleteTagValue(ORDERS, "n");
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump, bumpAttempts))
+                .as("a's retry returns what its landed attempt returned")
+                .isEqualTo(5L);
+        assertThat(b.getTagValue(ORDERS, "n")).as("and does not bring the deleted key back").isNull();
+
+        byte[] claim = OperationToken.fresh();
+        List<Long> claimAttempts = new ArrayList<>();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim, claimAttempts)).isTrue();
+        b.deleteTagValue(ORDERS, "owner");
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim, claimAttempts))
+                .as("a's claim did land")
+                .isTrue();
+        assertThat(b.getTagValue(ORDERS, "owner")).isNull();
+    }
+
+    /** The records are bounded by a horizon, cleared on every write with one range clear — and by nothing else. */
     @Test
     void attemptRecordsOlderThanTheHorizonAreClearedByTheNextWrite() throws IOException {
         for (int i = 0; i < 3; i++) a.incrementTagValue(ORDERS, "n", 1);
         assertThat(a.storedAttemptRecords(ORDERS, "n")).as("default horizon keeps them all").isEqualTo(3L);
+
+        a.deleteTagValue(ORDERS, "n");
+        assertThat(a.storedAttemptRecords(ORDERS, "n")).as("a delete is not a writer with a token and clears nothing").isEqualTo(3L);
 
         a.tokenHorizonVersions = 0;
         a.incrementTagValue(ORDERS, "n", 1);
         assertThat(a.storedAttemptRecords(ORDERS, "n"))
                 .as("a zero horizon keeps only the record the write itself made")
                 .isEqualTo(1L);
-
-        a.deleteTagValue(ORDERS, "n");
-        assertThat(a.storedAttemptRecords(ORDERS, "n")).as("deleting the key clears its records").isZero();
     }
 
     /**

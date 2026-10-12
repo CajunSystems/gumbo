@@ -787,11 +787,18 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         );
     }
 
+    /**
+     * Clears the value only. The key's idempotency records are deliberately left alone: a
+     * delete that lands between a conditional write's lost commit reply and its retry would
+     * otherwise take the retry's evidence with it, and the retry would apply again — a
+     * landed swap reported as lost, an increment counted twice. The horizon clear on the
+     * next conditional write is the only thing that removes records, and it never removes
+     * one younger than an hour of versions.
+     */
     @Override
     public void deleteTagValue(LogTag tag, String key) {
         db.run(tr -> {
             tr.clear(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
-            tr.clear(opSubspace(tag, key).range());
             return null;
         });
     }

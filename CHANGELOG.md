@@ -96,8 +96,10 @@ attempts (it knows their read versions; they ran in the same call) and returns t
 answer. One record per attempt, not one slot per key: review caught that a slot is
 overwritten by whoever writes the key next, so a writer slipping in between a lost reply and
 the retry would make the retry apply again. Records older than an hour of versions are
-range-cleared by the next write, so nothing is scanned and nothing accumulates. On the happy
-path the cost is one write and one range clear; the lookups only happen on a retry. The
+range-cleared by the next write, so nothing is scanned and nothing accumulates — and by
+nothing else: a `deleteTagValue` leaves them, since a delete landing between a lost reply
+and the retry would otherwise take the retry's evidence with it (also caught in review). On
+the happy path the cost is one write and one range clear; the lookups only happen on a retry. The
 *caller's* retry warning on `incrementTagValue` stands on every adapter; it is the client
 library's own retry that is now safe.
 
