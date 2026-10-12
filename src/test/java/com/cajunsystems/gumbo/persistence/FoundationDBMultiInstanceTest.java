@@ -322,6 +322,42 @@ class FoundationDBMultiInstanceTest {
         assertThat(open().getLatestSeqnum()).isEqualTo(3L);
     }
 
+    /**
+     * The batching decorator over this adapter, on a root another process writes. Its
+     * failed-flush reconcile used to compare against {@code getLatestSeqnum()}, which here
+     * is now the log's high-water mark; a peer committing a higher seqnum between the
+     * buffering and a flush that failed outright made the decorator drop its unwritten
+     * entries as persisted. Found in review of #40. The flush failure is injected by
+     * overriding {@code appendBatch} once.
+     */
+    @Test
+    void aBatchingDecoratorOnASharedRootKeepsAFailedFlushForRetry() throws IOException {
+        class FailsOnce extends FoundationDBPersistenceAdapter {
+            boolean failNext = true;
+            FailsOnce() { super(FdbTestSupport.clusterFile(), root); }
+            @Override public void appendBatch(List<LogEntry> entries) throws IOException {
+                if (failNext) { failNext = false; throw new IOException("injected flush failure"); }
+                super.appendBatch(entries);
+            }
+        }
+        FailsOnce delegate = new FailsOnce();
+        BatchingPersistenceAdapter batching = new BatchingPersistenceAdapter(delegate, 10, 600_000);
+        batching.open();
+        try {
+            batching.append(pending(0, ORDERS).withVersion(0));
+            batching.append(pending(1, ORDERS).withVersion(1));
+            b.append(pending(2, INVENTORY), PersistenceAdapter.ANY_VERSION);   // the peer, committing higher
+            assertThat(delegate.getLatestSeqnum()).as("the log's high-water mark is the peer's").isEqualTo(2L);
+
+            assertThatThrownBy(batching::flushNow).hasMessageContaining("injected flush failure");
+            batching.flushNow();
+
+            assertThat(seqnumsOf(b.readAll())).as("nothing of the failed flush was dropped").containsExactly(0L, 1L, 2L);
+        } finally {
+            batching.close();
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Ask 3 of #38: D2 does not apply
     // -------------------------------------------------------------------------

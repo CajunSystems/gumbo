@@ -115,6 +115,19 @@ the happy path the cost is one write and one range clear; the lookups only happe
 *caller's* retry warning on `incrementTagValue` stands on every adapter; it is the client
 library's own retry that is now safe.
 
+**The batching decorator over FDB could drop a failed flush on a shared root**
+(found in review of #41)
+
+A consequence of the read-through `getLatestSeqnum()` above: `BatchingPersistenceAdapter`
+reconciled a failed flush against it, which was exact while the value was this process's own
+high-water mark and wrong once it became the log's. A peer committing a higher seqnum
+between the buffering and a flush that failed outright made the decorator clear its
+unwritten entries as persisted, with nothing but a warning saying so. The decorator declares
+`multiWriter` off, but that under-reports its own fence; it cannot stop a plain adapter in
+another process from writing the same root. It now reads the batch's own seqnums back —
+one range scan from the batch's first seqnum, on a path that only runs after a flush has
+failed — which is the rule `FAILURE_SEMANTICS.md` gives every caller.
+
 **An empty `appendBatchAssigningVersions` would have pinned `meta/latest` at -1 forever**
 (found in review of #40)
 

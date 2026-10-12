@@ -84,8 +84,10 @@ and drop them. **Reconcile by reading your own seqnums back** — `readFrom(s)` 
 seqnum of each chunk; seqnums are unique per append, so presence is proof — or reason in
 versions, which are assigned in commit order and are always a dense prefix per tag. The same
 divergence is why a seqnum-keyed tail cursor is unsafe under `multiWriter` (`readAfter`).
-`BatchingPersistenceAdapter` reconciles against the delegate's `getLatestSeqnum()`, which is
-one more reason it forces `multiWriter` off.
+`BatchingPersistenceAdapter` used to reconcile a failed flush against the delegate's
+`getLatestSeqnum()` and now reads its own seqnums back, for exactly this reason: a decorator
+in one process cannot stop a plain adapter in another from writing the same root, so it has
+to be safe when that happens even though it declares `multiWriter` off for its own fence.
 
 ### The tag KV follows the same rule
 
@@ -112,10 +114,12 @@ The decorator defers durability, not identity. Two consequences worth stating pl
   append time; the entry reaches storage at the next flush. A crash in between loses it.
   This is the documented trade-off of the adapter, not a defect — but it means a caller
   that treats the returned version as proof of durability is wrong.
-- **A failed flush retains what it could not write, and drops what it could.** The
-  delegate's `getLatestSeqnum()` names the boundary, since entries flush in seqnum order.
-  If the delegate cannot answer, nothing is dropped: a duplicate is recoverable by
-  inspection, a discarded entry is not.
+- **A failed flush retains what it could not write, and drops what it could.** What was
+  written is decided by reading the batch's own seqnums back from the delegate — not by
+  comparing against its `getLatestSeqnum()`, which on a FoundationDB root another process
+  writes is the log's high-water mark and would have passed a peer's higher seqnum off as
+  proof that this batch landed (see above). If the delegate cannot answer, nothing is
+  dropped: a duplicate is recoverable by inspection, a discarded entry is not.
 - **The KV is write-through, so a claim outruns the entries it authorises.** KV calls,
   conditional ones included, go straight to the delegate and are durable when they return,
   while log entries appended around them may still be pending. So "claim, then append" can

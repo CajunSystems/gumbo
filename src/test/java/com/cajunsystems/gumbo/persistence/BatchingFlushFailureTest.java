@@ -32,7 +32,7 @@ class BatchingFlushFailureTest {
 
     /** Fails writes on demand, so the failure is chosen rather than waited for. */
     private static final class FlakyDelegate implements PersistenceAdapter {
-        private final PersistenceAdapter inner;
+        final PersistenceAdapter inner;
         volatile boolean failWrites = false;
 
         FlakyDelegate(PersistenceAdapter inner) { this.inner = inner; }
@@ -105,6 +105,38 @@ class BatchingFlushFailureTest {
             // Both versions handed out are backed by entries that actually exist.
             assertThat(adapter.readAll().stream().map(LogEntry::streamVersion))
                     .containsExactly(0L, 1L);
+        } finally {
+            adapter.close();
+        }
+    }
+
+    /**
+     * On a root another process writes, the delegate's {@code getLatestSeqnum()} is the
+     * log's high-water mark, which any writer raises. Reconciling a failed flush against it
+     * mistook a peer's higher seqnum for proof that this batch had landed and dropped the
+     * batch — found in review of #40. The peer is played by a write straight to the inner
+     * adapter, bypassing the decorator, between the buffering and the failed flush.
+     */
+    @Test
+    void aFailedFlushDoesNotMistakeAnotherWritersSeqnumForItsOwn() throws IOException {
+        FlakyDelegate delegate = new FlakyDelegate(new FileBasedPersistenceAdapter(tempDir));
+        BatchingPersistenceAdapter adapter = new BatchingPersistenceAdapter(delegate, 10, 600_000);
+        adapter.open();
+        try {
+            adapter.append(entry(10));
+            adapter.append(entry(11));
+            delegate.inner.append(entry(12));   // another writer commits a higher seqnum
+            assertThat(delegate.getLatestSeqnum()).isEqualTo(12L);
+
+            delegate.failWrites = true;
+            assertThatThrownBy(adapter::flushNow).isInstanceOf(IOException.class);
+
+            delegate.failWrites = false;
+            adapter.flushNow();
+
+            assertThat(adapter.readAll().stream().map(LogEntry::seqnum))
+                    .as("the failed flush wrote nothing, so nothing of it may be dropped")
+                    .containsExactly(10L, 11L, 12L);
         } finally {
             adapter.close();
         }
