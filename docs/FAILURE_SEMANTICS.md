@@ -67,6 +67,13 @@ Visibility now follows durability there.
 A third-party adapter that advertises written-but-not-durable entries here will silently
 lose data on the retry path, and nothing will report it.
 
+On FoundationDB it is also a **storage** read, not a process-local one: `meta/latest` is
+raised with an atomic `BYTE_MAX` in the same transaction as the entry, and
+`getLatestSeqnum()` is a point read of it. Under `multiWriter` the boundary is the log's,
+not this process's — a local high-water mark was wrong for a second writer and, written as
+`max(local, seqnum)`, could move the stored value backwards when a lower seqnum committed
+later.
+
 ### The tag KV follows the same rule
 
 A KV mutation is durable when it returns, and the value it publishes is the one that

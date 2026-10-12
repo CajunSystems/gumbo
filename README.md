@@ -612,10 +612,22 @@ persistence back-end for **multi-node or production-scale deployments**.
 {root} / "meta" / "latest"                        → latestSeqnum (8 bytes)
 {root} / "meta" / "trim"                          → trimSeqnum (8 bytes)
 {root} / "meta" / "tagcount" / namespace / key    → versionCount (8 bytes)
+{root} / "meta" / "taglatest" / namespace / key   → latest seqnum in the tag (8 bytes)
+{root} / "kv"   / namespace / key / kvKey         → tag KV value
 ```
 
 FDB's tuple-layer key encoding preserves ordering, so range reads over the log
 subspace naturally return entries in `seqnum` order without a separate index file.
+The index *is* this subspace — written in the same transaction as the entry — so there
+is no per-process index file for a second writer to clobber (the file adapter's D2 in
+Catalyst's requirements report does not apply here; `FoundationDBMultiInstanceTest`
+asserts it).
+
+The adapter keeps **no per-process cache** of any of this. `getLatestSeqnum()`,
+`getNextStreamVersion(tag)` and `getLatestSeqnumForTag(tag)` — and so
+`LogView.getLatestVersion()` — are each one point read, because another process may have
+moved them; `meta/latest` is raised with an atomic `BYTE_MAX` inside the write transaction
+so a lower seqnum committing later can never move it back.
 
 #### Quick start
 
@@ -644,14 +656,77 @@ seq.open();
 store.open();
 
 SharedLogConfig config = SharedLogConfig.builder()
-    .sequencer(store)        // seqnums assigned by FDB — safe across nodes
+    .sequencer(seq)          // seqnums assigned by FDB — safe across nodes
     .persistenceAdapter(store)
     .build();
 ```
 
+Only this pairing reports `capabilities().multiWriter()`. The adapter alone does not make a
+multi-writer log: the service composes the flag from storage **and** sequencer, and the
+default `LocalSequencer` is a per-process counter.
+
 > **`fdb-java` is an optional Maven dependency.** It pulls in a platform-specific
 > native library (`libfdb_c.so` on Linux).  Projects that do not use the FDB
 > adapter are not affected.
+
+#### Multi-writer: what is measured
+
+`FoundationDBMultiWriterTest` runs **two JVMs**, each with its own `SharedLogService`,
+`FoundationDBPersistenceAdapter` and `FoundationDBSequencer`, on one cluster and one root,
+appending concurrently. It asserts, over both writers' results and a third fresh service:
+
+- **Same tag:** the `streamVersion`s handed to the two writers are dense `0..n-1` with no
+  duplicate, and every append is readable from both services, in version order.
+- **Conditional append:** both race `append(request, tag, v)` for the same `v`, 20 rounds;
+  exactly one wins each round, the loser gets `VersionConflictException` and writes nothing,
+  and the entry at version `v` is the winner's.
+- **Multi-tag fan-out:** both write `(own execution tag, shared queue tag)` fenced on the own
+  tag; each own tag is dense, the queue is dense across both writers, and the fence held on
+  the named tag only.
+- **KV CAS:** `setValueIfAbsent` and `compareAndSetValue` from the same holder, 20 rounds
+  each; exactly one winner per round. `incrementValue` is the test's own barrier, and every
+  barrier counts exactly two arrivals.
+- **Global seqnums:** two `FoundationDBSequencer`s never issue the same seqnum.
+- **Metadata:** each writer's `getLatestVersion()` and `getLatestSeqnum()` include the other's
+  writes; a fresh service's `getLatestSeqnum()` is the highest seqnum committed.
+
+Three things it taught on its first run, now part of the contract:
+
+- **Version-keyed reads are returned in version order.** Under one writer that is seqnum
+  order; under two it is not, because a writer claims its seqnum from the sequencer *before*
+  its transaction and is handed its version *inside* it. A **seqnum-keyed tail cursor is
+  unsafe under `multiWriter`** — an entry with a lower seqnum can commit after the read and
+  be skipped for good — while a version-keyed one is safe, since versions are assigned in
+  commit order. Cursor on `readAfterVersion`.
+- **Push subscriptions are per process.** A subscription is fed by the appends made through
+  its own `SharedLog`; another process's appends are not pushed to it. Poll with
+  `readAfterVersion` for those.
+- **A refused conditional append has already consumed its seqnum** (on every adapter — the
+  sequencer is asked first). Seqnums are an order, not a count; only `streamVersion` is dense.
+
+#### Testing against FoundationDB
+
+The FoundationDB tests skip when no cluster is reachable, and `mvn verify` starts none.
+`scripts/fdb-tests.sh` runs them against a real one in Docker — the official image in
+host-networking mode plus a JDK image with the client library installed — with
+`GUMBO_REQUIRE_FDB=true`, under which an unreachable cluster is a failure rather than a skip:
+
+```bash
+scripts/fdb-tests.sh                                       # all FoundationDB*Test classes
+scripts/fdb-tests.sh --keep -Dtest=FoundationDBMultiWriterTest   # keep the cluster up; one class
+```
+
+Without the script, the recipe is four steps, and CI's `fdb` job in `.github/workflows/ci.yml`
+is the same four as a GitHub Actions service container — copy it as-is into a downstream
+build that needs a measured `multiWriter` log:
+
+```bash
+docker run -d --name fdb -e FDB_NETWORKING_MODE=host -p 4500:4500 foundationdb/foundationdb:7.3.43
+docker exec fdb fdbcli --exec 'configure new single memory'      # the image starts no database
+# install foundationdb-clients 7.3.43 (libfdb_c + fdbcli) on the client host, then:
+echo "docker:docker@127.0.0.1:4500" > fdb.cluster
+FDB_CLUSTER_FILE=$PWD/fdb.cluster GUMBO_REQUIRE_FDB=true mvn -Dtest='FoundationDB*Test' test
+```
 
 #### When to use FoundationDB in production
 
@@ -678,7 +753,7 @@ batches that would exceed 8 MB.
 
 #### Operational requirements
 
-- FoundationDB cluster running and reachable (default: `/etc/foundationdb/fdb.cluster`)
+- FoundationDB cluster running and reachable (default: `/etc/foundationdb/fdb.cluster`, or `FDB_CLUSTER_FILE`)
 - `libfdb_c.so` 7.x installed on every JVM host (`apt install foundationdb-clients` on Debian/Ubuntu)
 - Java binding: `org.foundationdb:fdb-java:7.3.43` (already in `pom.xml` as optional)
 
@@ -1142,12 +1217,14 @@ mvn test -Dtest=WorkflowExecutorExample
 Requires Java 21 and Maven 3.9+.
 
 ```bash
-mvn verify          # compile + test
-mvn package         # produce gumbo-0.6.0.jar
+mvn verify              # compile + test (the FoundationDB tests skip without a cluster)
+mvn package             # produce gumbo-0.6.0.jar
+scripts/fdb-tests.sh    # the FoundationDB tests against a real cluster, in Docker
 ```
 
-GitHub Actions runs `mvn verify` on every push using Java 21 (Temurin).
-Test reports are uploaded as workflow artifacts.
+GitHub Actions runs `mvn verify` on every push using Java 21 (Temurin), the mutation
+gate, and the FoundationDB suite against a service container (see *Testing against
+FoundationDB* above). Test reports are uploaded as workflow artifacts.
 
 ---
 
