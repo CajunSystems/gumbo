@@ -1,0 +1,90 @@
+name: Claude Code Review
+
+# Automatic review on every PR open/push, the same shape as Catalyst's.
+#
+# One direct prompt on one strong model, and it must end with a summary comment naming what it
+# read. Catalyst learned this the hard way: a multi-agent review plugin collapsed silently there,
+# with no run reaching the review agents and some still posting "No issues found". A review that
+# can quietly not happen and still look clean is worse than none — the same reasoning as this
+# repo's rule that a skipped FoundationDB test must not pass for a run one.
+#
+# Needs the CLAUDE_CODE_OAUTH_TOKEN repository secret (Settings → Secrets → Actions).
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# A newer push supersedes an in-flight review: without this, two overlapping runs review at once,
+# the older one reading a diff that no longer matches its checkout, and both post a verdict.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Actions are pinned to commit SHAs, as in ci.yml, and for the same reason: a tag is mutable.
+# The trailing comment is what Dependabot rewrites when it proposes a bump.
+jobs:
+  claude-review:
+    # Fork PRs get no secrets or OIDC token, so the action would fail; skip them explicitly instead.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc  # v1.0.248
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            HEAD COMMIT: ${{ github.event.pull_request.head.sha }}
+
+            Review this pull request for correctness. Do not skip the review for any reason.
+
+            1. Read CLAUDE.md at the repo root. Its "Key invariants" section is the bar: two number
+               spaces (global seqnum vs per-tag dense storage-owned streamVersion), reads that say
+               which space they key on, a fence decided by storage or not offered at all, a version
+               per tag on multi-tag entries, stored-not-derived versions, a failed append keeping its
+               position, getLatestSeqnum() as a durability boundary, capabilities that under-report
+               and are each backed by a test, loud refusal of a second writer, and ordered lossless
+               subscription delivery. docs/FAILURE_SEMANTICS.md is the per-operation failure
+               contract; a change that moves an operation between NOTHING, PREFIX and UNKNOWN
+               without updating that table is a finding.
+            2. Get the change with `gh pr view <PR>` and `gh pr diff <PR>`. Read the surrounding code
+               in the checkout for anything the diff alone does not settle — the other adapters that
+               implement the same PersistenceAdapter method, the service layer that composes them,
+               lock and transaction boundaries, what a reopen rebuilds. You are reviewing HEAD
+               COMMIT: if `gh pr view <PR> --json headRefOid` reports a different commit, a newer
+               push has landed — post a one-line comment saying this review was superseded, and stop.
+            3. Look for real defects: incorrect logic, races between writers or between a writer and a
+               reader, a path that leaves the log or the tag KV in a state a reopen or a cursor
+               mishandles, a broken CLAUDE.md invariant, a capability declared true without the
+               behaviour to back it, a per-process cache standing in for storage under multiWriter,
+               a record-layout change without a marker, missing handling for a case the change
+               itself introduces, a test that does not test what it claims (one tag in a fresh log is
+               the configuration where most defects here are invisible). Skip style nits and anything
+               you cannot ground in the code.
+            4. Before reporting a finding, confirm it by reading the code involved and state the
+               concrete scenario (inputs/state → wrong result). Drop anything you cannot confirm.
+            5. Post each confirmed finding as an inline comment on the relevant line with
+               mcp__github_inline_comment__create_inline_comment.
+            6. ALWAYS finish with exactly one summary comment via `gh pr comment <PR> --body ...`, even
+               when there are no findings. It must list the files you actually read, the number of
+               confirmed findings with a one-line summary of each, and a verdict. Say plainly that
+               you did not build or run anything.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 80
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Read,Grep,Glob"
