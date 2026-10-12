@@ -201,6 +201,36 @@ class FoundationDBMultiInstanceTest {
     }
 
     /**
+     * The batch form of the same refusal, raised in review of #41: checking only the first
+     * pending let a batch whose first seqnum was free overwrite another writer's record at a
+     * later one. The sequence that produces it — a refused conditional append consumes a
+     * seqnum, the peer's next lands beyond it — is ordinary for two {@code LocalSequencer}s
+     * on one root, which is exactly the configuration the refusal exists for.
+     */
+    @Test
+    void aBatchWhoseLaterSeqnumIsAlreadyTakenIsRefusedNotOverwritten() throws IOException {
+        PendingAppend as = pending(7, ORDERS);
+        a.append(as, PersistenceAdapter.ANY_VERSION);
+
+        PendingAppend collider = new PendingAppend(7, INVENTORY, Set.of(INVENTORY), bytes("other"), Instant.now());
+        assertThatThrownBy(() -> b.appendBatchAssigningVersions(List.of(pending(6, INVENTORY), collider)))
+                .as("seqnum 6 is free, seqnum 7 is a's")
+                .isInstanceOf(IOException.class)
+                .hasStackTraceContaining("already holds a different entry");
+
+        // A batch commits whole, so a retry of b's own batch would find both or neither;
+        // finding only one — here a's own pending, reused — is a collision as well.
+        assertThatThrownBy(() -> b.appendBatchAssigningVersions(List.of(pending(6, INVENTORY), as)))
+                .isInstanceOf(IOException.class)
+                .hasStackTraceContaining("partly present");
+
+        assertThat(seqnumsOf(a.readAll())).as("nothing written, nothing replaced").containsExactly(7L);
+        assertThat(a.readAll().get(0).tags()).containsExactly(ORDERS);
+        assertThat(versionsOf(b.readByTag(ORDERS, 0L), ORDERS)).containsExactly(0L);
+        assertThat(b.readByTag(INVENTORY, 0L)).isEmpty();
+    }
+
+    /**
      * The same retry, on the KV. A compare-and-set that landed and is run again reads the
      * value it wrote, which is not {@code expected}, and would report that it lost — for a
      * claim that is durable, in a round where then nobody is told they won. An increment run
@@ -320,6 +350,42 @@ class FoundationDBMultiInstanceTest {
 
         assertThat(a.getLatestSeqnum()).isEqualTo(3L);
         assertThat(open().getLatestSeqnum()).isEqualTo(3L);
+    }
+
+    /**
+     * The batching decorator over this adapter, on a root another process writes. Its
+     * failed-flush reconcile used to compare against {@code getLatestSeqnum()}, which here
+     * is now the log's high-water mark; a peer committing a higher seqnum between the
+     * buffering and a flush that failed outright made the decorator drop its unwritten
+     * entries as persisted. Found in review of #40. The flush failure is injected by
+     * overriding {@code appendBatch} once.
+     */
+    @Test
+    void aBatchingDecoratorOnASharedRootKeepsAFailedFlushForRetry() throws IOException {
+        class FailsOnce extends FoundationDBPersistenceAdapter {
+            boolean failNext = true;
+            FailsOnce() { super(FdbTestSupport.clusterFile(), root); }
+            @Override public void appendBatch(List<LogEntry> entries) throws IOException {
+                if (failNext) { failNext = false; throw new IOException("injected flush failure"); }
+                super.appendBatch(entries);
+            }
+        }
+        FailsOnce delegate = new FailsOnce();
+        BatchingPersistenceAdapter batching = new BatchingPersistenceAdapter(delegate, 10, 600_000);
+        batching.open();
+        try {
+            batching.append(pending(0, ORDERS).withVersion(0));
+            batching.append(pending(1, ORDERS).withVersion(1));
+            b.append(pending(2, INVENTORY), PersistenceAdapter.ANY_VERSION);   // the peer, committing higher
+            assertThat(delegate.getLatestSeqnum()).as("the log's high-water mark is the peer's").isEqualTo(2L);
+
+            assertThatThrownBy(batching::flushNow).hasMessageContaining("injected flush failure");
+            batching.flushNow();
+
+            assertThat(seqnumsOf(b.readAll())).as("nothing of the failed flush was dropped").containsExactly(0L, 1L, 2L);
+        } finally {
+            batching.close();
+        }
     }
 
     // -------------------------------------------------------------------------

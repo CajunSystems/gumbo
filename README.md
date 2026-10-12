@@ -106,7 +106,7 @@ Then add the dependency:
 <dependency>
     <groupId>com.github.CajunSystems</groupId>
     <artifactId>gumbo</artifactId>
-    <version>0.6.0</version>
+    <version>0.7.0</version>
 </dependency>
 ```
 
@@ -118,7 +118,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.CajunSystems:gumbo:0.6.0'
+    implementation 'com.github.CajunSystems:gumbo:0.7.0'
 }
 ```
 
@@ -1227,13 +1227,19 @@ Requires Java 21 and Maven 3.9+.
 
 ```bash
 mvn verify              # compile + test (the FoundationDB tests skip without a cluster)
-mvn package             # produce gumbo-0.6.0.jar
+mvn package             # produce gumbo-0.7.0.jar and gumbo-0.7.0-sources.jar
 scripts/fdb-tests.sh    # the FoundationDB tests against a real cluster, in Docker
 ```
 
 GitHub Actions runs `mvn verify` on every push using Java 21 (Temurin), the mutation
 gate, and the FoundationDB suite against a service container (see *Testing against
 FoundationDB* above). Test reports are uploaded as workflow artifacts.
+
+**Releasing.** A release is a PR that bumps the version in `pom.xml`, dates the CHANGELOG
+entry (`## [X.Y.Z] — YYYY-MM-DD`) and updates the coordinates above. When it merges, the
+`Release` workflow tags main, publishes a GitHub Release with that CHANGELOG section and the
+jars attached, and waits for JitPack to build the tag — so a merged release is a released
+one, with no step left to forget.
 
 ---
 

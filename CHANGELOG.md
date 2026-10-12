@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.7.0] — 2026-10-12
 
 Answers [#38](https://github.com/CajunSystems/gumbo/issues/38), Catalyst's list of what its
 distributed execution (Dist-0) needs from the FoundationDB adapter. The design was already in
@@ -23,6 +23,18 @@ claim, a dense queue, distinct global seqnums, and that a fresh third service re
 it. CI runs it against a real cluster in the new `fdb` job. **It is the only place
 `multiWriter` is measured rather than declared**, and the FDB tests had never run in CI
 before — `ci.yml` started no cluster, and the suite skipped them silently.
+
+**Why 0.7.0.** Nothing breaks: no public signature changed, every adapter and sequencer keeps
+compiling, and logs written by 0.6.0 read unchanged — the only new keys are idempotency
+records and a trim hint, both ignorable by an older reader. It is a minor because the FDB
+adapter's behaviour under two writers is different in ways a consumer can observe and rely
+on (version-ordered reads, read-through metadata, a fence that reports conflicts, writes
+that survive the client's retry), and because `OperationToken` is new public API. Upgrading
+from 0.6.0 requires nothing; a consumer that cursors on versions and polls with
+`readAfterVersion` already does the right thing.
+
+**Released by `release.yml`**, new in this version: merging this entry to `main` tags it,
+publishes the GitHub Release, and waits for JitPack. See *Build and CI* below.
 
 ### Fixed
 
@@ -103,6 +115,19 @@ the happy path the cost is one write and one range clear; the lookups only happe
 *caller's* retry warning on `incrementTagValue` stands on every adapter; it is the client
 library's own retry that is now safe.
 
+**The batching decorator over FDB could drop a failed flush on a shared root**
+(found in review of #41)
+
+A consequence of the read-through `getLatestSeqnum()` above: `BatchingPersistenceAdapter`
+reconciled a failed flush against it, which was exact while the value was this process's own
+high-water mark and wrong once it became the log's. A peer committing a higher seqnum
+between the buffering and a flush that failed outright made the decorator clear its
+unwritten entries as persisted, with nothing but a warning saying so. The decorator declares
+`multiWriter` off, but that under-reports its own fence; it cannot stop a plain adapter in
+another process from writing the same root. It now reads the batch's own seqnums back —
+one range scan from the batch's first seqnum, on a path that only runs after a flush has
+failed — which is the rule `FAILURE_SEMANTICS.md` gives every caller.
+
 **An empty `appendBatchAssigningVersions` would have pinned `meta/latest` at -1 forever**
 (found in review of #40)
 
@@ -130,7 +155,28 @@ own seqnums back, or reason in versions, which are a dense prefix per tag).
   package on the runner, `configure new single memory`, then the suite — and a final step
   that fails if any FDB class reports a skip. Downstream CI can copy it as-is
 - `scripts/fdb-tests.sh`: the same in Docker, locally
-- `CLAUDE.md`, and Claude Code review workflows mirroring Catalyst's
+- `CLAUDE.md`, and Claude Code review workflows mirroring Catalyst's. Reviewing this release
+  they found five real defects in the retry handling, one per round, each now pinned by a
+  test that fails with its fix reverted
+- `OperationToken`: the per-call token the FDB conditional writes and sequencer record so a
+  client retry can recognise its own landed commit
+
+### Build and CI
+
+**Releases are cut by `release.yml`.** On every push to `main` it reads the pom version; if
+that version has a dated CHANGELOG entry and no tag, it runs `mvn verify`, creates the
+lightweight tag, publishes a GitHub Release with the CHANGELOG section as notes and the jar
+and sources jar attached, then requests the JitPack build and waits for it to report `ok`
+(an `Error` fails the job — that is the unreachable-downstream state the workflow exists to
+prevent). A main whose entry is still `[Unreleased]` does nothing. Each step decides from
+its own evidence — tag exists, Release exists, JitPack ok — so a run that fails part-way is
+finished by running it again, building the tagged commit rather than whatever main has
+moved on to; review caught the first version gating everything on "no tag yet", which made
+every re-run a no-op. The lesson it encodes: a merged release is not a released one, and
+the half that publishes it should not depend on anyone remembering.
+
+- `maven-source-plugin` attaches a sources jar to every `package`, for the Release
+- The `fdb` job and the review workflows are described under *Added*
 
 ### Documentation
 

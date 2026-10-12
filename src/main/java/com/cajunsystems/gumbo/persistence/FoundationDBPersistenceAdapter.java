@@ -383,12 +383,23 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         if (pendings.isEmpty()) return List.of();
         try {
             List<LogEntry> entries = db.run(tr -> {
-                // One transaction commits the whole batch, so if the first entry is already
-                // stored this is a retry after commit_unknown_result and all of them are.
-                if (alreadyCommitted(tr, pendings.get(0)) != null) {
-                    List<LogEntry> stored = new ArrayList<>(pendings.size());
-                    for (PendingAppend p : pendings) stored.add(alreadyCommitted(tr, p));
-                    return stored;
+                // Every pending is checked, not only the first: a later seqnum can hold another
+                // writer's record while the first is empty (review of #41 had the sequence — a
+                // refused conditional append consumes a seqnum, the peer's next lands beyond
+                // it), and writeEntry would replace that record silently. One transaction
+                // commits the whole batch, so a retry after commit_unknown_result finds all of
+                // them or none; partly present is not this batch's retry but a collision.
+                List<LogEntry> stored = new ArrayList<>(pendings.size());
+                for (PendingAppend p : pendings) {
+                    LogEntry s = alreadyCommitted(tr, p);   // throws on a different record
+                    if (s != null) stored.add(s);
+                }
+                if (stored.size() == pendings.size()) return stored;
+                if (!stored.isEmpty()) {
+                    throw new IllegalStateException("seqnums of a batch are partly present ("
+                            + stored.size() + " of " + pendings.size() + "); a batch commits whole,"
+                            + " so this is not its own retry — two writers are sharing a sequencer"
+                            + " that is not distributed");
                 }
 
                 java.util.Map<LogTag, Long> next = new java.util.HashMap<>();

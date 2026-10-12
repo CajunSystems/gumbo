@@ -450,31 +450,40 @@ public class BatchingPersistenceAdapter implements PersistenceAdapter {
      * this replaced for duplicate records, which is no better in an append-only log that
      * things are folded from.
      *
-     * <p>Entries are flushed in seqnum order, so the delegate's latest seqnum names the
-     * boundary precisely: at or below it is durable, above it is not. Reconciling against
-     * that leaves the retry neither losing nor duplicating, without requiring delegates to
-     * make {@code appendBatch} all-or-nothing.
+     * <p>What is durable is decided by <strong>reading the batch's own seqnums back</strong>,
+     * not by comparing against the delegate's {@code getLatestSeqnum()}. That comparison
+     * was exact while the delegate's answer was this process's own high-water mark — entries
+     * flush in seqnum order, so at or below it was durable and above it was not. On a
+     * FoundationDB root that another process also writes, the answer is the log's: any
+     * writer raises it, and a flush that failed outright after a peer committed a higher
+     * seqnum would have had every one of its unwritten entries cleared from the buffer as
+     * though they had landed, with nothing reporting the loss but a warning saying they were
+     * persisted. Caught in review of #40. Seqnums are unique per append, so presence in a
+     * read-back is proof, and the read is one range scan from the batch's first seqnum, on
+     * a path that only runs after a flush has already failed.
      *
      * <p>If the delegate cannot say, nothing is dropped: a duplicate is recoverable by
      * inspection, whereas a discarded entry is not.
      */
     private void dropWhatTheDelegateKept(List<LogEntry> batch) {
-        long persistedThrough;
+        java.util.Set<Long> durable = new java.util.HashSet<>();
         try {
-            persistedThrough = delegate.getLatestSeqnum();
-        } catch (RuntimeException probeFailed) {
+            for (LogEntry stored : delegate.readFrom(batch.get(0).seqnum())) {
+                durable.add(stored.seqnum());
+            }
+        } catch (IOException | RuntimeException probeFailed) {
             logger.warn("Could not determine what the delegate persisted after a failed flush;"
                     + " keeping all {} entries for retry", batch.size(), probeFailed);
             return;
         }
         int persisted = 0;
-        while (persisted < batch.size() && batch.get(persisted).seqnum() <= persistedThrough) {
-            persisted++;
+        for (LogEntry e : batch) {
+            if (durable.contains(e.seqnum())) persisted++;
         }
         if (persisted > 0) {
             logger.warn("Flush failed after the delegate persisted {} of {} entries;"
                     + " retrying only the remainder", persisted, batch.size());
-            pendingBatch.subList(0, persisted).clear();
+            pendingBatch.removeIf(e -> durable.contains(e.seqnum()));
         }
     }
 

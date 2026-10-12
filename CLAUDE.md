@@ -26,10 +26,16 @@ a skip (`FdbTestSupport`). `scripts/fdb-tests.sh` does the same locally in Docke
 run that skipped them proves nothing about FDB** — check the surefire report says
 `Skipped: 0` before believing it.
 
-**Release = pom version + CHANGELOG date + README coordinates, then push the tag.** JitPack
-builds from tags, under the groupId `com.github.CajunSystems` (not the `com.cajunsystems` this
-pom declares). 0.4.0 sat merged and untagged for four weeks, unreachable from every downstream
-build; a merged release is not a released one.
+**Release = a PR that bumps the pom version, dates the CHANGELOG entry
+(`## [X.Y.Z] — YYYY-MM-DD`) and updates the README coordinates.** When it merges,
+`.github/workflows/release.yml` tags main (lightweight, the convention), publishes a GitHub
+Release with that CHANGELOG section and the jars, and waits for JitPack to build the tag.
+JitPack builds from tags, under the groupId `com.github.CajunSystems` (not the
+`com.cajunsystems` this pom declares). The workflow exists because 0.4.0 sat merged and
+untagged for four weeks, unreachable from every downstream build; a merged release is not a
+released one. Check the Release run went green before telling a downstream to bump — and
+never push a tag by hand for a version whose CHANGELOG entry is still `[Unreleased]`.
+`main` is a locked branch: merges need the admin bypass.
 
 ## Architecture (where things live)
 

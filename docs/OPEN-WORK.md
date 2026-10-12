@@ -473,9 +473,10 @@ could go backwards.
 
 ## Suggested order
 
-0. **Tag the release carrying #38** — Catalyst's Dist track is waiting on the measured
-   `multiWriter` and on the two fixes, and "a merged release is not a released one" has
-   cost four weeks once already
+0. ~~**Tag the release carrying #38**~~ — 0.7.0 carries it, and `release.yml` now does the
+   tagging: merging a dated CHANGELOG entry to `main` tags, publishes and waits for JitPack,
+   so "a merged release is not a released one" stops being a step anyone can forget. What
+   remains is Catalyst's side: bump its pin once the Release run is green
 1. ~~**Tag 0.5.0**~~ — tagged (`0.5.0` → `8230289`) and adopted. **Tag 0.6.0** next: it is cut
    here and carries the multi-tag version fix, which is what a consumer is waiting on —
    Catalyst's claimable-work design cannot cursor a queue tag until it is published, and
