@@ -1,0 +1,132 @@
+name: Release
+
+# Cutting a release is merging plus tagging, and the second half is the half that publishes
+# it: JitPack builds from tags, so a release that is merged and not tagged is unreachable from
+# every downstream build. 0.4.0 sat that way for four weeks. This workflow does the second
+# half the moment the first lands.
+#
+# How a release happens: a PR bumps pom.xml, dates the CHANGELOG entry (`## [X.Y.Z] — date`)
+# and updates the README coordinates. When that merges, this runs on main, sees a pom version
+# with a dated CHANGELOG entry and no tag, and: builds it with the same `mvn verify` CI runs,
+# creates the lightweight tag (the convention since 0.2.0), publishes a GitHub Release whose
+# notes are that CHANGELOG section with the jar and sources jar attached, then asks JitPack to
+# build the tag and waits until it reports ok. A main that is not a release — pom version
+# already tagged, or CHANGELOG entry still `[Unreleased]` — does nothing.
+#
+# The FoundationDB tests skip in this build (no cluster here); they ran for real against the
+# PR in ci.yml's fdb job, which is where multiWriter is measured. This build is the artefact,
+# not the gate.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # re-run by hand if JitPack was slow, or to publish a tag made by hand
+
+# Two releases cannot overlap, and a second push to main while one is publishing waits.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push the tag, create the Release
+
+# Actions are pinned to commit SHAs, as in ci.yml. The trailing comment is for Dependabot.
+jobs:
+  release:
+    name: Tag, publish, and confirm JitPack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0   # tags
+
+      - name: Decide whether main carries an unreleased version
+        id: decide
+        run: |
+          set -euo pipefail
+          # The project's own <version> is the first one at four-space indent; dependency
+          # versions sit deeper. Checked against the X.Y.Z shape so a parse slip cannot tag junk.
+          VERSION="$(grep -m1 '^    <version>' pom.xml | sed -E 's#.*<version>(.*)</version>.*#\1#')"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "pom.xml version '$VERSION' is not X.Y.Z; refusing to release"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null; then
+            echo "Tag $VERSION already exists; nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! grep -qE "^## \[$VERSION\] — [0-9]{4}-[0-9]{2}-[0-9]{2}" CHANGELOG.md; then
+            echo "CHANGELOG.md has no dated entry for $VERSION; not a release yet."
+            echo "release=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "Releasing $VERSION."
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21
+        if: steps.decide.outputs.release == 'true'
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: maven
+
+      - name: Build and test
+        if: steps.decide.outputs.release == 'true'
+        run: mvn --batch-mode --no-transfer-progress verify
+
+      - name: Extract the release notes from the CHANGELOG
+        if: steps.decide.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The section from this version's heading up to the next version heading.
+          awk -v v="$VERSION" '
+            /^## \[/ { if (on) exit; if (index($0, "## [" v "]") == 1) { on = 1; next } }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "Empty release notes for $VERSION"; exit 1
+          fi
+          echo "--- notes ---"; head -20 "$RUNNER_TEMP/notes.md"
+
+      - name: Tag and publish the GitHub Release
+        if: steps.decide.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag "$VERSION"
+          git push origin "refs/tags/$VERSION"
+          gh release create "$VERSION" \
+            --title "gumbo $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --verify-tag \
+            "target/gumbo-$VERSION.jar" "target/gumbo-$VERSION-sources.jar"
+
+      # JitPack builds on first request. Requesting the pom starts the build; the builds API
+      # then reports ok or Error. An Error means the tag is unreachable downstream — exactly
+      # the state this workflow exists to prevent — so it fails the job. A build still running
+      # after the wait is reported, not failed: the Release is published either way, and
+      # workflow_dispatch re-runs this check without re-tagging.
+      - name: Ask JitPack to build the tag, and wait for it
+        if: steps.decide.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          set -uo pipefail
+          GROUP="com.github.CajunSystems"
+          curl -sS -o /dev/null -w "pom request: HTTP %{http_code}\n" \
+            "https://jitpack.io/com/github/CajunSystems/gumbo/$VERSION/gumbo-$VERSION.pom" || true
+          for _ in $(seq 1 30); do
+            STATUS="$(curl -sS "https://jitpack.io/api/builds/$GROUP/gumbo/$VERSION" | sed -nE 's/.*"status" *: *"([^"]+)".*/\1/p')"
+            echo "JitPack $VERSION: ${STATUS:-no status yet}"
+            case "$STATUS" in
+              ok) echo "JitPack has built $GROUP:gumbo:$VERSION."; exit 0 ;;
+              Error|error) echo "JitPack failed to build $VERSION — see https://jitpack.io/#CajunSystems/gumbo/$VERSION"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "::warning::JitPack has not finished building $VERSION after 15 minutes; check https://jitpack.io/#CajunSystems/gumbo/$VERSION, then re-run this workflow to confirm."
