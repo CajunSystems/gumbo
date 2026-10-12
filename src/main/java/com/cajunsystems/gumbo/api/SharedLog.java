@@ -160,7 +160,9 @@ public interface SharedLog extends AutoCloseable {
      * <p>Use this whenever the position came from a previous entry of this tag:
      * a checkpoint, a stored cursor, a resume point. A seqnum-keyed read is only
      * equivalent while the log holds a single tag, and silently returns entries
-     * already consumed once it holds more than one.
+     * already consumed once it holds more than one. Entries are returned in version
+     * order, which under {@code multiWriter} is not always seqnum order — see
+     * {@link com.cajunsystems.gumbo.persistence.PersistenceAdapter#readFromVersion}.
      */
     CompletableFuture<List<LogEntry>> readFromVersion(LogTag tag, long fromVersion);
 
@@ -183,6 +185,11 @@ public interface SharedLog extends AutoCloseable {
      *
      * <p>Listeners may perform blocking operations safely because each invocation
      * runs on its own virtual thread.
+     *
+     * <p>Delivery is this process's: after the backlog read, a subscription is fed by the
+     * appends that go through <em>this</em> {@code SharedLog}. On a {@code multiWriter} log,
+     * entries committed by another process are not pushed to it; a consumer that needs
+     * them polls with {@link #readAfterVersion} instead.
      *
      * @return a {@link Subscription} that the caller must close to unregister
      */

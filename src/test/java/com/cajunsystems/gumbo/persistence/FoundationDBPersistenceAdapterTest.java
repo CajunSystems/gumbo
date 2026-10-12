@@ -14,7 +14,6 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Integration tests for {@link FoundationDBPersistenceAdapter}.
@@ -24,7 +23,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * the value of the {@code FDB_CLUSTER_FILE} environment variable).
  *
  * <p>If no FDB cluster is available the tests are <em>skipped</em> rather than
- * failed, so CI pipelines without FDB still pass.
+ * failed, so a build without FDB still passes — except under {@code GUMBO_REQUIRE_FDB=true},
+ * which CI's {@code fdb} job sets so that a missing cluster cannot pass for a green run.
+ * See {@link FdbTestSupport}.
  *
  * <p>Each test class run uses a unique subspace root derived from a random UUID
  * so tests are isolated and leave no lasting state if run in parallel.
@@ -44,22 +45,14 @@ class FoundationDBPersistenceAdapterTest {
 
     @BeforeAll
     static void checkFdbAvailability() {
-        testRoot = "gumbo-test-" + UUID.randomUUID();
-        try {
-            FoundationDBPersistenceAdapter probe =
-                    new FoundationDBPersistenceAdapter(fdbClusterFile(), testRoot + "-probe");
-            probe.open();
-            probe.close();
-            fdbAvailable = true;
-        } catch (Throwable e) {
-            // FDB not available (missing libfdb_c.so, no cluster file, etc.); all tests will be skipped
-            fdbAvailable = false;
-        }
+        testRoot = FdbTestSupport.freshRoot("gumbo-test");
+        // Skips without a cluster, unless GUMBO_REQUIRE_FDB says a skip is a failure (CI).
+        fdbAvailable = FdbTestSupport.probe("gumbo-test");
     }
 
     @BeforeEach
     void setUp() throws IOException {
-        assumeTrue(fdbAvailable, "FoundationDB cluster not available — skipping test");
+        FdbTestSupport.assumeAvailable(fdbAvailable);
         // Fresh subspace per test method
         adapter = new FoundationDBPersistenceAdapter(fdbClusterFile(),
                 testRoot + "-" + UUID.randomUUID());
@@ -330,8 +323,7 @@ class FoundationDBPersistenceAdapterTest {
         return new LogEntry(seqnum, streamVersion, Set.of(tag), data.getBytes(), Instant.now());
     }
 
-    /** Returns the cluster file path from the env variable, or null for the FDB default. */
     private static String fdbClusterFile() {
-        return System.getenv("FDB_CLUSTER_FILE"); // null → fdb.open() uses default
+        return FdbTestSupport.clusterFile();
     }
 }

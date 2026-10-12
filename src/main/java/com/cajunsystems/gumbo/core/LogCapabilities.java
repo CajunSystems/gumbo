@@ -40,12 +40,14 @@ package com.cajunsystems.gumbo.core;
  *                             only on the log's global {@code seqnum}
  * @param pushSubscriptions    new entries are delivered to subscribers rather than polled
  *                             for. Answered by the service, which implements delivery above
- *                             storage; an adapter never sets it
+ *                             storage; an adapter never sets it. Delivery covers the appends
+ *                             made through that service: under {@code multiWriter}, another
+ *                             process's appends are not pushed to this one's subscribers
  * @param atomicMultiTagAppend one append can carry an entry into several tags with no
- *                             window in which some see it and others do not. Note the
- *                             entry still carries a single {@code streamVersion}, from its
- *                             primary tag, so a secondary tag's numbering is not its own —
- *                             see {@code readFromVersion}
+ *                             window in which some see it and others do not. Since 0.6.0
+ *                             every tag the entry carries gets its own position, so a
+ *                             fan-out tag can be cursored with {@code readFromVersion} like
+ *                             any other
  * @param multiWriter          several processes may write one log concurrently and have both
  *                             their per-tag versions and the global {@code seqnum} assigned
  *                             consistently. When {@code false} the log is single-writer, and a
