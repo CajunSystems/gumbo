@@ -5,6 +5,155 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+Answers [#38](https://github.com/CajunSystems/gumbo/issues/38), Catalyst's list of what its
+distributed execution (Dist-0) needs from the FoundationDB adapter. The design was already in
+place — a transactional fence, a distributed sequencer, a composed `multiWriter` flag — and
+what was missing was evidence that it holds with more than one writer. So the headline here
+is a test, and the fixes are what the test found.
+
+**`FoundationDBMultiWriterTest` runs two JVMs on one log.** Each has its own `SharedLogService`,
+`FoundationDBPersistenceAdapter` and `FoundationDBSequencer` on one cluster and root, and the
+two race through the same script: 150 appends each to one tag, 20 rounds of conditional
+append at the same expected version, 100 fan-out appends each into (own tag, shared queue)
+fenced on the own tag, 20 rounds of racing `setValueIfAbsent` and `compareAndSetValue`. It
+asserts dense versions across both writers, exactly one winner per fenced round and per
+claim, a dense queue, distinct global seqnums, and that a fresh third service reads all of
+it. CI runs it against a real cluster in the new `fdb` job. **It is the only place
+`multiWriter` is measured rather than declared**, and the FDB tests had never run in CI
+before — `ci.yml` started no cluster, and the suite skipped them silently.
+
+### Fixed
+
+**A fenced-out writer on FoundationDB got `IOException`, not `VersionConflictException`**
+
+`db.run` hands a non-retryable exception from the transaction back wrapped in a
+`CompletionException`, and the adapter caught its conflict signal at the top of the chain. So
+every rejected conditional append on FDB surfaced as a generic write failure. The contract
+and the tests on the other adapters were right; nothing had exercised the conflict path on a
+real cluster. The signal is now found by walking the cause chain.
+
+**`meta/latest` could move backwards under two writers**
+
+Written as `max(localLatest, seqnum)` from a per-process high-water mark. Writer B claims
+seqnum 9, writer A claims and commits 10, B commits — and the stored value goes from 10 to 9,
+so a fresh process opens with its durability boundary below an entry that is durable. Read
+off the code in #38 and reproduced deterministically in `FoundationDBMultiInstanceTest` on
+all three write paths. Now an atomic `BYTE_MAX` mutation inside the write transaction: no
+read, so no new conflict range, and a lexicographic compare of 8-byte big-endian
+non-negative longs is numeric order, so the encoding stands.
+
+**Three metadata reads answered from per-process caches**
+
+`getLatestSeqnum()`, `getNextStreamVersion(tag)` and `getLatestSeqnumForTag(tag)` returned
+values loaded at open and advanced only by this process's writes — correct for one writer,
+stale for two, and they back `LogView.getLatestVersion()`, which Catalyst reads on a cold
+start. Each is now one point read. The caches are gone rather than documented as hints: a
+cache that must not be trusted under the one capability this adapter exists to provide is
+not worth having.
+
+**Version-keyed reads under two writers were not in version order**
+
+Measured on the first run of the two-JVM test. A writer claims its seqnum before its
+transaction and is handed its version inside it, so writer A can hold version 6 at seqnum
+10 behind writer B's version 5 at seqnum 11. The index scan is in seqnum order, so
+`readFromVersion` returned `6, 5`, and a consumer advancing its cursor to the last entry's
+version would be handed 6 twice. The FDB adapter now sorts by the tag's version, and the
+interface states the contract: version-keyed reads come back in version order. The same
+divergence makes a **seqnum-keyed tail cursor unsafe under `multiWriter`** — a lower seqnum
+can commit after the read and be skipped for good — which is documented on `readAfter`
+rather than changed; versions are assigned in commit order and are the cursor to use.
+
+**`trim` compared against a per-process hint**
+
+A stale instance could write a lower trim point over another process's higher one. The
+comparison now happens against the stored value inside the transaction.
+
+**A retried FDB write could report "nothing written" for a durable entry, or write it twice**
+(found in review of #40)
+
+`db.run` retries on `commit_unknown_result` with the entry possibly already committed. Run
+again, the conditional append failed its own fence — and with the conflict now surfacing
+properly, that was a `VersionConflictException`, which this document defines as nothing
+written, for an entry that was durable. The unconditional form wrote the same seqnum again
+one version up and left a hole. Both version-assigning paths now begin by looking for their
+own record at the pending's seqnum (unique per append) and return it if present. A
+*different* record at that seqnum means two writers share a sequencer that is not
+distributed; that used to overwrite silently and is now refused.
+
+**The FDB KV conditional writes and the FDB sequencer were not idempotent either**
+(found in review of #40)
+
+Same retry, other transactions. A landed compare-and-set run again read the value it had
+written, found it was not the expected one, and told its caller it lost — "nothing written"
+for a durable claim, and a round in which nobody is told they hold the lease. A landed
+increment applied its delta twice, with no exception anywhere. A landed sequencer claim
+claimed again and left a gap. Each now records an `OperationToken` and the result in the
+same transaction — `{root}/"kvop"/…/readVersion/token` for the KV,
+`{root}/"claim"/readVersion/token` for the sequencer — and a retry looks up its own earlier
+attempts (it knows their read versions; they ran in the same call) and returns the recorded
+answer. One record per attempt, not one slot per key: review caught that a slot is
+overwritten by whoever writes the key next, so a writer slipping in between a lost reply and
+the retry would make the retry apply again. Records older than an hour of versions are
+range-cleared by the next write, so nothing is scanned and nothing accumulates — and by
+nothing else: a `deleteTagValue` leaves them, since a delete landing between a lost reply
+and the retry would otherwise take the retry's evidence with it (also caught in review). On
+the happy path the cost is one write and one range clear; the lookups only happen on a retry. The
+*caller's* retry warning on `incrementTagValue` stands on every adapter; it is the client
+library's own retry that is now safe.
+
+**An empty `appendBatchAssigningVersions` would have pinned `meta/latest` at -1 forever**
+(found in review of #40)
+
+-1 encodes as eight `0xFF` bytes, which `BYTE_MAX` ranks above every real seqnum. The
+service never sends an empty batch; the adapter is public API and now returns early.
+
+**`getLatestSeqnum()` under `multiWriter` is a high-water mark, not a durable prefix**
+(found in review of #40; documentation)
+
+A seqnum is claimed before its transaction, so another writer's lower seqnum may still be in
+flight or may never land. The "at or below is durable" rule holds under one writer and not
+on a shared root; `FAILURE_SEMANTICS.md` now says so and gives the reconcile rule (read your
+own seqnums back, or reason in versions, which are a dense prefix per tag).
+
+### Added
+
+- `FoundationDBMultiWriterTest` + `MultiWriterPeer` (the two-process race, above), and
+  `FoundationDBMultiInstanceTest` (two adapters on one root in one JVM, interleaved by hand:
+  read-through metadata, the `meta/latest` raise, the cross-instance fence and KV claim, a
+  fan-out tag across instances, and that D2 does not apply)
+- `FdbTestSupport` and **`GUMBO_REQUIRE_FDB=true`**, under which an unreachable cluster fails
+  the FDB tests instead of skipping them. CI sets it; a build that quietly skipped every FDB
+  test read exactly like one that ran them
+- CI job `fdb`: the official image as a service container in host-networking mode, the client
+  package on the runner, `configure new single memory`, then the suite — and a final step
+  that fails if any FDB class reports a skip. Downstream CI can copy it as-is
+- `scripts/fdb-tests.sh`: the same in Docker, locally
+- `CLAUDE.md`, and Claude Code review workflows mirroring Catalyst's
+
+### Documentation
+
+- **D2's status for FDB:** does not apply. The index is the `tag` subspace, written in the
+  entry's transaction; there is no per-process view to clobber. Stated in the README and
+  asserted by `FoundationDBMultiInstanceTest.aFreshInstanceSeesEveryEntryBothInstancesAppended`
+- **Push subscriptions are per process.** A subscription is fed by appends made through its
+  own `SharedLog`; under `multiWriter`, another process's appends are not pushed to it.
+  Stated on `subscribe` and on `LogCapabilities.pushSubscriptions`
+- **A refused conditional append has already consumed its seqnum**, on every adapter, since
+  the sequencer is asked first. Seqnums are an order, not a count
+- The README's production example passed the adapter as the sequencer (`.sequencer(store)`);
+  it now passes the sequencer. `LogCapabilities.atomicMultiTagAppend` still said an entry
+  carries one version; it has carried one per tag since 0.6.0
+
+### Not done, deliberately
+
+- **An in-process `multiWriter` configuration** (#38's option b) — several services over one
+  shared in-memory store. It would need a new adapter whose claim to `multiWriter` is as
+  honest as FDB's, and the service container is the more honest test; the issue accepted
+  either
+- `appendAtomically(...)` (A6's convenience) — still blocks nothing
+
 ## [0.6.0] — 2026-08-28
 
 Closes the last item on the [Catalyst requirements report](https://github.com/CajunSystems/catalyst/blob/main/docs/gumbo-requirements.md)'s

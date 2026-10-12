@@ -197,7 +197,17 @@ public interface PersistenceAdapter extends AutoCloseable {
 
     /**
      * Returns entries visible to {@code tag} with {@code streamVersion >= fromVersion}, in
-     * seqnum order — the tag's <em>own</em> stream position, not the global seqnum.
+     * <strong>ascending version order</strong> — the tag's <em>own</em> stream position, not
+     * the global seqnum.
+     *
+     * <p>Version order and seqnum order are the same order under a single writer, and are
+     * not under several: a writer claims its seqnum before its write and is handed its
+     * version by the write, so two writers' entries can commit in the opposite order to the
+     * one their seqnums suggest. A version-keyed read is ordered by version so that "the
+     * version of the last entry returned" is always a correct cursor. Seqnum-keyed reads
+     * ({@link #readByTag}) stay in seqnum order, and under {@code multiWriter} a seqnum-keyed
+     * tail cursor can <em>skip</em> an entry whose seqnum was claimed earlier but committed
+     * later; a version-keyed cursor cannot, because versions are assigned in commit order.
      *
      * <p>This is the read a per-stream cursor needs. {@link #readByTag} takes a global
      * {@code seqnum}, and the two number spaces coincide only when the log holds a

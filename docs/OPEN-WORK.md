@@ -30,7 +30,12 @@ be a record marker rather than a migration.
 
 The multi-tag version defect is **fixed** and awaiting release — see §3 and the CHANGELOG.
 
-Report items now outstanding: **A6** (half) and **D2**.
+**Multi-writer on FoundationDB is measured** (#38, Catalyst's Dist-0 list): two JVMs on one
+log, in CI against a real cluster. The first run found two defects the single-writer tests
+could not — see §6 and the CHANGELOG's `[Unreleased]`.
+
+Report items now outstanding: **A6** (half) and **D2** — the latter now only for the file
+adapter, since §6 settles it for FDB.
 
 See [`FAILURE_SEMANTICS.md`](FAILURE_SEMANTICS.md) for the write-path contracts, which
 several items below depend on.
@@ -165,6 +170,12 @@ present — nothing lost, the *view* was.
 Less urgent than it was: D3's directory lock now makes a second writer fail loudly rather
 than silently corrupt. So this is required for multi-writer to become *usable*, not to stop
 it being *dangerous*.
+
+**File adapter only.** For FoundationDB, D2 does not apply and is now asserted rather than
+argued: the index is the `tag` subspace, written in the same transaction as the entry, so
+there is no per-process view for a second writer to overwrite.
+`FoundationDBMultiInstanceTest.aFreshInstanceSeesEveryEntryBothInstancesAppended` has two
+instances interleave six appends, close both, and a third read all six, dense.
 
 **Do the fault-injection harness (§4) first** — D2 is squarely a partial-write problem and
 would be its first real customer.
@@ -413,8 +424,58 @@ Untouched, and all still true.
 
 ---
 
+## 6. Multi-writer on FoundationDB — measured (#38)
+
+Catalyst's distributed execution needs a `multiWriter` log and, having shipped D4 by
+assuming a property nothing had tested, will not trust the flag until it comes from a
+measured configuration. Fair: the FDB adapter's tests were single-instance and skipped in
+CI, and `FoundationDBSequencer` only ever appeared behind a stand-in.
+
+Now `FoundationDBMultiWriterTest` runs two JVMs — each its own service, adapter and
+sequencer — on one root, racing through `MultiWriterPeer`'s script, and CI's `fdb` job runs
+it against the official image as a service container with `GUMBO_REQUIRE_FDB=true` so a
+skip is a failure. `scripts/fdb-tests.sh` is the same in Docker, locally. The five
+properties #38 listed all hold; the CHANGELOG has the list.
+
+**What the first run found**, which is the argument for measuring:
+
+- The conflict signal on FDB was caught at the top of an exception chain that `db.run`
+  wraps, so a fenced-out writer got `IOException`. Every adapter test for the fence ran on
+  the file and in-memory adapters; the FDB path had never been driven to a conflict.
+- Version-keyed reads were in seqnum order, and under two writers that is not version
+  order — the seqnum is claimed before the transaction, the version inside it. A cursor
+  on "the last entry's version" would redeliver. Now sorted, and the contract is stated.
+
+Plus the two read off the code in #38 and reproduced deterministically before fixing:
+the per-process metadata caches, and `meta/latest` written as `max(local, seqnum)`, which
+could go backwards.
+
+**Still open, and now known rather than assumed:**
+
+- **Seqnum-keyed tail reads are unsafe under `multiWriter`** — a lower seqnum can commit
+  after the read and be skipped. Documented on `readAfter`; version-keyed cursors are the
+  answer, and nothing in the API prevents a caller using the wrong one. A `multiWriter` log
+  could refuse `readAfter`, or the service could warn. Decide when a consumer needs it.
+- **Push subscriptions are per process.** Cross-process delivery would mean either FDB
+  watches on the tag's `taglatest` key or a poll loop in the service. Nobody needs it yet;
+  Catalyst's claim loop polls with `readAfterVersion`.
+- **#38's option (b)** — an in-process `multiWriter` configuration (several services over
+  one shared store with storage-assigned seqnums) — is not offered. It would need a new
+  adapter whose claim is as honest as FDB's, and the service container is the more honest
+  test. The issue accepted either.
+- **A refused conditional append consumes its seqnum** on every adapter, since the sequencer
+  is asked first. Harmless (seqnums are an order, not a count) and now documented; handing
+  the seqnum back is the same trade as handing a version back, which §3 and the 0.6.0
+  CHANGELOG already decided against.
+- **Read amplification** (§3) is unchanged, and `raiseLatest` deliberately did not add to it:
+  `BYTE_MAX` is a mutation, not a read, so `meta/latest` adds no conflict range. The per-tag
+  `taglatest` raise still reads; it could be the same mutation.
+
 ## Suggested order
 
+0. **Tag the release carrying #38** — Catalyst's Dist track is waiting on the measured
+   `multiWriter` and on the two fixes, and "a merged release is not a released one" has
+   cost four weeks once already
 1. ~~**Tag 0.5.0**~~ — tagged (`0.5.0` → `8230289`) and adopted. **Tag 0.6.0** next: it is cut
    here and carries the multi-tag version fix, which is what a consumer is waiting on —
    Catalyst's claimable-work design cannot cursor a queue tag until it is published, and

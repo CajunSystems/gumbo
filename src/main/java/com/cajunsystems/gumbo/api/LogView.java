@@ -59,6 +59,11 @@ public interface LogView {
      * {@link #readAfterVersion} instead. The two agree only while the log holds a single
      * tag; with more than one tag this method silently returns entries you have already
      * seen, because the other tags' entries push this tag's seqnums past the cursor.
+     *
+     * <p>On a {@code multiWriter} log a seqnum-keyed tail cursor is unsafe in the other
+     * direction too: another process can claim a lower seqnum and commit it <em>after</em>
+     * this read, so advancing past the highest seqnum seen skips that entry for good.
+     * Versions are assigned in commit order, so a version-keyed cursor has neither problem.
      */
     default CompletableFuture<List<LogEntry>> readAfter(long afterSeqnum) {
         return readFrom(new LogPosition(afterSeqnum + 1), Integer.MAX_VALUE);
@@ -72,7 +77,9 @@ public interface LogView {
      * <p>This is the read for a per-stream cursor. A view's entries are numbered
      * {@code 0, 1, 2, …} within its own tag no matter how many other tags share the
      * physical log, so a version survives the log gaining new writers; a seqnum does
-     * not.
+     * not. Entries come back in <strong>version order</strong>, which is seqnum order under
+     * one writer and is the order that matters under several — see
+     * {@link com.cajunsystems.gumbo.persistence.PersistenceAdapter#readFromVersion}.
      *
      * <pre>{@code
      * long cursor = Long.parseLong(new String(view.getValue("cursor").join()));

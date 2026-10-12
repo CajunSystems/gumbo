@@ -132,10 +132,16 @@ append(entry)
 ```
 {root} / "log"  / seqnum (long)                  → entry value bytes
 {root} / "tag"  / namespace / key / seqnum        → streamVersion (8 bytes)
-{root} / "meta" / "latest"                        → latestSeqnum
+{root} / "meta" / "latest"                        → latestSeqnum (raised by atomic BYTE_MAX)
 {root} / "meta" / "trim"                          → trimSeqnum
 {root} / "meta" / "tagcount" / namespace / key    → versionCount
+{root} / "meta" / "taglatest" / namespace / key   → latest seqnum in the tag
+{root} / "kv"   / namespace / key / kvKey         → tag KV value
+{root} / "kvop" / namespace / key / kvKey / readVersion / token → result of that conditional write
 ```
+
+Nothing above is cached per process: every metadata getter is a point read, so a second
+writer's commits are visible to the first. See the README's *Multi-writer: what is measured*.
 
 FDB's tuple-layer encoding preserves the natural ordering of `seqnum` keys, so
 `readFrom(n)` is a single range scan with no separate index file.  `readByTag`

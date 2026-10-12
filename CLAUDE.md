@@ -15,11 +15,14 @@ reasoning behind most of what is below.
 mvn verify                                   # build + full suite (no FoundationDB needed)
 mvn -Dtest=ConditionalAppendTest test        # one class
 mvn test-compile org.pitest:pitest-maven:mutationCoverage   # mutation gate (persistence + service)
+scripts/fdb-tests.sh                         # the FoundationDB suite against a real cluster, in Docker
 ```
 
-**FoundationDB tests skip without a cluster.** `FoundationDBPersistenceAdapterTest` probes for
-one in `@BeforeAll` (default cluster file, or `FDB_CLUSTER_FILE`) and skips when it is
-unreachable, so a plain `mvn verify` never runs it, and `ci.yml` starts no cluster. **A green
+**FoundationDB tests skip without a cluster.** The `FoundationDB*Test` classes probe for one
+in `@BeforeAll` (default cluster file, or `FDB_CLUSTER_FILE`) and skip when it is unreachable,
+so a plain `mvn verify` never runs them. CI's `fdb` job runs them for real against a service
+container with `GUMBO_REQUIRE_FDB=true`, under which an unreachable cluster is a failure, not
+a skip (`FdbTestSupport`). `scripts/fdb-tests.sh` does the same locally in Docker. **A green
 run that skipped them proves nothing about FDB** — check the surefire report says
 `Skipped: 0` before believing it.
 
@@ -87,7 +90,10 @@ planning directory from the 0.2.0 era and is not maintained.
   silent. The reasoning is on `claimVersions` and in the 0.6.0 CHANGELOG entry.
 - **`getLatestSeqnum()` is a durability boundary**, not a visibility one: at or below it is
   durable. Never advance it for a write that has not been made durable. The tag KV follows
-  the same rule (`kv.dat` is synced before the in-memory value is published).
+  the same rule (`kv.dat` is synced before the in-memory value is published). **Under
+  `multiWriter` it is a high-water mark of committed seqnums, not a durable prefix** — another
+  writer's lower seqnum may still be in flight — so a `PREFIX` reconcile there reads its own
+  seqnums back, or reasons in versions, which are always a dense prefix per tag.
 - **Capabilities under-report, and every `true` is backed by a test.** `LogCapabilities` is
   answered per adapter; `SharedLogService` composes it — adding `pushSubscriptions` (delivery
   is the service's) and narrowing `multiWriter` to `storage.multiWriter() &&
@@ -101,7 +107,29 @@ planning directory from the 0.2.0 era and is not maintained.
 - **Subscriptions never lose or reorder.** Entries are enqueued under the write lock, drained
   by one virtual thread per subscription, and a listener is never called concurrently with
   itself. `close()` waits for an in-flight listener, escalating to an interrupt, and gives up
-  after 5 s rather than hang the log.
+  after 5 s rather than hang the log. Delivery is **per process**: on a `multiWriter` log,
+  another process's appends are not pushed to this one's subscribers.
+- **Version-keyed reads come back in version order.** Under one writer that is seqnum order;
+  under two it is not, because a writer claims its seqnum before its transaction and gets its
+  version inside it. A seqnum-keyed tail cursor can skip an entry under `multiWriter`; a
+  version-keyed one cannot, since versions are assigned in commit order.
+- **The FoundationDB adapter caches nothing per process.** `getLatestSeqnum()`,
+  `getNextStreamVersion(tag)` and `getLatestSeqnumForTag(tag)` are point reads;
+  `meta/latest` is raised with an atomic `BYTE_MAX` inside the write transaction. A local
+  high-water mark was wrong under two writers and could move the stored value backwards.
+- **A refused conditional append has already consumed its seqnum.** The sequencer is asked
+  before the adapter is. Seqnums are an order, not a count; only `streamVersion` is dense.
+- **Every FDB read-modify-write must be idempotent.** `db.run` retries on
+  `commit_unknown_result` with the commit possibly already applied; run twice, a
+  version-assigning append fails its own fence or writes a second record one version up, a
+  compare-and-set tells its winner it lost, an increment applies twice, the sequencer skips a
+  number. Appends check for their own record at the pending's seqnum (`alreadyCommitted`); a
+  different record there is a sequencer collision and is refused, never overwritten. The KV
+  conditional writes and `FoundationDBSequencer.claim` record an `OperationToken` and the
+  result under `readVersion/token` in the same transaction — one record per attempt, never a
+  slot per key, since another writer in between would overwrite a slot — and a retry looks
+  up its earlier attempts. A new FDB transaction that reads then writes gets the same
+  treatment.
 
 ## Tests (keep green if you touch the engine)
 
@@ -114,9 +142,14 @@ planning directory from the 0.2.0 era and is not maintained.
 - `RecordFormatCompatibilityTest` — pre-0.6.0 records still read. `FailedWriteKeepsItsPositionTest`
   — the premise behind keeping a failed append's position. `RecoveryAndTrimTest`,
   `FileBasedPersistenceAdapterLockTest`, the `Batching*` tests, `SubscriptionDeliveryTest`.
-- **FoundationDB** (needs a cluster; see above): `FoundationDBPersistenceAdapterTest` is a
-  single adapter on a single cluster. `multiWriter` is declared by the FDB adapter and
-  composed by the service, but nothing yet measures it with two writers.
+- **FoundationDB** (needs a cluster; see above): `FoundationDBPersistenceAdapterTest` (one
+  adapter), `FoundationDBMultiInstanceTest` (two adapters on one root, in one JVM, interleaved
+  by hand: read-through metadata, the `meta/latest` raise, the cross-instance fence, D2 does
+  not apply) and `FoundationDBMultiWriterTest` — **two JVMs**, each its own `SharedLogService`
+  + `FoundationDBPersistenceAdapter` + `FoundationDBSequencer` on one cluster and root,
+  racing through `MultiWriterPeer`'s script. It is the only place `multiWriter` is measured
+  rather than declared. Its first run found two defects (the conflict exception never
+  surfaced on FDB; version-keyed reads were not in version order), so keep it honest.
 - **Mutation gate** (`pom.xml`, `mutationThreshold`): a ratchet set to the *low* observed run,
   not the best one, because what times out varies run to run and a timed-out mutant counts
   as killed. When the score rises durably, raise it and recompute the floor — it moves with the

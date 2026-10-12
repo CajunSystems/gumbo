@@ -3,12 +3,13 @@ package com.cajunsystems.gumbo.persistence;
 import com.apple.foundationdb.Database;
 import com.apple.foundationdb.FDB;
 import com.apple.foundationdb.KeyValue;
-import com.apple.foundationdb.Range;
+import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.cajunsystems.gumbo.core.CounterValues;
 import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.OperationToken;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
@@ -26,8 +27,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A {@link PersistenceAdapter} backed by FoundationDB.
@@ -39,7 +38,42 @@ import java.util.concurrent.atomic.AtomicLong;
  * {root} / "meta" / "trim"                                 → trimSeqnum (8 bytes, big-endian)
  * {root} / "meta" / "latest"                               → latestSeqnum (8 bytes, big-endian)
  * {root} / "meta" / "tagcount" / namespace / key           → versionCount (8 bytes, big-endian)
+ * {root} / "meta" / "taglatest" / namespace / key          → latest seqnum in tag (8 bytes, big-endian)
+ * {root} / "kv"   / namespace / key / kvKey                → tag KV value
+ * {root} / "kvop" / namespace / key / kvKey / readVersion / token → result of that conditional write (8 bytes)
  * </pre>
+ *
+ * <h2>Every write transaction is idempotent</h2>
+ * <p>{@code db.run} retries on {@code commit_unknown_result} with the commit possibly already
+ * applied, so a transaction that runs twice must produce the same answer. The append paths
+ * look for their own record at the pending's seqnum ({@link #alreadyCommitted}). The
+ * conditional KV writes record an {@link OperationToken} under {@code kvop}, keyed by the
+ * attempt's read version and the token, in the same transaction as the value; a retry looks
+ * up its own earlier attempts by point read and returns the recorded result when one is
+ * there — otherwise a landed compare-and-set would tell its caller it lost, and a landed
+ * increment would apply twice. The record is <em>not</em> one slot per key: a writer that
+ * slips in between a lost commit reply and its retry would overwrite that slot and the
+ * retry would apply again. Each write clears records older than
+ * {@link #tokenHorizonVersions} with a single range clear, so the subspace stays bounded
+ * without being scanned.
+ *
+ * <h2>Nothing is cached per process</h2>
+ * <p>This is the adapter that declares {@code multiWriter}, so another process may be
+ * appending to the same root at any moment. Every answer this adapter gives therefore comes
+ * from FoundationDB: {@link #getLatestSeqnum()}, {@link #getNextStreamVersion} and
+ * {@link #getLatestSeqnumForTag} are each one point read in a snapshot transaction, and
+ * {@code meta/latest} is raised with an atomic {@code BYTE_MAX} mutation inside the write
+ * transaction rather than computed from a local high-water mark. Earlier versions kept all
+ * four in process memory, filled at open and advanced only by this process's own writes —
+ * correct for one writer and a stale opinion with a confident return type for two. The
+ * {@code meta/latest} write was worse than stale: {@code max(localLatest, seqnum)} could move
+ * the stored value <em>backwards</em> when a writer that claimed a lower seqnum committed
+ * after one that claimed a higher one. {@code FoundationDBMultiInstanceTest} pins both.
+ *
+ * <p>The one exception is the trim point, kept locally as a lower bound for index scans. It
+ * is a hint: entries below another process's trim are cleared from the log subspace, so a
+ * read that scans from a lower bound finds nothing there, and {@link #trim} compares against
+ * the stored point inside its transaction rather than against the hint.
  *
  * <h2>Entry value format</h2>
  * <p>No magic bytes or CRC — FDB provides integrity via its own checksumming and
@@ -74,9 +108,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * size.
  *
  * <h2>Thread safety</h2>
- * <p>Writes are externally serialized by
- * {@link com.cajunsystems.gumbo.service.SharedLogService}. Reads use FDB
- * snapshot transactions and are fully concurrent.
+ * <p>Within a process, writes are externally serialized by
+ * {@link com.cajunsystems.gumbo.service.SharedLogService}. Across processes they are
+ * serialized by FoundationDB: every write is one transaction that reads the per-tag
+ * counters it increments, so two writers on one tag conflict and one of them retries with
+ * the other's result visible. Reads use FDB snapshot transactions and are fully concurrent.
  *
  * <h2>Large result sets</h2>
  * <p>FDB transactions have a default 5 MB read limit. {@link #readAll()} and
@@ -105,6 +141,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private static final String TAGCOUNT_NS  = "tagcount";
     private static final String TAGLATEST_NS = "taglatest";
     private static final String KV_NS        = "kv";
+    private static final String KVOP_NS      = "kvop";
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -121,24 +158,26 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private Subspace tagCountSubspace;
     private Subspace tagLatestSubspace;
     private Subspace kvSubspace;
+    private Subspace kvOpSubspace;
 
-    // -------------------------------------------------------------------------
-    // In-memory caches (populated on open, kept current on every write)
-    // -------------------------------------------------------------------------
-
-    /** Highest persisted seqnum; -1 if nothing has been written. */
-    private volatile long latestSeqnum = -1L;
-
-    /** Highest trimmed seqnum (exclusive lower bound for reads). */
+    /**
+     * Lower bound for index scans, from the last trim this process saw. A hint, not an
+     * answer — see the class comment. Never consulted for a value a caller is given.
+     */
     private volatile long trimSeqnum = 0L;
 
-    /** Per-tag entry counts; mirrors what is persisted under the tagcount subspace. */
-    private final ConcurrentHashMap<LogTag, AtomicLong> tagVersionCount = new ConcurrentHashMap<>();
-
-    /** Per-tag latest seqnum; mirrors what is persisted under the taglatest subspace. */
-    private final ConcurrentHashMap<LogTag, AtomicLong> tagLatestSeqnum = new ConcurrentHashMap<>();
-
     private volatile boolean opened = false;
+
+    /**
+     * How long a conditional write's token record is kept, in FoundationDB versions, which
+     * advance at roughly a million per second. It only has to outlive the client's retry
+     * window, which is bounded by the transaction lifetime of a few seconds; an hour's worth
+     * leaves three orders of magnitude of margin, and the cost of a long horizon is storage
+     * on keys written in the last hour, not time. Package-private so a test can shorten it
+     * and watch the clearing happen.
+     */
+    static final long DEFAULT_TOKEN_HORIZON_VERSIONS = 3_600L * 1_000_000L;
+    volatile long tokenHorizonVersions = DEFAULT_TOKEN_HORIZON_VERSIONS;
 
     // =========================================================================
     // Constructors
@@ -199,10 +238,13 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 db = (clusterFilePath != null) ? fdb.open(clusterFilePath) : fdb.open();
             }
             initSubspaces();
-            loadMetadata();
+            long latest = db.run(tr -> {
+                trimSeqnum = readLong(tr, metaSubspace.pack(Tuple.from(TRIM_KEY)), 0L);
+                return readLong(tr, metaSubspace.pack(Tuple.from(LATEST_KEY)), -1L);
+            });
             opened = true;
             log.info("FoundationDBPersistenceAdapter opened: root={}, latestSeqnum={}, trimSeqnum={}",
-                    root, latestSeqnum, trimSeqnum);
+                    root, latest, trimSeqnum);
         } catch (Exception e) {
             throw new IOException("Failed to open FoundationDB connection", e);
         }
@@ -215,37 +257,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         tagCountSubspace  = metaSubspace.subspace(Tuple.from(TAGCOUNT_NS));
         tagLatestSubspace = metaSubspace.subspace(Tuple.from(TAGLATEST_NS));
         kvSubspace        = root.subspace(Tuple.from(KV_NS));
-    }
-
-    private void loadMetadata() {
-        db.run(tr -> {
-            byte[] trimVal   = tr.get(metaSubspace.pack(Tuple.from(TRIM_KEY))).join();
-            byte[] latestVal = tr.get(metaSubspace.pack(Tuple.from(LATEST_KEY))).join();
-
-            if (trimVal   != null) trimSeqnum   = ByteBuffer.wrap(trimVal).getLong();
-            if (latestVal != null) latestSeqnum = ByteBuffer.wrap(latestVal).getLong();
-
-            // Rebuild per-tag counts from the compact tagcount subspace
-            Range tcRange = tagCountSubspace.range();
-            for (KeyValue kv : tr.getRange(tcRange)) {
-                Tuple suffix = tagCountSubspace.unpack(kv.getKey());
-                String ns  = suffix.getString(0);
-                String key = suffix.getString(1);
-                long count = ByteBuffer.wrap(kv.getValue()).getLong();
-                tagVersionCount.put(LogTag.of(ns, key), new AtomicLong(count));
-            }
-
-            // Rebuild per-tag latest seqnum from the taglatest subspace
-            Range tlRange = tagLatestSubspace.range();
-            for (KeyValue kv : tr.getRange(tlRange)) {
-                Tuple suffix = tagLatestSubspace.unpack(kv.getKey());
-                String ns  = suffix.getString(0);
-                String key = suffix.getString(1);
-                long latest = ByteBuffer.wrap(kv.getValue()).getLong();
-                tagLatestSeqnum.put(LogTag.of(ns, key), new AtomicLong(latest));
-            }
-            return null;
-        });
+        kvOpSubspace      = root.subspace(Tuple.from(KVOP_NS));
     }
 
     @Override
@@ -319,6 +331,11 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         byte[] countKey = tagCountSubspace.pack(Tuple.from(primary.namespace(), primary.key()));
         try {
             LogEntry entry = db.run(tr -> {
+                // A retry after commit_unknown_result re-runs this lambda with the entry
+                // possibly already durable; see alreadyCommitted.
+                LogEntry already = alreadyCommitted(tr, pending);
+                if (already != null) return already;
+
                 byte[] raw = tr.get(countKey).join();
                 long next = raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
                 if (expectedVersion != ANY_VERSION && expectedVersion != next) {
@@ -338,15 +355,20 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                 }
                 LogEntry e = pending.withVersions(versions);
                 writeEntry(tr, e);
-                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)),
-                       longBytes(Math.max(latestSeqnum, e.seqnum())));
+                raiseLatest(tr, e.seqnum());
                 return e;
             });
-            cacheAfterCommit(entry);
             return entry;
-        } catch (ConflictSignal cs) {
-            throw cs.conflict;
         } catch (Exception e) {
+            // db.run hands a non-retryable exception from the lambda back through
+            // Transaction.onError(...).join(), i.e. wrapped in a CompletionException — so the
+            // signal is found by walking the chain, not by catching it at the top. Catching it
+            // at the top was what the first version did, and every fenced-out writer on FDB
+            // got a generic IOException instead; nothing had run the conflict path on a real
+            // cluster until FoundationDBMultiInstanceTest did.
+            for (Throwable c = e; c != null; c = c.getCause()) {
+                if (c instanceof ConflictSignal cs) throw cs.conflict;
+            }
             throw new IOException("FDB append failed for tag=" + primary, e);
         }
     }
@@ -355,11 +377,23 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
             throws IOException {
         ensureOpen();
+        // Nothing to write, and nothing to raise: with no entries the "highest seqnum" below
+        // would be -1, whose 8 bytes are all 0xFF — the largest value BYTE_MAX can see — and
+        // meta/latest would be pinned at -1 for every process on this root, for good.
+        if (pendings.isEmpty()) return List.of();
         try {
             List<LogEntry> entries = db.run(tr -> {
+                // One transaction commits the whole batch, so if the first entry is already
+                // stored this is a retry after commit_unknown_result and all of them are.
+                if (alreadyCommitted(tr, pendings.get(0)) != null) {
+                    List<LogEntry> stored = new ArrayList<>(pendings.size());
+                    for (PendingAppend p : pendings) stored.add(alreadyCommitted(tr, p));
+                    return stored;
+                }
+
                 java.util.Map<LogTag, Long> next = new java.util.HashMap<>();
                 List<LogEntry> out = new ArrayList<>(pendings.size());
-                long maxSeqnum = latestSeqnum;
+                long maxSeqnum = -1L;
                 for (PendingAppend p : pendings) {
                     java.util.Map<LogTag, Long> versions = new java.util.LinkedHashMap<>();
                     for (LogTag tag : p.tags()) {
@@ -376,10 +410,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                     out.add(e);
                     if (e.seqnum() > maxSeqnum) maxSeqnum = e.seqnum();
                 }
-                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)), longBytes(maxSeqnum));
+                raiseLatest(tr, maxSeqnum);
                 return out;
             });
-            for (LogEntry e : entries) cacheAfterCommit(e);
             return entries;
         } catch (Exception e) {
             throw new IOException("FDB batch append failed", e);
@@ -414,16 +447,60 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         }
     }
 
-    /** Refreshes the local caches once a commit is durable. */
-    private void cacheAfterCommit(LogEntry entry) {
-        if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
-        for (LogTag tag : entry.tags()) {
-            long version = entry.streamVersion(tag);
-            tagVersionCount.computeIfAbsent(tag, k -> new AtomicLong(0))
-                    .updateAndGet(c -> Math.max(c, version + 1));
-            tagLatestSeqnum.computeIfAbsent(tag, k -> new AtomicLong(-1L))
-                    .updateAndGet(c -> Math.max(c, entry.seqnum()));
+    /**
+     * Raises {@code meta/latest} to {@code seqnum} if it is higher, without reading it.
+     *
+     * <p>{@code BYTE_MAX} compares the stored and supplied values lexicographically as byte
+     * strings, which for two 8-byte big-endian non-negative longs is numeric order — so the
+     * existing encoding stands and the mutation adds no read conflict range. Reading the key
+     * and writing {@code max} would be correct too, but would make every append in every
+     * process conflict with every other on this one key, which is a retry storm for writers
+     * that otherwise never touch the same tag. {@code MAX} is not used for the reason
+     * {@link #incrementTagValue} gives for {@code ADD}: it is little-endian.
+     *
+     * <p>A plain {@code set} of {@code max(localLatest, seqnum)} is what this replaced, and
+     * under two writers it could move the value backwards: B claims 9, A claims and commits
+     * 10, B commits with its local high-water mark below 10.
+     */
+    private void raiseLatest(com.apple.foundationdb.Transaction tr, long seqnum) {
+        // A negative seqnum encodes above every valid one and would win the max for good.
+        if (seqnum < 0) throw new IllegalArgumentException("seqnum must be >= 0, was " + seqnum);
+        tr.mutate(MutationType.BYTE_MAX, metaSubspace.pack(Tuple.from(LATEST_KEY)), longBytes(seqnum));
+    }
+
+    /**
+     * The entry already stored at {@code pending}'s seqnum, if this append has in fact
+     * already committed — which is what a retry sees.
+     *
+     * <p>{@code db.run} retries on {@code commit_unknown_result}: the commit may have landed
+     * and the reply been lost. The version-assigning paths are not idempotent by themselves —
+     * run twice, the conditional one fails its own fence (and the earlier version of this
+     * adapter would then have reported {@link VersionConflictException}, which
+     * {@code FAILURE_SEMANTICS.md} defines as "nothing written", for an entry that was
+     * durable), and the unconditional one writes the same seqnum again one version up and
+     * leaves a hole. Seqnums are unique per append, so the record at this seqnum is the
+     * test: present and the same entry means the earlier attempt committed, and it is
+     * returned as the result.
+     *
+     * <p>Present and a <em>different</em> entry means two writers were handed the same
+     * seqnum, which only a non-distributed sequencer shared across processes can do — a
+     * configuration that does not report {@code multiWriter}. It used to overwrite the first
+     * record silently; it is now refused, since the alternative is losing an entry with no
+     * error anywhere.
+     */
+    private LogEntry alreadyCommitted(com.apple.foundationdb.ReadTransaction tr, PendingAppend pending) {
+        byte[] existing = tr.get(logSubspace.pack(Tuple.from(pending.seqnum()))).join();
+        if (existing == null) return null;
+        LogEntry stored = decodeEntry(existing);
+        boolean same = stored.tags().equals(pending.tags())
+                && stored.timestamp().toEpochMilli() == pending.timestamp().toEpochMilli()
+                && Arrays.equals(stored.dataUnsafe(), pending.dataUnsafe());
+        if (!same) {
+            throw new IllegalStateException("seqnum " + pending.seqnum() + " already holds a different"
+                    + " entry (tags " + stored.tags() + "); two writers are sharing a sequencer that"
+                    + " is not distributed");
         }
+        return stored;
     }
 
     /** Carries a conflict out of the FDB retry loop, which only propagates RuntimeExceptions. */
@@ -435,7 +512,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private void commitChunk(List<LogEntry> entries) throws IOException {
         try {
             db.run(tr -> {
-                long maxSeqnum = latestSeqnum;
+                long maxSeqnum = -1L;
 
                 for (LogEntry entry : entries) {
                     // Shared with the version-assigning append so both raise per-tag
@@ -444,23 +521,9 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                     if (entry.seqnum() > maxSeqnum) maxSeqnum = entry.seqnum();
                 }
 
-                tr.set(metaSubspace.pack(Tuple.from(LATEST_KEY)), longBytes(maxSeqnum));
+                raiseLatest(tr, maxSeqnum);
                 return null;
             });
-
-            // Update in-memory caches after commit
-            for (LogEntry entry : entries) {
-                if (entry.seqnum() > latestSeqnum) latestSeqnum = entry.seqnum();
-                for (LogTag tag : entry.tags()) {
-                    long v = entry.streamVersion(tag);
-                    tagVersionCount
-                        .computeIfAbsent(tag, k -> new AtomicLong(0))
-                        .updateAndGet(c -> Math.max(c, v + 1));
-                    tagLatestSeqnum
-                        .computeIfAbsent(tag, k -> new AtomicLong(-1L))
-                        .updateAndGet(c -> Math.max(c, entry.seqnum()));
-                }
-            }
         } catch (Exception e) {
             throw new IOException("FDB transaction failed during appendBatch", e);
         }
@@ -539,7 +602,8 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     }
 
     /**
-     * Same two round-trips as {@link #readByTag}, filtered on the tag's own version.
+     * Same two round-trips as {@link #readByTag}, filtered on the tag's own version and
+     * <strong>returned in version order</strong>.
      *
      * <p>The tag index is keyed {@code (namespace, key, seqnum) → streamVersion}, so the
      * version is the value rather than part of the key and the scan cannot start at it
@@ -548,6 +612,16 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      * proportional to the result. A {@code (namespace, key, streamVersion)} index would make
      * the scan seekable too, at the cost of a second index and a migration for logs
      * already written.
+     *
+     * <h2>Why the sort</h2>
+     * <p>Under one writer, seqnum order and version order are the same order. Under two they
+     * are not: a writer claims its seqnum from the sequencer <em>before</em> its transaction
+     * and is handed its version <em>inside</em> it, so writer A can claim seqnum 10, lose the
+     * commit race to writer B's seqnum 11, and end up with version 6 at seqnum 10 behind
+     * version 5 at seqnum 11. The index scan is in seqnum order, so without the sort a
+     * version-keyed read would hand back {@code 6, 5}, and a consumer advancing its cursor
+     * to "the last entry's version" would be handed 6 again next time. Measured by
+     * {@code FoundationDBMultiWriterTest} on the first run, which is how it got here.
      */
     @Override
     public List<LogEntry> readFromVersion(LogTag tag, long fromVersion) throws IOException {
@@ -575,6 +649,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
                     byte[] val = f.join();
                     if (val != null) result.add(decodeEntry(val));
                 }
+                result.sort(java.util.Comparator.comparingLong(e -> e.streamVersion(tag)));
                 return Collections.unmodifiableList(result);
             });
         } catch (Exception e) {
@@ -602,16 +677,19 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         if (upToSeqnum <= trimSeqnum) return;
         try {
             final long newTrim = upToSeqnum;
-            db.run(tr -> {
-                // Clear log entries below the trim boundary
-                tr.clear(logSubspace.range().begin,
-                         logSubspace.pack(Tuple.from(newTrim)));
-                // Persist trim point
-                tr.set(metaSubspace.pack(Tuple.from(TRIM_KEY)), longBytes(newTrim));
-                return null;
+            byte[] trimKey = metaSubspace.pack(Tuple.from(TRIM_KEY));
+            long stored = db.run(tr -> {
+                // Compared against the stored point, not the local hint: another process may
+                // have trimmed further already, and a lower value written here would move
+                // the trim point back and re-expose a range it had cleared.
+                long current = readLong(tr, trimKey, 0L);
+                if (newTrim <= current) return current;
+                tr.clear(logSubspace.range().begin, logSubspace.pack(Tuple.from(newTrim)));
+                tr.set(trimKey, longBytes(newTrim));
+                return newTrim;
             });
-            trimSeqnum = upToSeqnum;
-            log.debug("Trimmed log up to seqnum {}", upToSeqnum);
+            trimSeqnum = Math.max(trimSeqnum, stored);
+            log.debug("Trimmed log up to seqnum {}", stored);
         } catch (Exception e) {
             throw new IOException("FDB trim failed", e);
         }
@@ -621,21 +699,52 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     // Metadata
     // =========================================================================
 
+    /**
+     * One point read, every call. Under {@code multiWriter} this is the only honest answer:
+     * a process-local high-water mark advanced by this process's writes alone is wrong the
+     * moment another process commits.
+     *
+     * <p>It is the highest seqnum <em>committed</em> by any writer. Under one writer that is
+     * also a durable prefix: everything at or below it has landed. Under several it is not —
+     * a seqnum is claimed from the sequencer before its transaction, so another writer's
+     * lower seqnum may still be in flight, or may have failed and never land. A caller
+     * reconciling a partial batch on a shared root reads its own seqnums back
+     * ({@link #readFrom}) rather than comparing against this; {@code FAILURE_SEMANTICS.md}
+     * has the rule. Versions have no such gap: they are assigned in commit order and a
+     * tag's versions are always a dense prefix.
+     */
     @Override
     public long getLatestSeqnum() {
-        return latestSeqnum;
+        ensureOpen();
+        byte[] key = metaSubspace.pack(Tuple.from(LATEST_KEY));
+        return db.run(tr -> readLong(tr, key, -1L));
     }
 
+    /** Read from the tag's counter in FDB — the same key the append transaction fences on. */
     @Override
     public long getNextStreamVersion(LogTag tag) {
-        AtomicLong c = tagVersionCount.get(tag);
-        return c == null ? 0L : c.get();
+        ensureOpen();
+        byte[] key = tagCountSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
+        return db.run(tr -> readLong(tr, key, 0L));
     }
 
     @Override
     public long getLatestSeqnumForTag(LogTag tag) {
-        AtomicLong c = tagLatestSeqnum.get(tag);
-        return c == null ? -1L : c.get();
+        ensureOpen();
+        byte[] key = tagLatestSubspace.pack(Tuple.from(tag.namespace(), tag.key()));
+        return db.run(tr -> readLong(tr, key, -1L));
+    }
+
+    /**
+     * The trim point as stored, for tests. A trim point moved backwards by a stale process
+     * is not observable through reads — the entries below the real point are already
+     * cleared — so the only way to assert {@link #trim} compares against the store is to
+     * read the store.
+     */
+    long storedTrimSeqnum() {
+        ensureOpen();
+        byte[] key = metaSubspace.pack(Tuple.from(TRIM_KEY));
+        return db.run(tr -> readLong(tr, key, 0L));
     }
 
     // -------------------------------------------------------------------------
@@ -678,6 +787,14 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         );
     }
 
+    /**
+     * Clears the value only. The key's idempotency records are deliberately left alone: a
+     * delete that lands between a conditional write's lost commit reply and its retry would
+     * otherwise take the retry's evidence with it, and the retry would apply again — a
+     * landed swap reported as lost, an increment counted twice. The horizon clear on the
+     * next conditional write is the only thing that removes records, and it never removes
+     * one younger than an hour of versions.
+     */
     @Override
     public void deleteTagValue(LogTag tag, String key) {
         db.run(tr -> {
@@ -695,8 +812,29 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value) {
+        return compareAndSetTagValue(tag, key, expected, value, OperationToken.fresh(), new ArrayList<>());
+    }
+
+    /**
+     * {@link #compareAndSetTagValue(LogTag, String, byte[], byte[])} with the call's token and
+     * its list of earlier attempts supplied, so a test can replay the retry {@code db.run}
+     * performs after {@code commit_unknown_result}: the same lambda, the same token, the same
+     * accumulating list, the first attempt possibly committed — and, in the test, another
+     * writer in between.
+     *
+     * <p>Without the record a landed swap's retry reads the value it wrote, finds it is not
+     * {@code expected}, and reports {@code false} — "nothing written" for a durable claim,
+     * and a round in which nobody is told they hold the lease. The record is written in the
+     * same transaction as the value, under the attempt's read version, and every retry looks
+     * for its earlier attempts' records first.
+     *
+     * @param attempts read versions of this call's earlier attempts; appended to by each run
+     */
+    boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value,
+                                  byte[] token, List<Long> attempts) {
         byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
         return db.run(tr -> {
+            if (earlierAttemptLanded(tr, tag, key, token, attempts) != null) return true;
             byte[] current = tr.get(k).join();
             if (!Arrays.equals(current, expected)) return false;
             if (value == null) {
@@ -704,6 +842,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             } else {
                 tr.set(k, value);
             }
+            recordAttempt(tr, tag, key, token, attempts, 0L);
             return true;
         });
     }
@@ -720,11 +859,75 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public long incrementTagValue(LogTag tag, String key, long delta) {
+        return incrementTagValue(tag, key, delta, OperationToken.fresh(), new ArrayList<>());
+    }
+
+    /**
+     * {@link #incrementTagValue(LogTag, String, long)} with the call's token and attempts
+     * supplied, for the same reason as the compare-and-set overload. A counter is the one
+     * value where a second application is not harmless, and the client library's own retry
+     * would apply it with no exception anywhere; the record stores the result, so the retry
+     * returns what the landed attempt returned.
+     */
+    long incrementTagValue(LogTag tag, String key, long delta, byte[] token, List<Long> attempts) {
         byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
         return db.run(tr -> {
+            Long landed = earlierAttemptLanded(tr, tag, key, token, attempts);
+            if (landed != null) return landed;
             long next = CounterValues.toLong(tr.get(k).join()) + delta;
             tr.set(k, CounterValues.toBytes(next));
+            recordAttempt(tr, tag, key, token, attempts, next);
             return next;
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Idempotency records for the conditional KV
+    // -------------------------------------------------------------------------
+
+    /** {@code {root}/"kvop"/namespace/key/kvKey}, under which a record is {@code /readVersion/token → result}. */
+    private Subspace opSubspace(LogTag tag, String key) {
+        return kvOpSubspace.subspace(Tuple.from(tag.namespace(), tag.key(), key));
+    }
+
+    /**
+     * The result recorded by one of this call's earlier attempts, or {@code null} if none of
+     * them committed. Each earlier attempt is one point read, and on the first attempt there
+     * are none, so the happy path pays nothing here. The reads also put those keys in this
+     * transaction's read conflict set, so an earlier attempt that lands <em>after</em> this
+     * read version makes this commit conflict and retry rather than apply twice.
+     */
+    private Long earlierAttemptLanded(com.apple.foundationdb.ReadTransaction tr, LogTag tag, String key,
+                                      byte[] token, List<Long> attempts) {
+        Subspace ops = opSubspace(tag, key);
+        for (long readVersion : attempts) {
+            byte[] result = tr.get(ops.pack(Tuple.from(readVersion, token))).join();
+            if (result != null) return ByteBuffer.wrap(result).getLong();
+        }
+        return null;
+    }
+
+    /**
+     * Records this attempt — read version, token, result — and clears every record on this
+     * key older than {@link #tokenHorizonVersions}. The clear is one range mutation keyed by
+     * read version, so the records stay bounded with no scan on the write path.
+     */
+    private void recordAttempt(com.apple.foundationdb.Transaction tr, LogTag tag, String key,
+                               byte[] token, List<Long> attempts, long result) {
+        Subspace ops = opSubspace(tag, key);
+        long readVersion = tr.getReadVersion().join();
+        attempts.add(readVersion);
+        tr.set(ops.pack(Tuple.from(readVersion, token)), longBytes(result));
+        tr.clear(ops.range().begin, ops.pack(Tuple.from(readVersion - tokenHorizonVersions)));
+    }
+
+    /** The records currently kept for {@code key}, for tests of the clearing. */
+    long storedAttemptRecords(LogTag tag, String key) {
+        ensureOpen();
+        return db.run(tr -> {
+            long n = 0;
+            for (KeyValue ignored : tr.getRange(opSubspace(tag, key).range())) n++;
+            return n;
         });
     }
 
@@ -838,6 +1041,12 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
 
     private static byte[] longBytes(long v) {
         return ByteBuffer.allocate(8).putLong(v).array();
+    }
+
+    /** Reads an 8-byte big-endian long at {@code key}, or {@code absent} if there is none. */
+    private static long readLong(com.apple.foundationdb.ReadTransaction tr, byte[] key, long absent) {
+        byte[] raw = tr.get(key).join();
+        return raw == null ? absent : ByteBuffer.wrap(raw).getLong();
     }
 
     private void ensureOpen() {

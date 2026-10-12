@@ -4,12 +4,15 @@ import com.apple.foundationdb.Database;
 import com.apple.foundationdb.FDB;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
+import com.cajunsystems.gumbo.core.OperationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A distributed {@link Sequencer} backed by FoundationDB.
@@ -20,6 +23,12 @@ import java.nio.ByteBuffer;
  * write transaction that atomically increments the counter and returns the value
  * it claimed.  FDB's optimistic concurrency control serialises concurrent callers
  * automatically; conflicting transactions are transparently retried by the client.
+ *
+ * <p>The client also retries on {@code commit_unknown_result}, with the commit possibly
+ * already applied. A plain read-modify-write run twice would claim twice and skip a
+ * number, so each claim records an {@link OperationToken} and its base under
+ * {@code {root} / "claim" / readVersion / token} in the same transaction, and a retry looks
+ * up its own earlier attempts and returns the base it already holds.
  *
  * <h2>Why FDB over an AtomicLong</h2>
  * <p>In a single-process deployment {@link LocalSequencer} is sufficient and
@@ -49,6 +58,19 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
     private final boolean ownsDatabase;
     private final byte[]  counterKey;
 
+    /**
+     * {@code {root} / "claim" / readVersion / token → base}: one record per claim attempt, so
+     * a retry after {@code commit_unknown_result} finds the base its earlier attempt was
+     * handed rather than claiming again and leaving a gap. Written in the same transaction as
+     * the counter; not a single slot, since another process's claim in between would
+     * overwrite it. Every claim range-clears records older than {@link #claimHorizonVersions}.
+     */
+    private final Subspace claims;
+
+    /** As the persistence adapter's token horizon: an hour of versions, far beyond any retry. */
+    static final long DEFAULT_CLAIM_HORIZON_VERSIONS = 3_600L * 1_000_000L;
+    volatile long claimHorizonVersions = DEFAULT_CLAIM_HORIZON_VERSIONS;
+
     private Database db;
 
     /** Last value returned by next(); -1 if none issued yet. */
@@ -76,6 +98,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
         this.clusterFilePath = clusterFilePath;
         this.ownsDatabase    = true;
         this.counterKey      = new Subspace(Tuple.from(rootPrefix)).pack(Tuple.from("seq"));
+        this.claims          = new Subspace(Tuple.from(rootPrefix)).subspace(Tuple.from("claim"));
     }
 
     /**
@@ -90,6 +113,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
         this.ownsDatabase    = false;
         this.db              = database;
         this.counterKey      = new Subspace(Tuple.from(rootPrefix)).pack(Tuple.from("seq"));
+        this.claims          = new Subspace(Tuple.from(rootPrefix)).subspace(Tuple.from("claim"));
     }
 
     // =========================================================================
@@ -158,15 +182,48 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
 
     @Override
     public long next() {
-        long claimed = db.run(tr -> {
+        return claim(1, OperationToken.fresh(), new ArrayList<>());
+    }
+
+    /**
+     * Claims {@code count} consecutive seqnums and returns the first. The read-modify-write
+     * and the claim record are one transaction; see {@link #claims}. Package-private so a
+     * test can replay the retry {@code db.run} performs after {@code commit_unknown_result}
+     * — the same call with the same token and the same accumulating list of attempts, and
+     * another process's claim in between — and check the counter moved once.
+     *
+     * @param attempts read versions of this call's earlier attempts; appended to by each run
+     */
+    long claim(int count, byte[] token, List<Long> attempts) {
+        long base = db.run(tr -> {
+            // An earlier attempt of this call that landed: one point read each, none on the
+            // first attempt. Reading them also makes a late-landing earlier attempt conflict
+            // with this commit rather than let it claim twice.
+            for (long readVersion : attempts) {
+                byte[] landed = tr.get(claims.pack(Tuple.from(readVersion, token))).join();
+                if (landed != null) return ByteBuffer.wrap(landed).getLong();
+            }
             byte[] val     = tr.get(counterKey).join();
             long   current = (val == null) ? 0L : ByteBuffer.wrap(val).getLong();
-            long   next    = current + 1;
-            tr.set(counterKey, ByteBuffer.allocate(8).putLong(next).array());
+            tr.set(counterKey, ByteBuffer.allocate(8).putLong(current + count).array());
+
+            long readVersion = tr.getReadVersion().join();
+            attempts.add(readVersion);
+            tr.set(claims.pack(Tuple.from(readVersion, token)), ByteBuffer.allocate(8).putLong(current).array());
+            tr.clear(claims.range().begin, claims.pack(Tuple.from(readVersion - claimHorizonVersions)));
             return current;
         });
-        lastIssued = claimed;
-        return claimed;
+        lastIssued = base + count - 1;
+        return base;
+    }
+
+    /** The claim records currently kept, for tests of the clearing. */
+    long storedClaimRecords() {
+        return db.run(tr -> {
+            long n = 0;
+            for (com.apple.foundationdb.KeyValue ignored : tr.getRange(claims.range())) n++;
+            return n;
+        });
     }
 
     /**
@@ -185,14 +242,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
     @Override
     public long[] nextBatch(int count) {
         if (count <= 0) throw new IllegalArgumentException("count must be > 0");
-        long base = db.run(tr -> {
-            byte[] val     = tr.get(counterKey).join();
-            long   current = (val == null) ? 0L : ByteBuffer.wrap(val).getLong();
-            long   next    = current + count;
-            tr.set(counterKey, ByteBuffer.allocate(8).putLong(next).array());
-            return current;
-        });
-        lastIssued = base + count - 1;
+        long base = claim(count, OperationToken.fresh(), new ArrayList<>());
         long[] seqnums = new long[count];
         for (int i = 0; i < count; i++) seqnums[i] = base + i;
         return seqnums;
