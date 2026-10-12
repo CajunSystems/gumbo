@@ -168,9 +168,12 @@ that version has a dated CHANGELOG entry and no tag, it runs `mvn verify`, creat
 lightweight tag, publishes a GitHub Release with the CHANGELOG section as notes and the jar
 and sources jar attached, then requests the JitPack build and waits for it to report `ok`
 (an `Error` fails the job — that is the unreachable-downstream state the workflow exists to
-prevent). A main whose version is already tagged, or whose entry is still `[Unreleased]`,
-does nothing. The lesson it encodes: a merged release is not a released one, and the half
-that publishes it should not depend on anyone remembering.
+prevent). A main whose entry is still `[Unreleased]` does nothing. Each step decides from
+its own evidence — tag exists, Release exists, JitPack ok — so a run that fails part-way is
+finished by running it again, building the tagged commit rather than whatever main has
+moved on to; review caught the first version gating everything on "no tag yet", which made
+every re-run a no-op. The lesson it encodes: a merged release is not a released one, and
+the half that publishes it should not depend on anyone remembering.
 
 - `maven-source-plugin` attaches a sources jar to every `package`, for the Release
 - The `fdb` job and the review workflows are described under *Added*
