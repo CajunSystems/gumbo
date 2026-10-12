@@ -1,5 +1,6 @@
 package com.cajunsystems.gumbo.persistence;
 
+import com.cajunsystems.gumbo.core.CounterValues;
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogTag;
 import com.cajunsystems.gumbo.core.OperationToken;
@@ -209,27 +210,73 @@ class FoundationDBMultiInstanceTest {
     @Test
     void aRetriedKvClaimOrIncrementIsAppliedOnceAndAnsweredTheSame() throws IOException {
         byte[] claim = OperationToken.fresh();
-        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim)).isTrue();
-        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim))
+        List<Long> claimAttempts = new ArrayList<>();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim, claimAttempts)).isTrue();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim, claimAttempts))
                 .as("the retry of a landed claim is told it won, not that it lost")
                 .isTrue();
-        assertThat(b.compareAndSetTagValue(ORDERS, "owner", null, bytes("b"), OperationToken.fresh()))
+        assertThat(b.compareAndSetTagValue(ORDERS, "owner", null, bytes("b")))
                 .as("a different call with the same expectation still loses")
                 .isFalse();
         assertThat(b.getTagValue(ORDERS, "owner")).isEqualTo(bytes("a"));
 
         byte[] release = OperationToken.fresh();
-        assertThat(a.compareAndSetTagValue(ORDERS, "owner", bytes("a"), null, release)).isTrue();
-        assertThat(a.compareAndSetTagValue(ORDERS, "owner", bytes("a"), null, release)).isTrue();
+        List<Long> releaseAttempts = new ArrayList<>();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", bytes("a"), null, release, releaseAttempts)).isTrue();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", bytes("a"), null, release, releaseAttempts)).isTrue();
         assertThat(b.getTagValue(ORDERS, "owner")).isNull();
 
         byte[] bump = OperationToken.fresh();
-        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump)).isEqualTo(5L);
-        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump))
+        List<Long> bumpAttempts = new ArrayList<>();
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump, bumpAttempts)).isEqualTo(5L);
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump, bumpAttempts))
                 .as("the retry returns the landed attempt's result and applies nothing")
                 .isEqualTo(5L);
-        assertThat(b.incrementTagValue(ORDERS, "n", 1, OperationToken.fresh())).isEqualTo(6L);
-        assertThat(b.incrementTagValue(ORDERS, "n", 1)).isEqualTo(7L);
+        assertThat(b.incrementTagValue(ORDERS, "n", 1)).isEqualTo(6L);
+    }
+
+    /**
+     * The case a single last-writer slot per key gets wrong, raised in review: another
+     * process writes the key <em>between</em> the lost commit reply and the retry. A slot
+     * would now hold the other writer's token, and the retry would apply again — a double
+     * increment, or a landed claim reported as lost. One record per attempt, keyed by the
+     * attempt's read version, survives the writer in between.
+     */
+    @Test
+    void aRetryStillRecognisesItsLandedWriteWhenAnotherWriterSlippedInBetween() throws IOException {
+        byte[] bump = OperationToken.fresh();
+        List<Long> bumpAttempts = new ArrayList<>();
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump, bumpAttempts)).isEqualTo(5L);
+        assertThat(b.incrementTagValue(ORDERS, "n", 100)).as("b writes the key in between").isEqualTo(105L);
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump, bumpAttempts))
+                .as("a's retry returns a's own landed result, not 110")
+                .isEqualTo(5L);
+        assertThat(CounterValues.toLong(b.getTagValue(ORDERS, "n"))).as("applied once").isEqualTo(105L);
+
+        byte[] claim = OperationToken.fresh();
+        List<Long> claimAttempts = new ArrayList<>();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim, claimAttempts)).isTrue();
+        assertThat(b.compareAndSetTagValue(ORDERS, "owner", bytes("a"), bytes("b"))).as("b takes over in between").isTrue();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim, claimAttempts))
+                .as("a's claim did land; the retry says so even though b holds the key now")
+                .isTrue();
+        assertThat(b.getTagValue(ORDERS, "owner")).as("and b's takeover stands").isEqualTo(bytes("b"));
+    }
+
+    /** The records are bounded by a horizon, cleared on every write with one range clear. */
+    @Test
+    void attemptRecordsOlderThanTheHorizonAreClearedByTheNextWrite() throws IOException {
+        for (int i = 0; i < 3; i++) a.incrementTagValue(ORDERS, "n", 1);
+        assertThat(a.storedAttemptRecords(ORDERS, "n")).as("default horizon keeps them all").isEqualTo(3L);
+
+        a.tokenHorizonVersions = 0;
+        a.incrementTagValue(ORDERS, "n", 1);
+        assertThat(a.storedAttemptRecords(ORDERS, "n"))
+                .as("a zero horizon keeps only the record the write itself made")
+                .isEqualTo(1L);
+
+        a.deleteTagValue(ORDERS, "n");
+        assertThat(a.storedAttemptRecords(ORDERS, "n")).as("deleting the key clears its records").isZero();
     }
 
     /**

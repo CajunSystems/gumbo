@@ -89,13 +89,17 @@ Same retry, other transactions. A landed compare-and-set run again read the valu
 written, found it was not the expected one, and told its caller it lost — "nothing written"
 for a durable claim, and a round in which nobody is told they hold the lease. A landed
 increment applied its delta twice, with no exception anywhere. A landed sequencer claim
-claimed again and left a gap. Each now records an `OperationToken` (and the result, where
-there is one) next to the key in the same transaction — `{root}/"kvop"/…` for the KV,
-`{root}/"claim"` for the sequencer — and a retry that finds its own token returns the
-recorded answer. One extra point read and one extra write per call, on paths that are
-coordination steps rather than hot paths. The *caller's* retry warning on
-`incrementTagValue` stands on every adapter; it is the client library's own retry that is
-now safe.
+claimed again and left a gap. Each now records an `OperationToken` and the result in the
+same transaction — `{root}/"kvop"/…/readVersion/token` for the KV,
+`{root}/"claim"/readVersion/token` for the sequencer — and a retry looks up its own earlier
+attempts (it knows their read versions; they ran in the same call) and returns the recorded
+answer. One record per attempt, not one slot per key: review caught that a slot is
+overwritten by whoever writes the key next, so a writer slipping in between a lost reply and
+the retry would make the retry apply again. Records older than an hour of versions are
+range-cleared by the next write, so nothing is scanned and nothing accumulates. On the happy
+path the cost is one write and one range clear; the lookups only happen on a retry. The
+*caller's* retry warning on `incrementTagValue` stands on every adapter; it is the client
+library's own retry that is now safe.
 
 **An empty `appendBatchAssigningVersions` would have pinned `meta/latest` at -1 forever**
 (found in review of #40)

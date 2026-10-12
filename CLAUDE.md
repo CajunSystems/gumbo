@@ -125,9 +125,11 @@ planning directory from the 0.2.0 era and is not maintained.
   compare-and-set tells its winner it lost, an increment applies twice, the sequencer skips a
   number. Appends check for their own record at the pending's seqnum (`alreadyCommitted`); a
   different record there is a sequencer collision and is refused, never overwritten. The KV
-  conditional writes and `FoundationDBSequencer.claim` record an `OperationToken` (and the
-  result) next to the key in the same transaction and return the recorded answer on a retry.
-  A new FDB transaction that reads then writes gets the same treatment.
+  conditional writes and `FoundationDBSequencer.claim` record an `OperationToken` and the
+  result under `readVersion/token` in the same transaction — one record per attempt, never a
+  slot per key, since another writer in between would overwrite a slot — and a retry looks
+  up its earlier attempts. A new FDB transaction that reads then writes gets the same
+  treatment.
 
 ## Tests (keep green if you touch the engine)
 

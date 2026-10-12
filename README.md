@@ -614,13 +614,16 @@ persistence back-end for **multi-node or production-scale deployments**.
 {root} / "meta" / "tagcount" / namespace / key    → versionCount (8 bytes)
 {root} / "meta" / "taglatest" / namespace / key   → latest seqnum in the tag (8 bytes)
 {root} / "kv"   / namespace / key / kvKey         → tag KV value
-{root} / "kvop" / namespace / key / kvKey         → token of the last conditional write on that key (+ result)
+{root} / "kvop" / namespace / key / kvKey / readVersion / token → result of that conditional write (8 bytes)
 ```
 
 Every write transaction is idempotent against the FDB client's own retry on
 `commit_unknown_result`: appends look for their own record at the pending's seqnum, and the
-conditional KV writes (and `FoundationDBSequencer`'s claims, under `{root}/"claim"`) record
-a per-call token in the same transaction and return the recorded answer when they find it.
+conditional KV writes (and `FoundationDBSequencer`'s claims, under
+`{root}/"claim"/readVersion/token`) record one entry per attempt in the same transaction and
+look their earlier attempts up on a retry. One record per attempt rather than one slot per
+key, because a writer that slips in between a lost reply and the retry would overwrite a
+slot; records older than an hour of versions are range-cleared by the next write.
 
 FDB's tuple-layer key encoding preserves ordering, so range reads over the log
 subspace naturally return entries in `seqnum` order without a separate index file.

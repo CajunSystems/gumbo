@@ -40,16 +40,22 @@ import java.util.concurrent.CompletableFuture;
  * {root} / "meta" / "tagcount" / namespace / key           → versionCount (8 bytes, big-endian)
  * {root} / "meta" / "taglatest" / namespace / key          → latest seqnum in tag (8 bytes, big-endian)
  * {root} / "kv"   / namespace / key / kvKey                → tag KV value
- * {root} / "kvop" / namespace / key / kvKey                → token of the last conditional write (+ result)
+ * {root} / "kvop" / namespace / key / kvKey / readVersion / token → result of that conditional write (8 bytes)
  * </pre>
  *
  * <h2>Every write transaction is idempotent</h2>
  * <p>{@code db.run} retries on {@code commit_unknown_result} with the commit possibly already
  * applied, so a transaction that runs twice must produce the same answer. The append paths
  * look for their own record at the pending's seqnum ({@link #alreadyCommitted}). The
- * conditional KV writes record an {@link OperationToken} under {@code kvop} in the same
- * transaction and return the recorded result when they find it — otherwise a landed
- * compare-and-set would tell its caller it lost, and a landed increment would apply twice.
+ * conditional KV writes record an {@link OperationToken} under {@code kvop}, keyed by the
+ * attempt's read version and the token, in the same transaction as the value; a retry looks
+ * up its own earlier attempts by point read and returns the recorded result when one is
+ * there — otherwise a landed compare-and-set would tell its caller it lost, and a landed
+ * increment would apply twice. The record is <em>not</em> one slot per key: a writer that
+ * slips in between a lost commit reply and its retry would overwrite that slot and the
+ * retry would apply again. Each write clears records older than
+ * {@link #tokenHorizonVersions} with a single range clear, so the subspace stays bounded
+ * without being scanned.
  *
  * <h2>Nothing is cached per process</h2>
  * <p>This is the adapter that declares {@code multiWriter}, so another process may be
@@ -161,6 +167,17 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private volatile long trimSeqnum = 0L;
 
     private volatile boolean opened = false;
+
+    /**
+     * How long a conditional write's token record is kept, in FoundationDB versions, which
+     * advance at roughly a million per second. It only has to outlive the client's retry
+     * window, which is bounded by the transaction lifetime of a few seconds; an hour's worth
+     * leaves three orders of magnitude of margin, and the cost of a long horizon is storage
+     * on keys written in the last hour, not time. Package-private so a test can shorten it
+     * and watch the clearing happen.
+     */
+    static final long DEFAULT_TOKEN_HORIZON_VERSIONS = 3_600L * 1_000_000L;
+    volatile long tokenHorizonVersions = DEFAULT_TOKEN_HORIZON_VERSIONS;
 
     // =========================================================================
     // Constructors
@@ -774,7 +791,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public void deleteTagValue(LogTag tag, String key) {
         db.run(tr -> {
             tr.clear(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
-            tr.clear(kvOpSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
+            tr.clear(opSubspace(tag, key).range());
             return null;
         });
     }
@@ -788,25 +805,29 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value) {
-        return compareAndSetTagValue(tag, key, expected, value, OperationToken.fresh());
+        return compareAndSetTagValue(tag, key, expected, value, OperationToken.fresh(), new ArrayList<>());
     }
 
     /**
-     * {@link #compareAndSetTagValue(LogTag, String, byte[], byte[])} with the call's token
-     * supplied, so a test can replay the retry {@code db.run} performs after
-     * {@code commit_unknown_result}: the same lambda, the same token, the first attempt
-     * possibly committed.
+     * {@link #compareAndSetTagValue(LogTag, String, byte[], byte[])} with the call's token and
+     * its list of earlier attempts supplied, so a test can replay the retry {@code db.run}
+     * performs after {@code commit_unknown_result}: the same lambda, the same token, the same
+     * accumulating list, the first attempt possibly committed — and, in the test, another
+     * writer in between.
      *
-     * <p>Without the token a landed swap's retry reads the value it wrote, finds it is not
+     * <p>Without the record a landed swap's retry reads the value it wrote, finds it is not
      * {@code expected}, and reports {@code false} — "nothing written" for a durable claim,
-     * and a round in which nobody is told they hold the lease. The token is written in the
-     * same transaction as the value and checked first on every attempt.
+     * and a round in which nobody is told they hold the lease. The record is written in the
+     * same transaction as the value, under the attempt's read version, and every retry looks
+     * for its earlier attempts' records first.
+     *
+     * @param attempts read versions of this call's earlier attempts; appended to by each run
      */
-    boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value, byte[] token) {
-        byte[] k  = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
-        byte[] op = kvOpSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+    boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value,
+                                  byte[] token, List<Long> attempts) {
+        byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
         return db.run(tr -> {
-            if (OperationToken.matches(tr.get(op).join(), token)) return true;   // our earlier attempt landed
+            if (earlierAttemptLanded(tr, tag, key, token, attempts) != null) return true;
             byte[] current = tr.get(k).join();
             if (!Arrays.equals(current, expected)) return false;
             if (value == null) {
@@ -814,7 +835,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             } else {
                 tr.set(k, value);
             }
-            tr.set(op, token);
+            recordAttempt(tr, tag, key, token, attempts, 0L);
             return true;
         });
     }
@@ -831,26 +852,75 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public long incrementTagValue(LogTag tag, String key, long delta) {
-        return incrementTagValue(tag, key, delta, OperationToken.fresh());
+        return incrementTagValue(tag, key, delta, OperationToken.fresh(), new ArrayList<>());
     }
 
     /**
-     * {@link #incrementTagValue(LogTag, String, long)} with the call's token supplied, for
-     * the same reason as the compare-and-set overload. A counter is the one value where a
-     * second application is not harmless, and the client library's own retry would apply it
-     * with no exception anywhere; the token records the result alongside, so the retry
+     * {@link #incrementTagValue(LogTag, String, long)} with the call's token and attempts
+     * supplied, for the same reason as the compare-and-set overload. A counter is the one
+     * value where a second application is not harmless, and the client library's own retry
+     * would apply it with no exception anywhere; the record stores the result, so the retry
      * returns what the landed attempt returned.
      */
-    long incrementTagValue(LogTag tag, String key, long delta, byte[] token) {
-        byte[] k  = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
-        byte[] op = kvOpSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+    long incrementTagValue(LogTag tag, String key, long delta, byte[] token, List<Long> attempts) {
+        byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
         return db.run(tr -> {
-            byte[] last = tr.get(op).join();
-            if (OperationToken.matches(last, token)) return OperationToken.resultOf(last);
+            Long landed = earlierAttemptLanded(tr, tag, key, token, attempts);
+            if (landed != null) return landed;
             long next = CounterValues.toLong(tr.get(k).join()) + delta;
             tr.set(k, CounterValues.toBytes(next));
-            tr.set(op, OperationToken.withResult(token, next));
+            recordAttempt(tr, tag, key, token, attempts, next);
             return next;
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Idempotency records for the conditional KV
+    // -------------------------------------------------------------------------
+
+    /** {@code {root}/"kvop"/namespace/key/kvKey}, under which a record is {@code /readVersion/token → result}. */
+    private Subspace opSubspace(LogTag tag, String key) {
+        return kvOpSubspace.subspace(Tuple.from(tag.namespace(), tag.key(), key));
+    }
+
+    /**
+     * The result recorded by one of this call's earlier attempts, or {@code null} if none of
+     * them committed. Each earlier attempt is one point read, and on the first attempt there
+     * are none, so the happy path pays nothing here. The reads also put those keys in this
+     * transaction's read conflict set, so an earlier attempt that lands <em>after</em> this
+     * read version makes this commit conflict and retry rather than apply twice.
+     */
+    private Long earlierAttemptLanded(com.apple.foundationdb.ReadTransaction tr, LogTag tag, String key,
+                                      byte[] token, List<Long> attempts) {
+        Subspace ops = opSubspace(tag, key);
+        for (long readVersion : attempts) {
+            byte[] result = tr.get(ops.pack(Tuple.from(readVersion, token))).join();
+            if (result != null) return ByteBuffer.wrap(result).getLong();
+        }
+        return null;
+    }
+
+    /**
+     * Records this attempt — read version, token, result — and clears every record on this
+     * key older than {@link #tokenHorizonVersions}. The clear is one range mutation keyed by
+     * read version, so the records stay bounded with no scan on the write path.
+     */
+    private void recordAttempt(com.apple.foundationdb.Transaction tr, LogTag tag, String key,
+                               byte[] token, List<Long> attempts, long result) {
+        Subspace ops = opSubspace(tag, key);
+        long readVersion = tr.getReadVersion().join();
+        attempts.add(readVersion);
+        tr.set(ops.pack(Tuple.from(readVersion, token)), longBytes(result));
+        tr.clear(ops.range().begin, ops.pack(Tuple.from(readVersion - tokenHorizonVersions)));
+    }
+
+    /** The records currently kept for {@code key}, for tests of the clearing. */
+    long storedAttemptRecords(LogTag tag, String key) {
+        ensureOpen();
+        return db.run(tr -> {
+            long n = 0;
+            for (KeyValue ignored : tr.getRange(opSubspace(tag, key).range())) n++;
+            return n;
         });
     }
 
