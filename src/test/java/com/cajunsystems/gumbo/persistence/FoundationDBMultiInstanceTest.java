@@ -2,6 +2,7 @@ package com.cajunsystems.gumbo.persistence;
 
 import com.cajunsystems.gumbo.core.LogEntry;
 import com.cajunsystems.gumbo.core.LogTag;
+import com.cajunsystems.gumbo.core.OperationToken;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
 import org.junit.jupiter.api.AfterEach;
@@ -196,6 +197,39 @@ class FoundationDBMultiInstanceTest {
         assertThat(a.readAll()).hasSize(1);
         assertThat(a.readAll().get(0).data()).isEqualTo(bytes("e0"));
         assertThat(a.readByTag(INVENTORY, 0L)).isEmpty();
+    }
+
+    /**
+     * The same retry, on the KV. A compare-and-set that landed and is run again reads the
+     * value it wrote, which is not {@code expected}, and would report that it lost — for a
+     * claim that is durable, in a round where then nobody is told they won. An increment run
+     * again would apply twice, with no exception anywhere. The call's token, recorded next to
+     * the key in the same transaction, is what the retry recognises.
+     */
+    @Test
+    void aRetriedKvClaimOrIncrementIsAppliedOnceAndAnsweredTheSame() throws IOException {
+        byte[] claim = OperationToken.fresh();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim)).isTrue();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", null, bytes("a"), claim))
+                .as("the retry of a landed claim is told it won, not that it lost")
+                .isTrue();
+        assertThat(b.compareAndSetTagValue(ORDERS, "owner", null, bytes("b"), OperationToken.fresh()))
+                .as("a different call with the same expectation still loses")
+                .isFalse();
+        assertThat(b.getTagValue(ORDERS, "owner")).isEqualTo(bytes("a"));
+
+        byte[] release = OperationToken.fresh();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", bytes("a"), null, release)).isTrue();
+        assertThat(a.compareAndSetTagValue(ORDERS, "owner", bytes("a"), null, release)).isTrue();
+        assertThat(b.getTagValue(ORDERS, "owner")).isNull();
+
+        byte[] bump = OperationToken.fresh();
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump)).isEqualTo(5L);
+        assertThat(a.incrementTagValue(ORDERS, "n", 5, bump))
+                .as("the retry returns the landed attempt's result and applies nothing")
+                .isEqualTo(5L);
+        assertThat(b.incrementTagValue(ORDERS, "n", 1, OperationToken.fresh())).isEqualTo(6L);
+        assertThat(b.incrementTagValue(ORDERS, "n", 1)).isEqualTo(7L);
     }
 
     /**

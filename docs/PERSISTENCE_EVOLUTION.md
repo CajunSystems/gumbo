@@ -137,6 +137,7 @@ append(entry)
 {root} / "meta" / "tagcount" / namespace / key    → versionCount
 {root} / "meta" / "taglatest" / namespace / key   → latest seqnum in the tag
 {root} / "kv"   / namespace / key / kvKey         → tag KV value
+{root} / "kvop" / namespace / key / kvKey         → token of the last conditional write (+ result)
 ```
 
 Nothing above is cached per process: every metadata getter is a point read, so a second

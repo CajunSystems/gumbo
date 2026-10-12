@@ -119,11 +119,15 @@ planning directory from the 0.2.0 era and is not maintained.
   high-water mark was wrong under two writers and could move the stored value backwards.
 - **A refused conditional append has already consumed its seqnum.** The sequencer is asked
   before the adapter is. Seqnums are an order, not a count; only `streamVersion` is dense.
-- **FDB write transactions must be idempotent.** `db.run` retries on `commit_unknown_result`
-  with the entry possibly already durable; a version-assigning transaction that runs twice
-  fails its own fence or writes a second record one version up. The adapter checks for its
-  own record at the pending's seqnum first (`alreadyCommitted`) and returns it. A different
-  record at that seqnum is a sequencer collision and is refused, never overwritten.
+- **Every FDB read-modify-write must be idempotent.** `db.run` retries on
+  `commit_unknown_result` with the commit possibly already applied; run twice, a
+  version-assigning append fails its own fence or writes a second record one version up, a
+  compare-and-set tells its winner it lost, an increment applies twice, the sequencer skips a
+  number. Appends check for their own record at the pending's seqnum (`alreadyCommitted`); a
+  different record there is a sequencer collision and is refused, never overwritten. The KV
+  conditional writes and `FoundationDBSequencer.claim` record an `OperationToken` (and the
+  result) next to the key in the same transaction and return the recorded answer on a retry.
+  A new FDB transaction that reads then writes gets the same treatment.
 
 ## Tests (keep green if you touch the engine)
 

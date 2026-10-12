@@ -9,6 +9,7 @@ import com.apple.foundationdb.tuple.Tuple;
 import com.cajunsystems.gumbo.core.CounterValues;
 import com.cajunsystems.gumbo.core.LogCapabilities;
 import com.cajunsystems.gumbo.core.LogEntry;
+import com.cajunsystems.gumbo.core.OperationToken;
 import com.cajunsystems.gumbo.core.PendingAppend;
 import com.cajunsystems.gumbo.core.VersionConflictException;
 import com.cajunsystems.gumbo.core.LogTag;
@@ -39,7 +40,16 @@ import java.util.concurrent.CompletableFuture;
  * {root} / "meta" / "tagcount" / namespace / key           → versionCount (8 bytes, big-endian)
  * {root} / "meta" / "taglatest" / namespace / key          → latest seqnum in tag (8 bytes, big-endian)
  * {root} / "kv"   / namespace / key / kvKey                → tag KV value
+ * {root} / "kvop" / namespace / key / kvKey                → token of the last conditional write (+ result)
  * </pre>
+ *
+ * <h2>Every write transaction is idempotent</h2>
+ * <p>{@code db.run} retries on {@code commit_unknown_result} with the commit possibly already
+ * applied, so a transaction that runs twice must produce the same answer. The append paths
+ * look for their own record at the pending's seqnum ({@link #alreadyCommitted}). The
+ * conditional KV writes record an {@link OperationToken} under {@code kvop} in the same
+ * transaction and return the recorded result when they find it — otherwise a landed
+ * compare-and-set would tell its caller it lost, and a landed increment would apply twice.
  *
  * <h2>Nothing is cached per process</h2>
  * <p>This is the adapter that declares {@code multiWriter}, so another process may be
@@ -125,6 +135,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private static final String TAGCOUNT_NS  = "tagcount";
     private static final String TAGLATEST_NS = "taglatest";
     private static final String KV_NS        = "kv";
+    private static final String KVOP_NS      = "kvop";
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -141,6 +152,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     private Subspace tagCountSubspace;
     private Subspace tagLatestSubspace;
     private Subspace kvSubspace;
+    private Subspace kvOpSubspace;
 
     /**
      * Lower bound for index scans, from the last trim this process saw. A hint, not an
@@ -228,6 +240,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         tagCountSubspace  = metaSubspace.subspace(Tuple.from(TAGCOUNT_NS));
         tagLatestSubspace = metaSubspace.subspace(Tuple.from(TAGLATEST_NS));
         kvSubspace        = root.subspace(Tuple.from(KV_NS));
+        kvOpSubspace      = root.subspace(Tuple.from(KVOP_NS));
     }
 
     @Override
@@ -761,6 +774,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public void deleteTagValue(LogTag tag, String key) {
         db.run(tr -> {
             tr.clear(kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
+            tr.clear(kvOpSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key)));
             return null;
         });
     }
@@ -774,8 +788,25 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value) {
-        byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+        return compareAndSetTagValue(tag, key, expected, value, OperationToken.fresh());
+    }
+
+    /**
+     * {@link #compareAndSetTagValue(LogTag, String, byte[], byte[])} with the call's token
+     * supplied, so a test can replay the retry {@code db.run} performs after
+     * {@code commit_unknown_result}: the same lambda, the same token, the first attempt
+     * possibly committed.
+     *
+     * <p>Without the token a landed swap's retry reads the value it wrote, finds it is not
+     * {@code expected}, and reports {@code false} — "nothing written" for a durable claim,
+     * and a round in which nobody is told they hold the lease. The token is written in the
+     * same transaction as the value and checked first on every attempt.
+     */
+    boolean compareAndSetTagValue(LogTag tag, String key, byte[] expected, byte[] value, byte[] token) {
+        byte[] k  = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+        byte[] op = kvOpSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
         return db.run(tr -> {
+            if (OperationToken.matches(tr.get(op).join(), token)) return true;   // our earlier attempt landed
             byte[] current = tr.get(k).join();
             if (!Arrays.equals(current, expected)) return false;
             if (value == null) {
@@ -783,6 +814,7 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
             } else {
                 tr.set(k, value);
             }
+            tr.set(op, token);
             return true;
         });
     }
@@ -799,10 +831,25 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      */
     @Override
     public long incrementTagValue(LogTag tag, String key, long delta) {
-        byte[] k = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+        return incrementTagValue(tag, key, delta, OperationToken.fresh());
+    }
+
+    /**
+     * {@link #incrementTagValue(LogTag, String, long)} with the call's token supplied, for
+     * the same reason as the compare-and-set overload. A counter is the one value where a
+     * second application is not harmless, and the client library's own retry would apply it
+     * with no exception anywhere; the token records the result alongside, so the retry
+     * returns what the landed attempt returned.
+     */
+    long incrementTagValue(LogTag tag, String key, long delta, byte[] token) {
+        byte[] k  = kvSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
+        byte[] op = kvOpSubspace.pack(Tuple.from(tag.namespace(), tag.key(), key));
         return db.run(tr -> {
+            byte[] last = tr.get(op).join();
+            if (OperationToken.matches(last, token)) return OperationToken.resultOf(last);
             long next = CounterValues.toLong(tr.get(k).join()) + delta;
             tr.set(k, CounterValues.toBytes(next));
+            tr.set(op, OperationToken.withResult(token, next));
             return next;
         });
     }

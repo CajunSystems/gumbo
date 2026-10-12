@@ -4,6 +4,7 @@ import com.apple.foundationdb.Database;
 import com.apple.foundationdb.FDB;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
+import com.cajunsystems.gumbo.core.OperationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,6 +21,12 @@ import java.nio.ByteBuffer;
  * write transaction that atomically increments the counter and returns the value
  * it claimed.  FDB's optimistic concurrency control serialises concurrent callers
  * automatically; conflicting transactions are transparently retried by the client.
+ *
+ * <p>The client also retries on {@code commit_unknown_result}, with the commit possibly
+ * already applied. A plain read-modify-write run twice would claim twice and skip a
+ * number, so each claim records an {@link OperationToken} and its base under
+ * {@code {root} / "claim"} in the same transaction, and a retry that finds its own token
+ * returns the base it already holds.
  *
  * <h2>Why FDB over an AtomicLong</h2>
  * <p>In a single-process deployment {@link LocalSequencer} is sufficient and
@@ -49,6 +56,14 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
     private final boolean ownsDatabase;
     private final byte[]  counterKey;
 
+    /**
+     * {@code {root} / "claim"}: the token of the last claim and the base it was handed, so a
+     * retry after {@code commit_unknown_result} returns the numbers its earlier attempt
+     * claimed rather than claiming again and leaving a gap. Written in the same transaction
+     * as the counter.
+     */
+    private final byte[]  claimKey;
+
     private Database db;
 
     /** Last value returned by next(); -1 if none issued yet. */
@@ -76,6 +91,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
         this.clusterFilePath = clusterFilePath;
         this.ownsDatabase    = true;
         this.counterKey      = new Subspace(Tuple.from(rootPrefix)).pack(Tuple.from("seq"));
+        this.claimKey        = new Subspace(Tuple.from(rootPrefix)).pack(Tuple.from("claim"));
     }
 
     /**
@@ -90,6 +106,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
         this.ownsDatabase    = false;
         this.db              = database;
         this.counterKey      = new Subspace(Tuple.from(rootPrefix)).pack(Tuple.from("seq"));
+        this.claimKey        = new Subspace(Tuple.from(rootPrefix)).pack(Tuple.from("claim"));
     }
 
     // =========================================================================
@@ -158,15 +175,27 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
 
     @Override
     public long next() {
-        long claimed = db.run(tr -> {
+        return claim(1, OperationToken.fresh());
+    }
+
+    /**
+     * Claims {@code count} consecutive seqnums and returns the first. The read-modify-write
+     * and the token record are one transaction; see {@link #claimKey}. Package-private so a
+     * test can replay the retry {@code db.run} performs after {@code commit_unknown_result}
+     * — the same call with the same token — and check the counter moved once.
+     */
+    long claim(int count, byte[] token) {
+        long base = db.run(tr -> {
+            byte[] last = tr.get(claimKey).join();
+            if (OperationToken.matches(last, token)) return OperationToken.resultOf(last);
             byte[] val     = tr.get(counterKey).join();
             long   current = (val == null) ? 0L : ByteBuffer.wrap(val).getLong();
-            long   next    = current + 1;
-            tr.set(counterKey, ByteBuffer.allocate(8).putLong(next).array());
+            tr.set(counterKey, ByteBuffer.allocate(8).putLong(current + count).array());
+            tr.set(claimKey, OperationToken.withResult(token, current));
             return current;
         });
-        lastIssued = claimed;
-        return claimed;
+        lastIssued = base + count - 1;
+        return base;
     }
 
     /**
@@ -185,14 +214,7 @@ public class FoundationDBSequencer implements Sequencer, Closeable {
     @Override
     public long[] nextBatch(int count) {
         if (count <= 0) throw new IllegalArgumentException("count must be > 0");
-        long base = db.run(tr -> {
-            byte[] val     = tr.get(counterKey).join();
-            long   current = (val == null) ? 0L : ByteBuffer.wrap(val).getLong();
-            long   next    = current + count;
-            tr.set(counterKey, ByteBuffer.allocate(8).putLong(next).array());
-            return current;
-        });
-        lastIssued = base + count - 1;
+        long base = claim(count, OperationToken.fresh());
         long[] seqnums = new long[count];
         for (int i = 0; i < count; i++) seqnums[i] = base + i;
         return seqnums;
