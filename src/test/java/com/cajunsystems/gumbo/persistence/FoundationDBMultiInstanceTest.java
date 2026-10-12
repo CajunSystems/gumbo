@@ -143,6 +143,79 @@ class FoundationDBMultiInstanceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Review findings on #40
+    // -------------------------------------------------------------------------
+
+    /**
+     * What {@code db.run} does after {@code commit_unknown_result}: run the same lambda again
+     * with the same pending, the first attempt possibly having committed. Calling the method
+     * twice with one {@code PendingAppend} is that retry, minus the lost reply. The second
+     * call must return the committed entry — not a conflict for the conditional form, which
+     * would tell a caller "nothing written" about an entry that is durable, and not a second
+     * record one version up for the unconditional form, which would leave a hole.
+     */
+    @Test
+    void aRetryOfACommittedAppendReturnsTheCommittedEntryNotAConflictOrAHole() throws IOException {
+        PendingAppend fenced = pending(0, ORDERS);
+        LogEntry first = a.append(fenced, 0L);
+        LogEntry again = a.append(fenced, 0L);
+        assertThat(sameEntry(again, first)).as("the retry is handed what the first attempt committed").isTrue();
+
+        PendingAppend unfenced = pending(1, ORDERS);
+        a.append(unfenced, PersistenceAdapter.ANY_VERSION);
+        a.append(unfenced, PersistenceAdapter.ANY_VERSION);
+
+        List<PendingAppend> batch = List.of(pending(2, ORDERS), pending(3, INVENTORY));
+        List<LogEntry> stored = a.appendBatchAssigningVersions(batch);
+        List<LogEntry> retried = a.appendBatchAssigningVersions(batch);
+        assertThat(retried).hasSize(2);
+        assertThat(sameEntry(retried.get(0), stored.get(0))).isTrue();
+        assertThat(sameEntry(retried.get(1), stored.get(1))).isTrue();
+
+        assertThat(versionsOf(b.readByTag(ORDERS, 0L), ORDERS))
+                .as("one record per append, no hole, as seen from the other instance")
+                .containsExactly(0L, 1L, 2L);
+        assertThat(versionsOf(b.readByTag(INVENTORY, 0L), INVENTORY)).containsExactly(0L);
+        assertThat(b.getNextStreamVersion(ORDERS)).isEqualTo(3L);
+    }
+
+    /**
+     * The other thing a record already at this seqnum can mean: two writers behind a
+     * sequencer that is not distributed, handed the same number. That configuration does not
+     * report {@code multiWriter}, and used to overwrite the first record silently.
+     */
+    @Test
+    void aDifferentEntryAtAnAlreadyUsedSeqnumIsRefusedNotOverwritten() throws IOException {
+        a.append(pending(0, ORDERS), PersistenceAdapter.ANY_VERSION);
+
+        PendingAppend collider = new PendingAppend(0, INVENTORY, Set.of(INVENTORY), bytes("other"), Instant.now());
+        assertThatThrownBy(() -> b.append(collider, PersistenceAdapter.ANY_VERSION))
+                .isInstanceOf(IOException.class)
+                .hasStackTraceContaining("already holds a different entry");
+
+        assertThat(a.readAll()).hasSize(1);
+        assertThat(a.readAll().get(0).data()).isEqualTo(bytes("e0"));
+        assertThat(a.readByTag(INVENTORY, 0L)).isEmpty();
+    }
+
+    /**
+     * {@code BYTE_MAX} with no entries would be {@code BYTE_MAX} with -1, whose bytes are all
+     * {@code 0xFF} and outrank every real seqnum: {@code meta/latest} would read -1 in every
+     * process on this root, forever. The service never sends an empty batch; the adapter is
+     * public API and must not depend on that.
+     */
+    @Test
+    void anEmptyBatchLeavesLatestSeqnumAlone() throws IOException {
+        a.append(pending(3, ORDERS), PersistenceAdapter.ANY_VERSION);
+
+        a.appendBatchAssigningVersions(List.of());
+        a.appendBatch(List.of());
+
+        assertThat(a.getLatestSeqnum()).isEqualTo(3L);
+        assertThat(open().getLatestSeqnum()).isEqualTo(3L);
+    }
+
+    // -------------------------------------------------------------------------
     // Ask 3 of #38: D2 does not apply
     // -------------------------------------------------------------------------
 
@@ -271,6 +344,15 @@ class FoundationDBMultiInstanceTest {
 
     private static PendingAppend pending(long seqnum, LogTag primary, Set<LogTag> tags) {
         return new PendingAppend(seqnum, primary, tags, bytes("e" + seqnum), Instant.now());
+    }
+
+    /** Same record: an entry handed back from the store carries its timestamp at millisecond precision. */
+    private static boolean sameEntry(LogEntry x, LogEntry y) {
+        return x.seqnum() == y.seqnum()
+                && x.streamVersions().equals(y.streamVersions())
+                && x.tags().equals(y.tags())
+                && java.util.Arrays.equals(x.dataUnsafe(), y.dataUnsafe())
+                && x.timestamp().toEpochMilli() == y.timestamp().toEpochMilli();
     }
 
     private static List<Long> seqnumsOf(List<LogEntry> entries) {

@@ -45,8 +45,8 @@ that had already landed.
 | `open()` | `NOTHING` | Unwinds fully: channels closed, directory lock released. A failed open leaves nothing to clean up and the directory reopenable. |
 | `close()` | — | Idempotent. Releases what it holds even if flushing fails. |
 | `append(LogEntry)` | `NOTHING` \| `PREFIX` | File: a torn record may reach the tail of `log.dat`; the recovery scan stops at it, so it is invisible to readers but occupies space. FDB: `NOTHING` — the transaction either commits or does not. |
-| `appendBatch(List<LogEntry>)` | **`PREFIX`** | File writes entry by entry with no rollback. FDB chunks large batches and can commit an earlier chunk before a later one fails. **Callers must not assume all-or-nothing.** The boundary is `getLatestSeqnum()`: at or below it is durable. A failed *sync* on the file adapter is `NOTHING` — none of the batch is published, so the whole batch is retried. |
-| `append(PendingAppend, expectedVersion)` | `NOTHING` | The version is assigned in the same operation as the write, so a failure consumes no version — except on the batching adapter, where see below. |
+| `appendBatch(List<LogEntry>)` | **`PREFIX`** | File writes entry by entry with no rollback. FDB chunks large batches and can commit an earlier chunk before a later one fails. **Callers must not assume all-or-nothing.** Under one writer the boundary is `getLatestSeqnum()`: at or below it is durable. Under `multiWriter` it is not (see below) — read your own seqnums back with `readFrom` instead. A failed *sync* on the file adapter is `NOTHING` — none of the batch is published, so the whole batch is retried. |
+| `append(PendingAppend, expectedVersion)` | `NOTHING` | The version is assigned in the same operation as the write, so a failure consumes no version — except on the batching adapter, where see below. On FDB a `commit_unknown_result` is retried by the client with the entry possibly already durable; the retry finds its own record at its seqnum and returns it, so a `VersionConflictException` always means nothing was written, and no retry writes the same seqnum twice. |
 | `appendBatchAssigningVersions(...)` | `PREFIX` | As `appendBatch`. Versions are assigned in list order. |
 | `trim(upToSeqnum)` | `NOTHING` | The trim point is written to a temp file and atomically renamed, so a crash mid-trim leaves the old point intact. |
 | `setTagValue` / `deleteTagValue` | `NOTHING` \| `UNKNOWN` | Appended to a sidecar and synced before the new value is published. A torn record is skipped on replay, so the key keeps its previous value (`NOTHING`). A failed *sync* is `UNKNOWN`: the record may still become durable, while this process goes on reporting the old value — read the key back after a reopen before deciding. |
@@ -69,10 +69,23 @@ lose data on the retry path, and nothing will report it.
 
 On FoundationDB it is also a **storage** read, not a process-local one: `meta/latest` is
 raised with an atomic `BYTE_MAX` in the same transaction as the entry, and
-`getLatestSeqnum()` is a point read of it. Under `multiWriter` the boundary is the log's,
-not this process's — a local high-water mark was wrong for a second writer and, written as
-`max(local, seqnum)`, could move the stored value backwards when a lower seqnum committed
-later.
+`getLatestSeqnum()` is a point read of it. A local high-water mark was wrong for a second
+writer and, written as `max(local, seqnum)`, could move the stored value backwards when a
+lower seqnum committed later.
+
+**Under `multiWriter` it is a high-water mark, not a prefix.** It is the highest seqnum any
+writer has *committed*. A seqnum is claimed from the sequencer before its transaction, so
+another writer's lower seqnum may still be in flight — or may have failed and never land. P1
+claims 9, P2 claims 10 and commits, `getLatestSeqnum()` reads 10, and 9 is not durable. So
+on a shared root the rule "at or below it is durable" does not hold, and a caller must not
+reconcile a `PREFIX` failure against it: with a chunked `appendBatch` of 5–9 where 5–7
+committed and 8–9 failed while P2 committed 12, that reconcile would conclude 8 and 9 landed
+and drop them. **Reconcile by reading your own seqnums back** — `readFrom(s)` for the first
+seqnum of each chunk; seqnums are unique per append, so presence is proof — or reason in
+versions, which are assigned in commit order and are always a dense prefix per tag. The same
+divergence is why a seqnum-keyed tail cursor is unsafe under `multiWriter` (`readAfter`).
+`BatchingPersistenceAdapter` reconciles against the delegate's `getLatestSeqnum()`, which is
+one more reason it forces `multiWriter` off.
 
 ### The tag KV follows the same rule
 

@@ -70,6 +70,32 @@ rather than changed; versions are assigned in commit order and are the cursor to
 A stale instance could write a lower trim point over another process's higher one. The
 comparison now happens against the stored value inside the transaction.
 
+**A retried FDB write could report "nothing written" for a durable entry, or write it twice**
+(found in review of #40)
+
+`db.run` retries on `commit_unknown_result` with the entry possibly already committed. Run
+again, the conditional append failed its own fence — and with the conflict now surfacing
+properly, that was a `VersionConflictException`, which this document defines as nothing
+written, for an entry that was durable. The unconditional form wrote the same seqnum again
+one version up and left a hole. Both version-assigning paths now begin by looking for their
+own record at the pending's seqnum (unique per append) and return it if present. A
+*different* record at that seqnum means two writers share a sequencer that is not
+distributed; that used to overwrite silently and is now refused.
+
+**An empty `appendBatchAssigningVersions` would have pinned `meta/latest` at -1 forever**
+(found in review of #40)
+
+-1 encodes as eight `0xFF` bytes, which `BYTE_MAX` ranks above every real seqnum. The
+service never sends an empty batch; the adapter is public API and now returns early.
+
+**`getLatestSeqnum()` under `multiWriter` is a high-water mark, not a durable prefix**
+(found in review of #40; documentation)
+
+A seqnum is claimed before its transaction, so another writer's lower seqnum may still be in
+flight or may never land. The "at or below is durable" rule holds under one writer and not
+on a shared root; `FAILURE_SEMANTICS.md` now says so and gives the reconcile rule (read your
+own seqnums back, or reason in versions, which are a dense prefix per tag).
+
 ### Added
 
 - `FoundationDBMultiWriterTest` + `MultiWriterPeer` (the two-process race, above), and

@@ -90,7 +90,10 @@ planning directory from the 0.2.0 era and is not maintained.
   silent. The reasoning is on `claimVersions` and in the 0.6.0 CHANGELOG entry.
 - **`getLatestSeqnum()` is a durability boundary**, not a visibility one: at or below it is
   durable. Never advance it for a write that has not been made durable. The tag KV follows
-  the same rule (`kv.dat` is synced before the in-memory value is published).
+  the same rule (`kv.dat` is synced before the in-memory value is published). **Under
+  `multiWriter` it is a high-water mark of committed seqnums, not a durable prefix** — another
+  writer's lower seqnum may still be in flight — so a `PREFIX` reconcile there reads its own
+  seqnums back, or reasons in versions, which are always a dense prefix per tag.
 - **Capabilities under-report, and every `true` is backed by a test.** `LogCapabilities` is
   answered per adapter; `SharedLogService` composes it — adding `pushSubscriptions` (delivery
   is the service's) and narrowing `multiWriter` to `storage.multiWriter() &&
@@ -116,6 +119,11 @@ planning directory from the 0.2.0 era and is not maintained.
   high-water mark was wrong under two writers and could move the stored value backwards.
 - **A refused conditional append has already consumed its seqnum.** The sequencer is asked
   before the adapter is. Seqnums are an order, not a count; only `streamVersion` is dense.
+- **FDB write transactions must be idempotent.** `db.run` retries on `commit_unknown_result`
+  with the entry possibly already durable; a version-assigning transaction that runs twice
+  fails its own fence or writes a second record one version up. The adapter checks for its
+  own record at the pending's seqnum first (`alreadyCommitted`) and returns it. A different
+  record at that seqnum is a sequencer collision and is refused, never overwritten.
 
 ## Tests (keep green if you touch the engine)
 

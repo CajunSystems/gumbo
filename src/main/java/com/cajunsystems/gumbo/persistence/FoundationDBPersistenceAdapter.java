@@ -301,6 +301,11 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
         byte[] countKey = tagCountSubspace.pack(Tuple.from(primary.namespace(), primary.key()));
         try {
             LogEntry entry = db.run(tr -> {
+                // A retry after commit_unknown_result re-runs this lambda with the entry
+                // possibly already durable; see alreadyCommitted.
+                LogEntry already = alreadyCommitted(tr, pending);
+                if (already != null) return already;
+
                 byte[] raw = tr.get(countKey).join();
                 long next = raw == null ? 0L : ByteBuffer.wrap(raw).getLong();
                 if (expectedVersion != ANY_VERSION && expectedVersion != next) {
@@ -342,8 +347,20 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     public List<LogEntry> appendBatchAssigningVersions(List<PendingAppend> pendings)
             throws IOException {
         ensureOpen();
+        // Nothing to write, and nothing to raise: with no entries the "highest seqnum" below
+        // would be -1, whose 8 bytes are all 0xFF — the largest value BYTE_MAX can see — and
+        // meta/latest would be pinned at -1 for every process on this root, for good.
+        if (pendings.isEmpty()) return List.of();
         try {
             List<LogEntry> entries = db.run(tr -> {
+                // One transaction commits the whole batch, so if the first entry is already
+                // stored this is a retry after commit_unknown_result and all of them are.
+                if (alreadyCommitted(tr, pendings.get(0)) != null) {
+                    List<LogEntry> stored = new ArrayList<>(pendings.size());
+                    for (PendingAppend p : pendings) stored.add(alreadyCommitted(tr, p));
+                    return stored;
+                }
+
                 java.util.Map<LogTag, Long> next = new java.util.HashMap<>();
                 List<LogEntry> out = new ArrayList<>(pendings.size());
                 long maxSeqnum = -1L;
@@ -416,7 +433,44 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
      * 10, B commits with its local high-water mark below 10.
      */
     private void raiseLatest(com.apple.foundationdb.Transaction tr, long seqnum) {
+        // A negative seqnum encodes above every valid one and would win the max for good.
+        if (seqnum < 0) throw new IllegalArgumentException("seqnum must be >= 0, was " + seqnum);
         tr.mutate(MutationType.BYTE_MAX, metaSubspace.pack(Tuple.from(LATEST_KEY)), longBytes(seqnum));
+    }
+
+    /**
+     * The entry already stored at {@code pending}'s seqnum, if this append has in fact
+     * already committed — which is what a retry sees.
+     *
+     * <p>{@code db.run} retries on {@code commit_unknown_result}: the commit may have landed
+     * and the reply been lost. The version-assigning paths are not idempotent by themselves —
+     * run twice, the conditional one fails its own fence (and the earlier version of this
+     * adapter would then have reported {@link VersionConflictException}, which
+     * {@code FAILURE_SEMANTICS.md} defines as "nothing written", for an entry that was
+     * durable), and the unconditional one writes the same seqnum again one version up and
+     * leaves a hole. Seqnums are unique per append, so the record at this seqnum is the
+     * test: present and the same entry means the earlier attempt committed, and it is
+     * returned as the result.
+     *
+     * <p>Present and a <em>different</em> entry means two writers were handed the same
+     * seqnum, which only a non-distributed sequencer shared across processes can do — a
+     * configuration that does not report {@code multiWriter}. It used to overwrite the first
+     * record silently; it is now refused, since the alternative is losing an entry with no
+     * error anywhere.
+     */
+    private LogEntry alreadyCommitted(com.apple.foundationdb.ReadTransaction tr, PendingAppend pending) {
+        byte[] existing = tr.get(logSubspace.pack(Tuple.from(pending.seqnum()))).join();
+        if (existing == null) return null;
+        LogEntry stored = decodeEntry(existing);
+        boolean same = stored.tags().equals(pending.tags())
+                && stored.timestamp().toEpochMilli() == pending.timestamp().toEpochMilli()
+                && Arrays.equals(stored.dataUnsafe(), pending.dataUnsafe());
+        if (!same) {
+            throw new IllegalStateException("seqnum " + pending.seqnum() + " already holds a different"
+                    + " entry (tags " + stored.tags() + "); two writers are sharing a sequencer that"
+                    + " is not distributed");
+        }
+        return stored;
     }
 
     /** Carries a conflict out of the FDB retry loop, which only propagates RuntimeExceptions. */
@@ -618,9 +672,16 @@ public class FoundationDBPersistenceAdapter implements PersistenceAdapter {
     /**
      * One point read, every call. Under {@code multiWriter} this is the only honest answer:
      * a process-local high-water mark advanced by this process's writes alone is wrong the
-     * moment another process commits. It is also still the durability boundary
-     * {@code FAILURE_SEMANTICS.md} describes, since {@code meta/latest} is raised in the same
-     * transaction as the entry and FDB commits are durable before they are visible.
+     * moment another process commits.
+     *
+     * <p>It is the highest seqnum <em>committed</em> by any writer. Under one writer that is
+     * also a durable prefix: everything at or below it has landed. Under several it is not —
+     * a seqnum is claimed from the sequencer before its transaction, so another writer's
+     * lower seqnum may still be in flight, or may have failed and never land. A caller
+     * reconciling a partial batch on a shared root reads its own seqnums back
+     * ({@link #readFrom}) rather than comparing against this; {@code FAILURE_SEMANTICS.md}
+     * has the rule. Versions have no such gap: they are assigned in commit order and a
+     * tag's versions are always a dense prefix.
      */
     @Override
     public long getLatestSeqnum() {
