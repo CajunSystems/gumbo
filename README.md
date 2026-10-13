@@ -229,6 +229,12 @@ long tip = orders.getLatestVersion();   // -1 when the tag is empty
 
 Both forms exist on `SharedLog`, `LogView` and `TypedLogView`.
 
+**Order follows the key, too.** The seqnum-keyed reads — `readAll()`, `readFrom(position,
+n)`, `readAfter` — return seqnum order; the version-keyed ones return version order. Under a
+single writer the two agree. Under `multiWriter` they do not (see
+[what is measured](#multi-writer-what-is-measured)), so a reader that folds a stream in order
+reads the whole tag with `readAfterVersion(-1)`, not `readAll()`.
+
 ### Conditional append
 
 A version is also a fence. `append(request, expectedVersion)` writes only if the primary tag
@@ -706,7 +712,11 @@ Three things it taught on its first run, now part of the contract:
   its transaction and is handed its version *inside* it. A **seqnum-keyed tail cursor is
   unsafe under `multiWriter`** — an entry with a lower seqnum can commit after the read and
   be skipped for good — while a version-keyed one is safe, since versions are assigned in
-  commit order. Cursor on `readAfterVersion`.
+  commit order. Cursor on `readAfterVersion`. The same divergence shows in the **order** of
+  a seqnum-keyed read: `readAll()` and `readFrom(position, n)` return seqnum order, and under
+  two writers a tag's neighbouring entries can come back with their versions swapped
+  (Catalyst's two-node test saw `25, 24` and `83, 80, 81, 82`; #42). Read a whole tag in
+  version order with `readAfterVersion(-1)`.
 - **Push subscriptions are per process.** A subscription is fed by the appends made through
   its own `SharedLog`; another process's appends are not pushed to it. Poll with
   `readAfterVersion` for those.

@@ -142,11 +142,22 @@ public interface SharedLog extends AutoCloseable {
     /**
      * Reads at most {@code maxEntries} entries with the given tag, starting at
      * (and including) {@code from}.
+     *
+     * <p>Keyed and ordered on the global {@code seqnum}. Under a single writer that is
+     * also the tag's version order; under {@code multiWriter} it is not — a writer claims
+     * its seqnum before its transaction and is handed its version inside it, so two
+     * writers' neighbouring entries can come back with their versions swapped. When the
+     * order of a stream matters, read it with {@link #readAfterVersion readAfterVersion(tag, -1)}
+     * for the whole tag or {@link #readFromVersion} from a cursor; those return version
+     * order on every adapter.
      */
     CompletableFuture<List<LogEntry>> read(LogTag tag, LogPosition from, int maxEntries);
 
     /**
-     * Reads all entries with the given tag from {@link LogPosition#BEGINNING}.
+     * Reads all entries with the given tag from {@link LogPosition#BEGINNING}, in global
+     * {@code seqnum} order — the tag's version order only under a single writer (see
+     * {@link #read}). For the whole tag in version order use
+     * {@link #readAfterVersion readAfterVersion(tag, -1)}.
      */
     default CompletableFuture<List<LogEntry>> readAll(LogTag tag) {
         return read(tag, LogPosition.BEGINNING, Integer.MAX_VALUE);

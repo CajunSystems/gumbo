@@ -70,6 +70,10 @@ public interface TypedLogView<T> {
     /**
      * Reads all entries for this tag from the beginning, deserializing each
      * payload into a {@code T}.
+     *
+     * <p>Returned in global {@code seqnum} order, which is this tag's version order only
+     * under a single writer (see {@link #readFrom}). For the whole tag in version order
+     * use {@link #readAfterVersion readAfterVersion(-1)}.
      */
     default CompletableFuture<List<T>> readAll() {
         return readFrom(LogPosition.BEGINNING, Integer.MAX_VALUE);
@@ -78,6 +82,12 @@ public interface TypedLogView<T> {
     /**
      * Reads at most {@code maxEntries} entries starting at (and including)
      * {@code from}, deserializing each payload.
+     *
+     * <p>Keyed and ordered on the global {@code seqnum}. Under {@code multiWriter} that is
+     * not version order: a writer claims its seqnum before its transaction and is handed
+     * its version inside it, so two writers' neighbouring entries can come back with their
+     * versions swapped. When the order of the stream matters, read with
+     * {@link #readFromVersion} or {@link #readAfterVersion}, which return version order.
      */
     CompletableFuture<List<T>> readFrom(LogPosition from, int maxEntries);
 

@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Documentation
+
+- **Seqnum-keyed reads return seqnum order, which is not version order under
+  `multiWriter`** ([#42](https://github.com/CajunSystems/gumbo/issues/42)). 0.7.0 stated the
+  contract for the version-keyed reads and warned on `readAfter` about a seqnum-keyed tail
+  cursor, but said nothing on `readAll()`, `readFrom(LogPosition, int)` or `SharedLog.read`,
+  whose Javadoc was "reads all entries visible from this tag". Catalyst folded streams from
+  `readAll()` and its two-node FoundationDB test got neighbours with versions swapped
+  (`25, 24`; `83, 80, 81, 82`) — the cause 0.7.0 already describes, a seqnum claimed before
+  the transaction and a version assigned inside it. Those methods, `TypedLogView`'s, the
+  README, `FAILURE_SEMANTICS.md` and `CLAUDE.md` now say the order, that it agrees with
+  version order only under a single writer, and that `readAfterVersion(-1)` is the whole tag
+  in version order. Catalyst already moved (CajunSystems/catalyst#37). Behaviour is unchanged:
+  making a tag view's `readAll()` sort by version was offered as optional and is not taken,
+  since it would reorder existing callers' results for a case the documentation now covers
+
 ## [0.7.0] — 2026-10-12
 
 Answers [#38](https://github.com/CajunSystems/gumbo/issues/38), Catalyst's list of what its

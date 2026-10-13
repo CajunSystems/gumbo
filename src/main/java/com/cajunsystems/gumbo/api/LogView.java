@@ -14,8 +14,12 @@ import java.util.function.Consumer;
  * A tag-scoped, read/append view of the shared log.
  *
  * <p>A {@code LogView} filters the global log to entries that carry
- * {@linkplain #getTag() its tag}. Entries are still ordered by their global
- * {@code seqnum}; only visibility is restricted.
+ * {@linkplain #getTag() its tag}. The seqnum-keyed reads ({@link #readFrom},
+ * {@link #readAll}, {@link #readAfter}) still order entries by their global
+ * {@code seqnum}; only visibility is restricted. The version-keyed reads
+ * ({@link #readFromVersion}, {@link #readAfterVersion}) order them by this tag's own
+ * {@code streamVersion}. The two orders agree under a single writer and not under
+ * {@code multiWriter}, so a reader that folds a stream in order should use the latter.
  *
  * <p>{@link #append} writes through to the underlying {@link SharedLog} with
  * this view's tag automatically included in the request's tag set.
@@ -41,10 +45,26 @@ public interface LogView {
     /**
      * Reads at most {@code maxEntries} entries visible from this tag, starting
      * at (and including) {@code from}.
+     *
+     * <p>Keyed and ordered on the global {@code seqnum}. Under a single writer that is
+     * also this tag's version order; under {@code multiWriter} it is not, because a writer
+     * claims its seqnum from the sequencer before its transaction and is handed its
+     * version inside it, so two writers' neighbouring entries can come back with their
+     * versions swapped. When the order of a stream matters — folding its events into a
+     * state — read it with {@link #readAfterVersion readAfterVersion(-1)} for the whole
+     * tag, or {@link #readFromVersion} from a cursor; those return version order on every
+     * adapter.
      */
     CompletableFuture<List<LogEntry>> readFrom(LogPosition from, int maxEntries);
 
-    /** Reads all entries visible from this tag. */
+    /**
+     * Reads all entries visible from this tag, in global {@code seqnum} order.
+     *
+     * <p>That is this tag's version order only under a single writer. Under
+     * {@code multiWriter} neighbours can arrive with their versions swapped (see
+     * {@link #readFrom}); to read the whole tag in version order use
+     * {@link #readAfterVersion readAfterVersion(-1)}.
+     */
     default CompletableFuture<List<LogEntry>> readAll() {
         return readFrom(LogPosition.BEGINNING, Integer.MAX_VALUE);
     }
