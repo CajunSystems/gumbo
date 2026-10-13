@@ -83,7 +83,14 @@ committed and 8–9 failed while P2 committed 12, that reconcile would conclude 
 and drop them. **Reconcile by reading your own seqnums back** — `readFrom(s)` for the first
 seqnum of each chunk; seqnums are unique per append, so presence is proof — or reason in
 versions, which are assigned in commit order and are always a dense prefix per tag. The same
-divergence is why a seqnum-keyed tail cursor is unsafe under `multiWriter` (`readAfter`).
+divergence is why a seqnum-keyed tail cursor is unsafe under `multiWriter` (`readAfter`),
+and why the **order** of a seqnum-keyed read is not version order there: `readAll()`,
+`readFrom(LogPosition, int)` and `SharedLog.read` return a tag's entries in seqnum order,
+which under two writers can hold neighbours with their versions swapped (`25, 24`;
+`83, 80, 81, 82` — measured by Catalyst's two-node test, #42). Under one writer the two
+orders agree, which is why nothing single-process ever shows it. A fold over such a list
+applies events out of order. To read a whole tag in version order use `readAfterVersion(-1)`;
+only the version-keyed reads promise version order.
 `BatchingPersistenceAdapter` used to reconcile a failed flush against the delegate's
 `getLatestSeqnum()` and now reads its own seqnums back, for exactly this reason: a decorator
 in one process cannot stop a plain adapter in another from writing the same root, so it has

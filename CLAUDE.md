@@ -71,9 +71,11 @@ planning directory from the 0.2.0 era and is not maintained.
   two coincide only while a log holds one tag — which is why every test with one tag in a
   fresh log is blind to the defects that matter (D1, D2, D4 all hid there). **Put a second tag
   in the log.**
-- **Reads say which space they key on.** `readByTag` / `LogView.readFrom` / `readAfter` are
-  seqnum-keyed. `readFromVersion` / `readAfterVersion` are version-keyed and are what a
-  per-stream cursor wants. Don't blur them; D4 was exactly that blur.
+- **Reads say which space they key on, and order follows the key.** `readByTag` /
+  `LogView.readFrom` / `readAll` / `readAfter` are seqnum-keyed and return seqnum order.
+  `readFromVersion` / `readAfterVersion` are version-keyed, return version order, and are
+  what a per-stream cursor wants. Don't blur them; D4 was exactly that blur, and #42 was a
+  `readAll()` fold that assumed list order was stream order under `multiWriter`.
 - **The fence is decided by storage, or not offered.** `append(pending, expectedVersion)` must
   compare and increment atomically in the store. An adapter that cannot throws
   `UnsupportedOperationException` for a non-`ANY_VERSION` expectation; it never falls back to a
